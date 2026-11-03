@@ -9,6 +9,9 @@ x-local-ledger-env: &local-ledger-env
   HEALTH_DATA_THRESHOLD: "0.98"
 
 services:
+  client1: { environment: { ANTITHESIS_SDK_LOCAL_OUTPUT: /tmp/sdk.jsonl } }
+  client2: { environment: { ANTITHESIS_SDK_LOCAL_OUTPUT: /tmp/sdk.jsonl } }
+  client3: { environment: { ANTITHESIS_SDK_LOCAL_OUTPUT: /tmp/sdk.jsonl } }
   ledger-0: { environment: *local-ledger-env }
   ledger-1: { environment: *local-ledger-env }
   ledger-2: { environment: *local-ledger-env }

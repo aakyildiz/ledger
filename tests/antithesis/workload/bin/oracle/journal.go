@@ -28,6 +28,9 @@ type journalEntry struct {
 	Resp       json.RawMessage `json:"resp"`
 	Violations []string        `json:"violations"`
 	Ms         int64           `json:"ms"`
+	// Us is the request's time in the service, mutex wait included
+	// (microseconds; debug only, for latency percentiles, task 99).
+	Us int64 `json:"us,omitempty"`
 }
 
 type elided struct {

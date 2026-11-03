@@ -119,6 +119,7 @@ func refused(ref *oc.Refusal, evs []oc.Event) result {
 
 // do handles one request: ep is "METHOD /path[?query]".
 func (s *server) do(ep string, body []byte) (status int, resp []byte) {
+	arrived := time.Now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -163,7 +164,7 @@ func (s *server) do(ep string, body []byte) (status int, resp []byte) {
 		req, _ = json.Marshal(string(body))
 	}
 	s.journal.append(journalEntry{Boot: s.boot, Ep: ep, Req: req, Status: res.status, Resp: resp, Violations: findings,
-		Ms: time.Since(s.started).Milliseconds()})
+		Ms: time.Since(s.started).Milliseconds(), Us: time.Since(arrived).Microseconds()})
 	if len(findings) > 0 && !s.dumped {
 		s.dumped = true
 		for _, line := range s.journal.newest(findingDumpBytes) {
