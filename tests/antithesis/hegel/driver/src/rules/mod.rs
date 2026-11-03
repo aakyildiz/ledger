@@ -60,6 +60,7 @@ pub mod signing;
 pub mod blocks;
 // ==== end 17-scenario-blocks mods ====
 // ==== 18-restore mods ====
+pub mod restore;
 // ==== end 18-restore mods ====
 
 pub fn rules() -> Vec<ConcurrentRule<Driver>> {
@@ -116,6 +117,7 @@ pub fn rules() -> Vec<ConcurrentRule<Driver>> {
     v.extend(blocks::rules());
     // ==== end 17-scenario-blocks rules ====
     // ==== 18-restore rules ====
+    v.extend(restore::rules());
     // ==== end 18-restore rules ====
     keep_named(v, std::env::var("RULES").ok().as_deref())
 }
@@ -206,6 +208,7 @@ pub fn quiet_hooks() -> Vec<crate::quiet::QuietHook> {
     // ==== 17-scenario-blocks quiet_hooks ====
     // ==== end 17-scenario-blocks quiet_hooks ====
     // ==== 18-restore quiet_hooks ====
+    v.extend(restore::quiet_hooks());
     // ==== end 18-restore quiet_hooks ====
     v
 }
