@@ -1,0 +1,6 @@
+{
+  "name": "09-delete-checkpoint-next-id",
+  "setup": [{"createQueryCheckpoint": {}}],
+  "requests": [{"deleteQueryCheckpoint": {"checkpointId": "2"}}],
+  "expectReason": "CHECKPOINT_NOT_FOUND"
+}
