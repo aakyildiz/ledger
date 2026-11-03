@@ -32,6 +32,7 @@ pub mod smoke;
 // ==== 14-rust-probes mods ====
 // ==== end 14-rust-probes mods ====
 // ==== 15-convergence mods ====
+pub mod convergence;
 // ==== end 15-convergence mods ====
 // ==== 16-signing mods ====
 // ==== end 16-signing mods ====
@@ -151,6 +152,7 @@ pub fn quiet_hooks() -> Vec<crate::quiet::QuietHook> {
     // ==== 14-rust-probes quiet_hooks ====
     // ==== end 14-rust-probes quiet_hooks ====
     // ==== 15-convergence quiet_hooks ====
+    v.extend(convergence::quiet_hooks());
     // ==== end 15-convergence quiet_hooks ====
     // ==== 16-signing quiet_hooks ====
     // ==== end 16-signing quiet_hooks ====
