@@ -325,7 +325,6 @@ pub(crate) fn attempt(d: &Driver, st: &mut TicketState, route: &Route) -> (u64, 
     st.ops.push((op, route.clone()));
     let out = d.s.clients.call_with_op(op, route, "bucket", "Apply", req, &opts);
     st.attempts.push(AttemptRecord { op_id: op, class: out.class(), code: out.code.clone(), reason: out.reason.clone() });
-    explore_attempt(&out);
     if out.local_message_size() {
         check_unreachable!("a tracked write outcome fits the client's message limit", json!({"wid": st.wid, "ticket": st.ticket, "outcome": out.summary()}));
     }
@@ -333,6 +332,9 @@ pub(crate) fn attempt(d: &Driver, st: &mut TicketState, route: &Route) -> (u64, 
 }
 
 /// The write-path exploration assertions on one attempt's reason (DESIGN §4.9).
+/// `Clients::call_with_op` runs it on every `Apply` answer, so tracked
+/// attempts, untracked sends (`send_untracked`) and the rules' direct
+/// Applies (idempotency replays, probes) all count.
 pub fn explore_attempt(out: &Outcome) {
     match out.reason.as_str() {
         "STALE_PROPOSAL" => check_sometimes!(true, "a write attempt is refused as a stale proposal", json!({"code": out.code})),

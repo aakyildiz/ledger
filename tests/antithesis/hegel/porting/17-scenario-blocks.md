@@ -20,6 +20,19 @@ Code:
 - `HG/driver/src/rules/blocks.rs`: setup hook `blocks_setup`, rule `block_run` (weight 1.5),
   and `scenario_blocks!`, which declares the 26 names and expands to one literal
   `check_reachable!` and one literal `check_unreachable!` per block.
+- Chaining (`chained_consumer`, `run_blocks`): `block_run` draws `chain` (1/2) before any
+  call. When the drawn block succeeds and `chain` is set, its consumer runs next through the
+  same client, with values mapped so that it picks the entity the producer just funded (each
+  `Intn` takes one value modulo its bound): `subscription/fund` → `charge` (same subscriber)
+  → `recognize`; `marketplace/deposit` → `purchase` (same customer) → `payout` (values
+  rotated by one: purchase's merchant is payout's first draw); `lending/fund_pool` →
+  `disburse` → `provision` (same borrower); `payroll/fund_clearing` → `distribute` →
+  `cost_alloc` (first value mapped to the allocation drawn from the funded department). The
+  chain continues while each block succeeds and stops when less than 2 s of its 8 s
+  client-side budget is left. Without it each consumer drew its entity independently (1 in 50
+  for `charge`, 1 in 10 for `payout` and `provision`), and Antithesis run 67-0 (timelines of
+  20–60 s) never saw `charge`, `recognize`, `payout`, `provision` or `cost_alloc` succeed:
+  every attempt was `precondition not met`.
 
 ## Old assertions
 
@@ -51,13 +64,15 @@ choice among the 26 replaces it.
 | `a block never runs out of its pre-drawn values` | AlwaysOrUnreachable (`exhausted == false`), every answered `/block`; the Sometimes above cannot detect exhaustion (no block uses more than 5 values, `TestEveryBlockUsesAtMostFiveValues`) | rules/blocks.rs `block_run` |
 | `a block's post-commit volumes are well formed` | Always | rules/blocks.rs `block_run` |
 | `the client program accepts every block request` | Unreachable (the client answered `/block` with a non-200) | rules/blocks.rs `post_block` |
+| `a chained consumer block succeeds after its producer commits` | Sometimes, every non-transient answer of a chained consumer. Not an Always: a concurrent block can drain the entity in between. It also makes a chained consumer that always skips visible: `GetColoredAccountBalance` turns a read error into `ErrSkip`, which `report` does not assert on | rules/blocks.rs `run_blocks` |
 
 ## Reachability
 
 | Must-hit | Reached by | Needs |
 |---|---|---|
 | `should be able to setup scenario` | `blocks_setup` (setup hook, 6 evaluations) | no faults |
-| `block <name> succeeded` × 26 | `block_run`: every block is drawn with equal weight; the 16 values make a success likely once the group's ledger has funds. Blocks that read balances (`purchase`, `payout`, `buy_item`, `p2p_trade`, `clawback`, `disburse`, `repay`, `provision`, `write_off`, `charge`, `recognize`, `fx`, `vendor_pay`, `distribute`, `pay_salary`, `cost_alloc`, `revert`) skip until a funding block of the same group succeeded; in a long run every funding block is drawn many times | no faults (long enough run) |
+| `block <name> succeeded` × 26 | `block_run`: every block is drawn with equal weight; the 16 values make a success likely once the group's ledger has funds. Blocks that read balances (`purchase`, `payout`, `buy_item`, `p2p_trade`, `clawback`, `disburse`, `repay`, `provision`, `write_off`, `charge`, `recognize`, `fx`, `vendor_pay`, `distribute`, `pay_salary`, `cost_alloc`, `revert`) skip until a funding block of the same group succeeded; `charge`, `recognize`, `purchase`, `payout`, `disburse`, `provision`, `distribute` and `cost_alloc` are also reached by chaining right after their producer | no faults |
+| `a chained consumer block succeeds after its producer commits` | any chained consumer | no faults |
 | `a block's post-commit volumes are well formed` | any succeeded block | no faults |
 | `a block runs within its pre-drawn values` | any answered `/block` (the largest block uses 5 of the 16 values) | no faults |
 

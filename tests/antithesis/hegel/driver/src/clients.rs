@@ -620,6 +620,7 @@ impl Clients {
         };
         if service == "bucket" && method == "Apply" {
             self.note_apply(&out);
+            crate::write::explore_attempt(&out);
         }
         out
     }
