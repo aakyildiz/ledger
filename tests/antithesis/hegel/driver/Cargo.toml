@@ -1,0 +1,15 @@
+[package]
+name = "driver"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+antithesis_sdk = "0.3.0"
+base64 = "0.22"
+hegeltest = { version = "0.51.0", features = ["static-engine"] }
+serde_json = "1"
+ureq = { version = "2.12", default-features = false, features = ["json"] }
+
+[profile.release]
+debug = 1

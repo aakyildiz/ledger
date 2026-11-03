@@ -1,0 +1,22 @@
+# Local coverage runs: `go build -cover` ledger nodes writing to a shared volume.
+# Use with docker-compose.local.yaml.
+x-cov: &cov
+  build:
+    context: ../../..
+    dockerfile: tests/antithesis/hegel/ledger/Dockerfile.coverage
+  image: ledger-hegel-coverage:latest
+services:
+  ledger-0:
+    <<: *cov
+    environment: { GOCOVERDIR: /coverage/ledger-0 }
+    volumes: [coverage:/coverage]
+  ledger-1:
+    <<: *cov
+    environment: { GOCOVERDIR: /coverage/ledger-1 }
+    volumes: [coverage:/coverage]
+  ledger-2:
+    <<: *cov
+    environment: { GOCOVERDIR: /coverage/ledger-2 }
+    volumes: [coverage:/coverage]
+volumes:
+  coverage:

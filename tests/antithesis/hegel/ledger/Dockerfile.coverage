@@ -1,0 +1,26 @@
+# Local coverage build of the ledger server (go build -cover); not for Antithesis.
+FROM golang:1.27.3-trixie AS compiler
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY main.go .
+COPY internal internal
+COPY cmd cmd
+COPY pkg pkg
+RUN go build -cover -covermode=atomic -coverpkg=github.com/formancehq/ledger/v3/... -tags "s3,nats" -o /ledger-server .
+
+FROM rust:1-trixie AS log-forward
+RUN rustup target add x86_64-unknown-linux-musl
+COPY tests/antithesis/hegel/log-forward/Cargo.toml /src/Cargo.toml
+COPY tests/antithesis/hegel/log-forward/src /src/src
+RUN cd /src && cargo build --release --target x86_64-unknown-linux-musl
+
+FROM debian:trixie
+RUN apt-get update && apt-get install -y ca-certificates tzdata && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY --from=compiler /ledger-server /app/ledger-server
+COPY --from=log-forward /src/target/x86_64-unknown-linux-musl/release/log-forward /usr/local/bin/
+COPY tests/antithesis/hegel/forward-logs /usr/local/bin/
+COPY tests/antithesis/hegel/ledger/start.sh /app/start.sh
+RUN chmod 755 /usr/local/bin/forward-logs /app/start.sh
+ENTRYPOINT ["forward-logs", "/app/start.sh"]

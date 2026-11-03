@@ -1,0 +1,6 @@
+# Local runs only: SDK output to a file, and frequent quiet periods.
+services:
+  driver:
+    environment:
+      ANTITHESIS_SDK_LOCAL_OUTPUT: /tmp/sdk.jsonl
+      QUIET_PROBABILITY: "0.004"
