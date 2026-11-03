@@ -68,15 +68,18 @@ fn existing_pool_types(view: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// `addAccountType t-N` (pattern `t-N:{id}`): top-level, or nested (1/4,
-/// always with the opt-in) under `apply` with `ACCOUNT_TYPE_ALREADY_EXISTS`.
+/// `addAccountType t-N` (pattern `t-N:{id}`): top-level, or nested under
+/// `apply` with the `ACCOUNT_TYPE_ALREADY_EXISTS` opt-in when `compose_bulk`
+/// asks for the opt-in variant (1/4 per slot). As in `M/apply_surface.go`
+/// maybeAddSkippableReason, nesting and the opt-in go together, so the
+/// nested form is drawn exactly 1/4 of the time.
 fn gen_chart_add(_d: &Driver, tc: &TestCase, ctx: &BulkCtx, opt_in: bool) -> Option<Value> {
     if !chart_applies(ctx) {
         return None;
     }
     let name = pool_name(tc);
     let account_type = json!({"name": name, "pattern": format!("{name}:{{id}}"), "persistence": persistence(tc)});
-    let nested = opt_in || draw::chance(tc, 0.25);
+    let nested = opt_in;
     if !nested {
         return Some(json!({"addAccountType": {"ledger": ctx.ledger, "accountType": account_type}}));
     }
@@ -95,7 +98,7 @@ fn gen_chart_remove(_d: &Driver, tc: &TestCase, ctx: &BulkCtx, opt_in: bool) -> 
     }
     let existing = existing_pool_types(ctx.ledger_view);
     let name = if !existing.is_empty() && draw::chance(tc, 0.5) { draw::one_of(tc, &existing).clone() } else { pool_name(tc) };
-    let nested = opt_in || draw::chance(tc, 0.25);
+    let nested = opt_in;
     if !nested {
         return Some(json!({"removeAccountType": {"ledger": ctx.ledger, "name": name}}));
     }
@@ -139,18 +142,32 @@ pub fn pick_chart_ledger(d: &Driver, tc: &TestCase) -> Option<(String, Value)> {
     Some((ledger, view))
 }
 
-/// `compose_bulk` over this family's generators, one slot at a time with
-/// the generator list rotated by a drawn offset. `draw::weighted` draws a
-/// 32-bit integer that hegel biases toward small values, so without the
-/// rotation the first generator takes nearly every slot (observed in the
-/// native smoke: no enforcement order in 180 s).
+/// Picks one of this family's generators by the spec weights (1.5/1.5/0.5)
+/// with `draw::chance` booleans. `draw::weighted` draws a 32-bit integer that
+/// hegel biases toward small values, so it picks the first generator nearly
+/// every time (observed in the native smoke: no enforcement order in 180 s).
+pub fn pick_chart_gen(tc: &TestCase) -> usize {
+    let gens = order_gens();
+    let total: f64 = gens.iter().map(|g| g.weight).sum();
+    let mut rest = total;
+    for (i, g) in gens.iter().enumerate().take(gens.len() - 1) {
+        if draw::chance(tc, g.weight / rest) {
+            return i;
+        }
+        rest -= g.weight;
+    }
+    gens.len() - 1
+}
+
+/// `compose_bulk` over this family's generators, one slot at a time: each
+/// slot's generator comes from `pick_chart_gen` (spec weights) and
+/// `compose_bulk` then draws the opt-in and the order.
 pub fn compose_chart(d: &Driver, tc: &TestCase, ledger: &str, view: &Value, len: usize) -> Vec<Value> {
     let mut out = Vec::with_capacity(len);
     for _ in 0..len {
         let mut gens = order_gens();
-        let k = draw::pick(tc, gens.len());
-        gens.rotate_left(k);
-        out.extend(compose_bulk(d, tc, &gens, ledger, view, 1));
+        let g = gens.swap_remove(pick_chart_gen(tc));
+        out.extend(compose_bulk(d, tc, &[g], ledger, view, 1));
     }
     out
 }
@@ -241,6 +258,31 @@ mod tests {
             assert_eq!(e["apply"]["skippableReasons"], json!(["ERROR_REASON_ACCOUNT_TYPE_NOT_FOUND"]), "a disallowed reason on the setter");
             for v in [gen_chart_add(&d, tc, &ctx, false).unwrap(), gen_chart_remove(&d, tc, &ctx, false).unwrap(), gen_enforcement(&d, tc, &ctx, false).unwrap()] {
                 assert!(v.get("apply").and_then(|a| a.get("skippableReasons")).is_none(), "no opt-in without the flag: {v}");
+            }
+        });
+    }
+
+    /// The generator mix follows the spec weights (3/7, 3/7, 1/7) and the
+    /// nested form is exactly the opt-in variant.
+    #[test]
+    fn generator_mix_follows_the_spec_weights() {
+        let (d, _, _) = testkit::driver();
+        let counts = std::sync::Mutex::new([0usize; 3]);
+        testkit::with_tc_n(700, |tc| {
+            counts.lock().unwrap()[pick_chart_gen(tc)] += 1;
+        });
+        let c = *counts.lock().unwrap();
+        let n: usize = c.iter().sum();
+        let frac = |i: usize| c[i] as f64 / n as f64;
+        assert!(frac(2) > 0.04 && frac(2) < 0.30, "enforcement ≈ 1/7: {c:?}");
+        assert!(frac(0) > 0.25 && frac(1) > 0.25, "add and remove ≈ 3/7 each: {c:?}");
+        let run = d.s.run.clone();
+        let view = json!({});
+        let ctx = BulkCtx { run: &run, ledger: "o-test-l1", ledger_view: &view, index_in_bulk: 0, len: 1 };
+        testkit::with_tc_n(50, |tc| {
+            for g in [gen_chart_add, gen_chart_remove] {
+                assert!(g(&d, tc, &ctx, false).unwrap().get("apply").is_none(), "top-level without the opt-in");
+                assert!(g(&d, tc, &ctx, true).unwrap().get("apply").is_some(), "nested with the opt-in");
             }
         });
     }

@@ -10,6 +10,10 @@ import (
 // extKey is the family's Tracker side table key.
 const extKey = "ledgers"
 
+// maxPendingDeleted caps the deleted names the deletion coverage probe
+// remembers (the side table must not grow for the whole run).
+const maxPendingDeleted = 256
+
 // sideTable is the observation state the coverage hooks keep
 // (M/checker.go pendingDeleted / pendingPromoted).
 type sideTable struct {
@@ -40,7 +44,12 @@ func DrainHook(t *oc.Tracker, rec oc.WriteRecord, resp *servicepb.ApplyResponse,
 		}
 		switch {
 		case req.GetDeleteLedger() != nil:
-			st.pendingDeleted[req.GetDeleteLedger().GetName()] = struct{}{}
+			// Bounded: the probe needs one recreate of a remembered name, and
+			// the rule-owned deletion probes delete a reserved ledger per run
+			// that nothing ever recreates.
+			if len(st.pendingDeleted) < maxPendingDeleted {
+				st.pendingDeleted[req.GetDeleteLedger().GetName()] = struct{}{}
+			}
 		case req.GetPromoteLedger() != nil:
 			st.pendingPromoted[req.GetPromoteLedger().GetLedger()] = struct{}{}
 		case req.GetApply() != nil && log != nil && isSuccessfulBusinessWrite(req, log):

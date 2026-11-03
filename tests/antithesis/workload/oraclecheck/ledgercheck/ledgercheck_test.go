@@ -1,6 +1,8 @@
 package ledgercheck
 
 import (
+	"fmt"
+
 	"encoding/json"
 	"slices"
 	"testing"
@@ -436,6 +438,19 @@ func TestLifecycleCoverage(t *testing.T) {
 	require.Empty(t, rawIDs(applyHooks(t, s, nestedRemove(m4, "t-9"))), "a skipped chart order proves nothing")
 	require.Equal(t, []oc.EventID{EvLcCovPromotion}, rawIDs(applyHooks(t, s, testutil.TxReq(m4, "", "world", "users:1", "COIN", 1))))
 	require.Empty(t, rawIDs(applyHooks(t, s, testutil.TxReq(m4, "", "world", "users:1", "COIN", 1))))
+}
+
+// The deletion probe's side table stays bounded however many ledgers the
+// run deletes.
+func TestPendingDeletedIsBounded(t *testing.T) {
+	t.Parallel()
+	s := fleet(t)
+	reqs := make([]*servicepb.Request, 0, 2*maxPendingDeleted)
+	for i := range 2 * maxPendingDeleted {
+		reqs = append(reqs, testutil.DeleteLedgerReq(fmt.Sprintf("%sown%d", prefix, i)))
+	}
+	DrainHook(s.T, oc.WriteRecord{Requests: reqs}, &servicepb.ApplyResponse{}, oracle.GlobalState{}, oracle.GlobalState{})
+	require.Len(t, table(s.T).pendingDeleted, maxPendingDeleted)
 }
 
 // The hooks are registered and wired through the tracker: a real session

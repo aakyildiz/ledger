@@ -49,13 +49,21 @@ pub const MIN_LIVE: usize = 2;
 pub const ROTATION_TXS: u64 = 3000;
 /// The chain budget of a rule-owned deletion probe's writes.
 pub const CHAIN_BUDGET: Duration = Duration::from_secs(12);
+/// Extra time a probe's cleanup delete gets once the chain budget is spent
+/// (the probe that creates a reserved ledger deletes it).
+pub const CLEANUP_GRACE: Duration = Duration::from_secs(2);
+/// The pause between two attempts of a Rust-direct read.
+pub const READ_RETRY_PAUSE: Duration = Duration::from_millis(200);
 
 /// Lifecycle operations in flight (soft reservations, `M/checker.go`
 /// reserveLedgerCreate), so concurrent rules do not overshoot the bounds.
 #[derive(Default)]
 pub struct LedgersExt {
+    /// Normal creates and promotions in flight (both add a live normal ledger).
     pub pending_creates: AtomicU64,
     pub pending_deletes: AtomicU64,
+    /// Mirror creates in flight.
+    pub pending_mirrors: AtomicU64,
 }
 
 fn names(v: &Value, key: &str) -> Vec<String> {
@@ -83,6 +91,7 @@ pub struct LifecycleInput {
     pub tx_counts: Vec<(String, u64)>,
     pub pending_creates: u64,
     pub pending_deletes: u64,
+    pub pending_mirrors: u64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -109,15 +118,24 @@ fn draw_ledger_meta(tc: &TestCase) -> Vec<(String, Value)> {
 }
 
 /// The lifecycle decision (all draws). Reserved names in the input are
-/// ignored; l1/l2 are never deleted; nothing is deleted at `MIN_LIVE`; nothing
-/// is created at `LIVE_TARGET`.
+/// ignored; l1/l2 are never deleted; nothing is deleted at `MIN_LIVE`;
+/// nothing that adds a live normal ledger (a normal create or a promotion) is
+/// chosen at `LIVE_TARGET` (pending ones included); no mirror is created at
+/// `MAX_MIRRORS` (pending ones included).
+///
+/// A promotion turns a mirror into a live normal ledger, so it competes with
+/// the normal create below the target instead of firing at the target as the
+/// spec's table suggests (that would grow live past `LIVE_TARGET`).
 pub fn choose_lifecycle(tc: &TestCase, run: &str, input: &LifecycleInput) -> Option<LifecycleAction> {
     let keep = |v: &Vec<String>| v.iter().filter(|n| !reserved(run, n)).cloned().collect::<Vec<_>>();
     let (live, deleted, mirror) = (keep(&input.live), keep(&input.deleted), keep(&input.mirror));
     let target = LIVE_TARGET as usize;
     if live.len() + (input.pending_creates as usize) < target {
+        if !mirror.is_empty() && draw::chance(tc, 0.25) {
+            return Some(LifecycleAction::Promote(draw::one_of(tc, &mirror).clone()));
+        }
         let meta = draw_ledger_meta(tc);
-        if mirror.len() < MAX_MIRRORS && draw::chance(tc, 0.25) {
+        if mirror.len() + (input.pending_mirrors as usize) < MAX_MIRRORS && draw::chance(tc, 0.25) {
             return Some(LifecycleAction::CreateMirror { meta });
         }
         return Some(LifecycleAction::CreateNormal { meta });
@@ -136,9 +154,6 @@ pub fn choose_lifecycle(tc: &TestCase, run: &str, input: &LifecycleInput) -> Opt
     }
     if can_delete && !deletable.is_empty() && draw::chance(tc, 0.25) {
         return Some(LifecycleAction::Delete { name: draw::one_of(tc, &deletable).clone(), rotation: false });
-    }
-    if !mirror.is_empty() && draw::chance(tc, 0.25) {
-        return Some(LifecycleAction::Promote(draw::one_of(tc, &mirror).clone()));
     }
     None
 }
@@ -182,6 +197,7 @@ pub fn ledger_lifecycle(d: &Driver, tc: TestCase) {
             tx_counts: vec![],
             pending_creates: ext.pending_creates.load(Ordering::SeqCst),
             pending_deletes: ext.pending_deletes.load(Ordering::SeqCst),
+            pending_mirrors: ext.pending_mirrors.load(Ordering::SeqCst),
         };
         let candidates: Vec<String> = input.live.iter().filter(|n| !protected(&run, n) && !reserved(&run, n)).cloned().collect();
         if input.live.len() >= LIVE_TARGET as usize && !candidates.is_empty() {
@@ -196,7 +212,8 @@ pub fn ledger_lifecycle(d: &Driver, tc: TestCase) {
         plan.requests = vec![lifecycle_request(d, &action)];
         plan.hint = json!({"gen": "ledger_lifecycle", "action": format!("{action:?}").split([' ', '(', '{']).next().unwrap_or("")});
         let counter = match &action {
-            LifecycleAction::CreateNormal { .. } => Some(&ext.pending_creates),
+            LifecycleAction::CreateNormal { .. } | LifecycleAction::Promote(_) => Some(&ext.pending_creates),
+            LifecycleAction::CreateMirror { .. } => Some(&ext.pending_mirrors),
             LifecycleAction::Delete { .. } => Some(&ext.pending_deletes),
             _ => None,
         };
@@ -310,13 +327,22 @@ pub fn ledger_delete_race(d: &Driver, tc: TestCase) {
         if !matches!(chain_step(d, create, deadline), Step::Ok(_)) {
             return None;
         }
-        let _ = chain_step(d, pre, deadline);
+        // From here on every early return still deletes the reserved ledger
+        // (best effort, a short grace past the chain budget).
+        let cleanup_now = |p: WritePlan| {
+            let _ = chain_step(d, p, deadline.max(Instant::now() + CLEANUP_GRACE));
+        };
+        if matches!(chain_step(d, pre, deadline), Step::Inconclusive) {
+            // A handed-off step makes the rest inconclusive.
+            cleanup_now(cleanup);
+            return None;
+        }
         let mut g = match d.s.slots.try_acquire_up_to(6) {
             Some(g) if g.len() >= 2 => g,
             other => {
                 // No race possible now: still delete what the probe created.
                 drop(other);
-                let _ = chain_step(d, cleanup, deadline);
+                cleanup_now(cleanup);
                 return None;
             }
         };
@@ -324,6 +350,8 @@ pub fn ledger_delete_race(d: &Driver, tc: TestCase) {
         g.split(1 + k);
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
+            drop(g);
+            cleanup_now(cleanup);
             return None;
         }
         let mut plans = vec![delete];
@@ -369,17 +397,44 @@ fn step_of_ref(r: &WriteResult) -> Option<Result<(), Outcome>> {
     }
 }
 
-/// A read outcome that says nothing (retried).
-fn transient(o: &Outcome) -> bool {
-    o.is_unknown() || matches!(o.code.as_str(), "Unavailable" | "DeadlineExceeded" | "Canceled")
+/// A read outcome that says nothing about the ledger (retried, then
+/// skipped). The old driver skipped `internal.IsTolerated` errors (no answer,
+/// Unavailable, DeadlineExceeded, Canceled, `EXTERNAL_SERVICE_ERROR`,
+/// `WRITES_BLOCKED_DISK_FULL`); this also skips client-local errors, answers
+/// without a code, and the codes a node restart or overload produces
+/// (Unknown, Aborted, ResourceExhausted). Internal stays an answer, as in the
+/// old driver.
+pub fn transient(o: &Outcome) -> bool {
+    if o.is_unknown() {
+        return true;
+    }
+    if o.ok {
+        return false;
+    }
+    o.local
+        || o.code.is_empty()
+        || matches!(o.code.as_str(), "Unavailable" | "DeadlineExceeded" | "Canceled" | "Unknown" | "Aborted" | "ResourceExhausted")
+        || matches!(o.reason.as_str(), "EXTERNAL_SERVICE_ERROR" | "WRITES_BLOCKED_DISK_FULL")
 }
 
 /// A Rust-direct linearizable read: one attempt plus ≤ 3 retries on
-/// transient outcomes; `None` if every attempt was transient.
-fn direct_read(d: &Driver, route: &Route, method: &str, req: Value, max_items: Option<u64>) -> Option<Outcome> {
+/// transient outcomes, all before `deadline` (each attempt's RPC timeout is
+/// capped by what is left); `None` (skipped) if every attempt was transient
+/// or the deadline ran out.
+fn direct_read(d: &Driver, route: &Route, method: &str, req: Value, max_items: Option<u64>, deadline: Instant) -> Option<Outcome> {
     let mut opts = CallOpts::linearizable();
     opts.max_items = max_items;
-    for _ in 0..4 {
+    let full = opts.timeout;
+    for i in 0..4 {
+        if i > 0 {
+            let pause = READ_RETRY_PAUSE.min(deadline.saturating_duration_since(Instant::now()));
+            std::thread::sleep(pause);
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return None;
+        }
+        opts.timeout = full.min(left);
         let (_, o) = d.call(route, "bucket", method, req.clone(), &opts);
         if !transient(&o) {
             return Some(o);
@@ -422,6 +477,8 @@ pub fn ledger_recreate_probe(d: &Driver, tc: TestCase) {
         let delete = probe_plan(d, tc, "ledgers", vec![json!({"deleteLedger": {"name": ledger}})]);
         let deleted_write = probe_plan(d, tc, "ledgers", vec![forced_tx(&ledger, &format!("users:own-rca{n}"), 100, None)]);
         let recreate = probe_plan(d, tc, "ledgers", vec![json!({"createLedger": {"name": ledger}})]);
+        let recreate_after = probe_plan(d, tc, "ledgers", vec![json!({"createLedger": {"name": ledger}})]);
+        let delete_on_failed_seed = probe_plan(d, tc, "ledgers", vec![json!({"deleteLedger": {"name": ledger}})]);
         let other = d.s.next_own_ledger();
         let create_other = probe_plan(d, tc, "ledgers", vec![json!({"createLedger": {"name": other}}), forced_tx(&other, &format!("users:own-rcm{n}"), 100, None)]);
         let reuse = probe_plan(d, tc, "ledgers", vec![forced_tx(&other, &format!("users:own-rcn{n}:0"), 100, Some(&refs[0]))]);
@@ -435,39 +492,43 @@ pub fn ledger_recreate_probe(d: &Driver, tc: TestCase) {
         }
         let ids = match chain_step(d, seeds, deadline) {
             Step::Ok(o) => created_ids(&o),
-            Step::Failed(_) => vec![],
-            Step::Inconclusive => return None,
+            Step::Failed(_) | Step::Inconclusive => {
+                // No acknowledged predecessor (the old driver stops here
+                // too): nothing to check, but delete what the probe created.
+                let _ = chain_step(d, delete_on_failed_seed, deadline.max(Instant::now() + CLEANUP_GRACE));
+                return None;
+            }
         };
         if !matches!(chain_step(d, delete, deadline), Step::Ok(_)) {
             return None;
         }
 
         // Linearizable reads of the deleted ledger: NotFound everywhere.
-        let o = direct_read(d, &route, "GetLedger", json!({"ledger": ledger}), None)?;
+        let o = direct_read(d, &route, "GetLedger", json!({"ledger": ledger}), None, deadline)?;
         check_always!(is_not_found(&o), "deleted ledger is hidden from ledger reads", json!({"ledger": ledger, "outcome": o.summary()}));
         if !is_not_found(&o) {
             return None;
         }
         for id in &ids {
-            let o = direct_read(d, &route, "GetTransaction", json!({"ledger": ledger, "transactionId": id.to_string()}), None)?;
+            let o = direct_read(d, &route, "GetTransaction", json!({"ledger": ledger, "transactionId": id.to_string()}), None, deadline)?;
             check_always!(is_not_found(&o), "deleted ledger hides predecessor transaction point reads", json!({"ledger": ledger, "transactionId": id, "outcome": o.summary()}));
             if !is_not_found(&o) {
                 return None;
             }
         }
         for a in &accounts {
-            let o = direct_read(d, &route, "GetAccount", json!({"ledger": ledger, "address": a}), None)?;
+            let o = direct_read(d, &route, "GetAccount", json!({"ledger": ledger, "address": a}), None, deadline)?;
             check_always!(is_not_found(&o), "deleted ledger hides predecessor account point reads", json!({"ledger": ledger, "account": a, "outcome": o.summary()}));
             if !is_not_found(&o) {
                 return None;
             }
         }
-        let o = direct_read(d, &route, "ListTransactions", json!({"ledger": ledger, "options": {"pageSize": 10}}), Some(1))?;
+        let o = direct_read(d, &route, "ListTransactions", json!({"ledger": ledger, "options": {"pageSize": 10}}), Some(1), deadline)?;
         check_always!(is_not_found(&o), "deleted ledger exposes no predecessor transactions", json!({"ledger": ledger, "outcome": o.summary()}));
         if !is_not_found(&o) {
             return None;
         }
-        let o = direct_read(d, &route, "ListAccounts", json!({"ledger": ledger, "options": {"pageSize": 10}}), Some(1))?;
+        let o = direct_read(d, &route, "ListAccounts", json!({"ledger": ledger, "options": {"pageSize": 10}}), Some(1), deadline)?;
         check_always!(is_not_found(&o), "deleted ledger exposes no predecessor accounts", json!({"ledger": ledger, "outcome": o.summary()}));
         if !is_not_found(&o) {
             return None;
@@ -493,16 +554,17 @@ pub fn ledger_recreate_probe(d: &Driver, tc: TestCase) {
         }
         let mut cleanup = Some(delete_other);
         let result = (|| {
-            let o = direct_read(d, &route, "ListTransactions", json!({"ledger": other, "options": {"pageSize": 100}}), Some(101))?;
-            if o.is_ok() {
+            let o = direct_read(d, &route, "ListTransactions", json!({"ledger": other, "options": {"pageSize": 100}}), Some(101), deadline)?;
+            // Only a complete listing proves the predecessor's absence.
+            if o.is_ok() && o.complete {
                 let items = o.items.clone().unwrap_or_default();
                 let leaked_tx = items.iter().any(|t| t.get("reference").and_then(Value::as_str).is_some_and(|r| refs.iter().any(|x| x == r)));
                 check_always!(!leaked_tx, "other ledger never exposes predecessor transactions", details.clone());
                 let leaked_acct = items.iter().flat_map(|t| t.get("postings").and_then(Value::as_array).cloned().unwrap_or_default()).any(|p| {
                     [p.get("source"), p.get("destination")].iter().any(|s| s.and_then(|v| v.as_str()).is_some_and(|s| accounts.iter().any(|a| a == s)))
                 });
-                let o2 = direct_read(d, &route, "ListAccounts", json!({"ledger": other, "options": {"pageSize": 100}}), Some(101))?;
-                if o2.is_ok() {
+                let o2 = direct_read(d, &route, "ListAccounts", json!({"ledger": other, "options": {"pageSize": 100}}), Some(101), deadline)?;
+                if o2.is_ok() && o2.complete {
                     let listed = o2.items.clone().unwrap_or_default().iter().any(|a| a.get("address").and_then(Value::as_str).is_some_and(|s| accounts.iter().any(|x| x == s)));
                     check_always!(!leaked_acct && !listed, "other ledger never exposes predecessor account activity", details.clone());
                 }
@@ -513,12 +575,22 @@ pub fn ledger_recreate_probe(d: &Driver, tc: TestCase) {
                     let d2 = json!({"ledger": ledger, "otherLedger": other, "reference": refs[0], "outcome": o.summary()});
                     check_sometimes!(o.is_ok(), "predecessor reference accepted by another ledger", d2.clone());
                     check_always!(o.is_ok(), "predecessor references are reusable in another ledger", d2);
+                    if o.is_ok() {
+                        // The old driver re-checks the tombstone after the
+                        // reuse (`recreate-after`).
+                        match chain_step(d, recreate_after, deadline) {
+                            Step::Inconclusive => {}
+                            Step::Ok(o) | Step::Failed(o) => {
+                                check_always!(is_deleted_refusal(&o), "deleted ledger name remains permanently reserved", json!({"ledger": ledger, "outcome": o.summary(), "step": "after reuse"}));
+                            }
+                        }
+                    }
                 }
             }
             Some(())
         })();
         if let Some(p) = cleanup.take() {
-            let _ = chain_step(d, p, deadline.max(Instant::now() + Duration::from_secs(2)));
+            let _ = chain_step(d, p, deadline.max(Instant::now() + CLEANUP_GRACE));
         }
         result
     });
@@ -557,7 +629,9 @@ fn ledger_scoped_read(d: &Driver, tc: &TestCase, kind: &'static str, absent_pct:
     let route = draw::route(tc, &d.s);
     let rt = d.read_begin(kind, &[ViewReq::ledgers()], json!({}))?;
     let lv = rt.views().first()?.clone();
-    let (live, deleted) = (names(&lv, "live"), names(&lv, "deleted"));
+    // Live mirrors are live ledgers too (the old model's pool included them).
+    let (mut live, deleted) = (names(&lv, "live"), names(&lv, "deleted"));
+    live.extend(names(&lv, "mirror"));
     let (ledger, target) = match target {
         Target::Absent => (absent_name, Target::Absent),
         Target::Deleted if !deleted.is_empty() => (draw::one_of(tc, &deleted).clone(), Target::Deleted),
@@ -645,7 +719,7 @@ mod tests {
 
     fn input(live: &[&str], deleted: &[&str], mirror: &[&str], counts: &[(&str, u64)]) -> LifecycleInput {
         let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
-        LifecycleInput { live: s(live), deleted: s(deleted), mirror: s(mirror), tx_counts: counts.iter().map(|(n, c)| (n.to_string(), *c)).collect(), pending_creates: 0, pending_deletes: 0 }
+        LifecycleInput { live: s(live), deleted: s(deleted), mirror: s(mirror), tx_counts: counts.iter().map(|(n, c)| (n.to_string(), *c)).collect(), pending_creates: 0, pending_deletes: 0, pending_mirrors: 0 }
     }
 
     #[test]
@@ -676,13 +750,17 @@ mod tests {
                         assert!((1..=2).contains(&meta.len()));
                     }
                     Some(LifecycleAction::Recreate(n)) => assert_eq!(n, "o-test-l9"),
-                    Some(LifecycleAction::CreateExisting(n)) | Some(LifecycleAction::Promote(n)) => assert!(!n.contains("own")),
+                    Some(LifecycleAction::CreateExisting(n)) => assert!(!n.contains("own")),
+                    Some(LifecycleAction::Promote(n)) => {
+                        assert!(!n.contains("own"));
+                        assert!(live_n < LIVE_TARGET as usize, "a promotion adds a live ledger: never at the target");
+                    }
                     None => {}
                 }
             }
-            // Below the target: always a create; a mirror only below MAX_MIRRORS.
+            // Below the target: a normal create or a promotion; no mirror at MAX_MIRRORS.
             let a = choose_lifecycle(tc, run, &below).unwrap();
-            assert!(matches!(a, LifecycleAction::CreateNormal { .. }), "two mirrors already: {a:?}");
+            assert!(matches!(a, LifecycleAction::CreateNormal { .. } | LifecycleAction::Promote(_)), "two mirrors already: {a:?}");
         });
         assert!(rotated.get() > 0, "rotation reached");
         assert!(seen_delete_l4.get(), "plain deletes reached");
@@ -690,8 +768,93 @@ mod tests {
         let mut pend = input(&["o-test-l1", "o-test-l2", "o-test-l3"], &[], &[], &[]);
         pend.pending_creates = 1;
         testkit::with_tc_n(50, |tc| {
-            assert!(!matches!(choose_lifecycle(tc, run, &pend), Some(LifecycleAction::CreateNormal { .. }) | Some(LifecycleAction::CreateMirror { .. })));
+            assert!(!matches!(choose_lifecycle(tc, run, &pend), Some(LifecycleAction::CreateNormal { .. }) | Some(LifecycleAction::CreateMirror { .. }) | Some(LifecycleAction::Promote(_))));
         });
+    }
+
+    /// Live at the target with a mirror: never a promotion (it would take
+    /// live to 5); a promotion below the target only. Pending deletes guard
+    /// the minimum; pending mirror creates count toward `MAX_MIRRORS`.
+    #[test]
+    fn lifecycle_bounds_with_pending_work() {
+        let run = "test";
+        let at_target = input(&["o-test-l1", "o-test-l2", "o-test-l3", "o-test-l4"], &[], &["o-test-m5"], &[]);
+        let mut draining = at_target.clone();
+        draining.pending_deletes = 2;
+        let mut mirrors_pending = input(&["o-test-l1", "o-test-l2"], &[], &["o-test-m5"], &[]);
+        mirrors_pending.pending_mirrors = 1;
+        let below = input(&["o-test-l1", "o-test-l2", "o-test-l3"], &[], &["o-test-m5"], &[]);
+        let promoted = std::cell::Cell::new(false);
+        let deleted_at_target = std::cell::Cell::new(false);
+        testkit::with_tc_n(400, |tc| {
+            let a = choose_lifecycle(tc, run, &at_target);
+            assert!(!matches!(a, Some(LifecycleAction::Promote(_)) | Some(LifecycleAction::CreateNormal { .. }) | Some(LifecycleAction::CreateMirror { .. })), "{a:?}");
+            if matches!(a, Some(LifecycleAction::Delete { .. })) {
+                deleted_at_target.set(true);
+            }
+            // 4 live, 2 deletes in flight: deleting a third could leave 1.
+            let a = choose_lifecycle(tc, run, &draining);
+            assert!(!matches!(a, Some(LifecycleAction::Delete { .. })), "{a:?}");
+            let a = choose_lifecycle(tc, run, &mirrors_pending);
+            assert!(!matches!(a, Some(LifecycleAction::CreateMirror { .. })), "{a:?}");
+            if let Some(LifecycleAction::Promote(n)) = choose_lifecycle(tc, run, &below) {
+                assert_eq!(n, "o-test-m5");
+                promoted.set(true);
+            }
+        });
+        assert!(promoted.get(), "promotion reached below the target");
+        assert!(deleted_at_target.get(), "the delete guard is not vacuous");
+    }
+
+    #[test]
+    fn read_outcomes_that_say_nothing_are_skipped() {
+        let o = |v: Value| Outcome::from_json(&v);
+        for v in [
+            json!({"ok": false, "code": "Unavailable"}),
+            json!({"ok": false, "code": "ResourceExhausted"}),
+            json!({"ok": false, "code": "Aborted"}),
+            json!({"ok": false, "code": "Unknown"}),
+            json!({"ok": false, "code": ""}),
+            json!({"ok": false, "code": "FailedPrecondition", "reason": "EXTERNAL_SERVICE_ERROR"}),
+            json!({"ok": false, "code": "NotFound", "local": true}),
+        ] {
+            assert!(transient(&o(v.clone())), "{v}");
+        }
+        assert!(transient(&Outcome::unknown("timeout")));
+        for v in [json!({"ok": true}), json!({"ok": false, "code": "NotFound"}), json!({"ok": false, "code": "Internal"}), json!({"ok": false, "code": "FailedPrecondition", "reason": "LEDGER_DELETED"})] {
+            assert!(!transient(&o(v.clone())), "{v}");
+        }
+    }
+
+    /// A deleted-ledger read that keeps failing transiently is skipped
+    /// within the chain budget, not asserted on and not retried for minutes.
+    #[test]
+    fn recreate_probe_reads_stop_at_the_deadline() {
+        let (d, ft, fo) = testkit::driver();
+        testkit::reset();
+        ft.script("bucket", "Apply", vec![FakeReply::Outcome(ok_create_logs(&[])), FakeReply::Outcome(ok_create_logs(&[1, 2, 3, 4, 5])), FakeReply::Outcome(ok_create_logs(&[]))]);
+        ft.set_default("bucket", "GetLedger", FakeReply::Delayed(Duration::from_millis(300), Outcome::from_json(&json!({"ok": false, "code": "Unavailable"}))));
+        let t0 = Instant::now();
+        testkit::run_rule(&d, ledger_recreate_probe);
+        assert!(t0.elapsed() < CHAIN_BUDGET + CLEANUP_GRACE + Duration::from_secs(3), "{:?}", t0.elapsed());
+        assert!(!testkit::fired("deleted ledger is hidden from ledger reads"), "a transient read is never asserted on");
+        assert!(ft.calls_of("bucket", "GetLedger").len() <= 4);
+        let _ = fo;
+    }
+
+    #[test]
+    fn recreate_probe_stops_when_no_seed_was_acknowledged() {
+        let (d, ft, fo) = testkit::driver();
+        testkit::reset();
+        ft.script("bucket", "Apply", vec![FakeReply::Outcome(ok_create_logs(&[])), fail("FailedPrecondition", "INSUFFICIENT_FUNDS")]);
+        ft.set_default("bucket", "Apply", FakeReply::Outcome(ok_create_logs(&[])));
+        testkit::run_rule(&d, ledger_recreate_probe);
+        assert!(!testkit::fired("predecessor references are reusable in another ledger"));
+        assert!(!testkit::fired("deleted ledger is hidden from ledger reads"));
+        assert!(ft.calls_of("bucket", "GetLedger").is_empty());
+        let begins = fo.calls("/write/begin");
+        assert_eq!(begins.iter().filter(|b| b.pointer("/requests/0/deleteLedger").is_some()).count(), 1, "the reserved ledger is still deleted");
+        assert!(d.s.registry.snapshot().is_empty());
     }
 
     #[test]
@@ -793,8 +956,11 @@ mod tests {
         // create, seeds, delete commit; reads NotFound; deleted write and
         // recreate refused; other ledger created; lists empty; reuse commits;
         // delete other commits.
+        // create, seeds, delete; deleted write, recreate; create other,
+        // reuse; recreate after reuse; delete other.
         ft.script("bucket", "Apply", vec![FakeReply::Outcome(ok_create_logs(&[])), FakeReply::Outcome(ok_create_logs(&[1, 2, 3, 4, 5])), FakeReply::Outcome(ok_create_logs(&[]))]);
         ft.script("bucket", "Apply", vec![fail("FailedPrecondition", "LEDGER_DELETED"), fail("FailedPrecondition", "LEDGER_DELETED")]);
+        ft.script("bucket", "Apply", vec![FakeReply::Outcome(ok_create_logs(&[1])), FakeReply::Outcome(ok_create_logs(&[1])), fail("FailedPrecondition", "LEDGER_DELETED")]);
         ft.set_default("bucket", "Apply", FakeReply::Outcome(ok_create_logs(&[1])));
         for (m, n) in [("GetLedger", 1), ("GetTransaction", 5), ("GetAccount", 5), ("ListTransactions", 1), ("ListAccounts", 1)] {
             ft.script("bucket", m, vec![FakeReply::Outcome(Outcome::from_json(&json!({"ok": false, "code": "NotFound"}))); n]);
@@ -820,6 +986,8 @@ mod tests {
             assert!(!hits.is_empty(), "{lit} not evaluated");
             assert!(hits.iter().all(|r| r.cond), "{lit} failed: {:?}", hits);
         }
+        // The tombstone is checked before and after the reuse.
+        assert_eq!(a.iter().filter(|r| r.message == "deleted ledger name remains permanently reserved").count(), 2);
         // Every write went through the oracle on reserved ledgers.
         let begins = fo.calls("/write/begin");
         let creates: Vec<_> = begins.iter().filter_map(|b| b.pointer("/requests/0/createLedger/name").and_then(Value::as_str)).collect();

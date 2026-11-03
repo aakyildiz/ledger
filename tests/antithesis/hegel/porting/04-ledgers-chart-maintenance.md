@@ -45,16 +45,16 @@ Branch `hegel/04-ledgers-chart-maintenance`. Rust: `rules/ledgers.rs`, `rules/ch
 | MD/parallel_driver_concurrent_ledger_delete:171 | Reachable: concurrent ledger delete: post-delete write rejected | verbatim | `ledger_delete_race` |
 | MD/parallel_driver_ledger_recreate:48 | Always: ledger deletion scenario has no unexpected operation errors | oracle (every write of the probe is tracked: an unexpected failure is `oracle: bulk failure not explained by any serialization`); reads: transient outcomes retried ≤ 3 times then skipped | (00a) |
 | MD/parallel_driver_ledger_recreate:56 | Always: ledger deletion acknowledged transaction includes its created log | oracle: committed log count mismatch / transaction id mismatch (commit check) | (00a) |
-| MD/parallel_driver_ledger_recreate:67 | Always: deleted ledger name remains permanently reserved | verbatim (code FailedPrecondition + reason LEDGER_DELETED on the oracle-tracked recreate) | rules/ledgers.rs `ledger_recreate_probe` |
-| MD/parallel_driver_ledger_recreate:111 | Sometimes: ledger deletion predecessor write set recorded | dropped: the seed bulk is one tracked write; the oracle validates it | – |
+| MD/parallel_driver_ledger_recreate:67, :256 | Always: deleted ledger name remains permanently reserved | verbatim (code FailedPrecondition + reason LEDGER_DELETED on the oracle-tracked recreate), checked after the delete and again after a successful reference reuse, as the old `recreate-before`/`recreate-after` | rules/ledgers.rs `ledger_recreate_probe` |
+| MD/parallel_driver_ledger_recreate:111 | Sometimes: ledger deletion predecessor write set recorded | dropped: the seed bulk is one tracked write; the oracle validates it. As the old driver (lines 111–114), the probe stops (after deleting the reserved ledger) when the seeds were not acknowledged | – |
 | MD/parallel_driver_ledger_recreate:129 | Always: deleted ledger is hidden from ledger reads | verbatim | `ledger_recreate_probe` |
 | MD/parallel_driver_ledger_recreate:138 | Always: deleted ledger hides predecessor transaction point reads | verbatim | `ledger_recreate_probe` |
 | MD/parallel_driver_ledger_recreate:147 | Always: deleted ledger hides predecessor account point reads | verbatim | `ledger_recreate_probe` |
 | MD/parallel_driver_ledger_recreate:161 | Always: deleted ledger exposes no predecessor transactions | verbatim | `ledger_recreate_probe` |
 | MD/parallel_driver_ledger_recreate:173 | Always: deleted ledger exposes no predecessor accounts | verbatim | `ledger_recreate_probe` |
 | MD/parallel_driver_ledger_recreate:183 | Always: deleted ledger rejects new transaction writes | verbatim (FailedPrecondition + LEDGER_DELETED) | `ledger_recreate_probe` |
-| MD/parallel_driver_ledger_recreate:223 | Always: other ledger never exposes predecessor transactions | verbatim (first page of 100) | `ledger_recreate_probe` |
-| MD/parallel_driver_ledger_recreate:237 | Always: other ledger never exposes predecessor account activity | verbatim (first page of 100) | `ledger_recreate_probe` |
+| MD/parallel_driver_ledger_recreate:223 | Always: other ledger never exposes predecessor transactions | verbatim (first page of 100, evaluated only when the listing is complete) | `ledger_recreate_probe` |
+| MD/parallel_driver_ledger_recreate:237 | Always: other ledger never exposes predecessor account activity | verbatim (first page of 100, evaluated only when both listings are complete) | `ledger_recreate_probe` |
 | MD/parallel_driver_ledger_recreate:249 | Sometimes: predecessor reference accepted by another ledger | verbatim | `ledger_recreate_probe` |
 | MD/parallel_driver_ledger_recreate:250 | Always: predecessor references are reusable in another ledger | verbatim | `ledger_recreate_probe` |
 | MD/parallel_driver_delete_ledger:34 | Unreachable: Hegel driver generation failed | dropped: no Go generator | – |
@@ -92,6 +92,46 @@ Branch `hegel/04-ledgers-chart-maintenance`. Rust: `rules/ledgers.rs`, `rules/ch
   writes of `maintenance_window` had an attempt refused with reason MAINTENANCE_MODE.
 - Foreign tolerance of every ListLedgers check (DESIGN §3.2): structural row checks apply
   to foreign rows; the tracked window and row contents are compared with the model.
+
+## Deviations from the spec
+
+- **Promotion below the target.** The `ledgers` view lists a promoted mirror under `live`, so a
+  promotion at `live == LIVE_TARGET` (the spec's "else … 1/4 promote") would grow live normal
+  ledgers to 5, 6, …. `choose_lifecycle` promotes (1/4, when a mirror exists) in the branch that
+  would otherwise create a normal ledger, i.e. only when `live + pending creates < LIVE_TARGET`,
+  and counts an in-flight promotion as a pending create. Mirror creates have their own pending
+  counter, checked against `MAX_MIRRORS`. The old model (`M/actions.go:286-338`) had no bound.
+- **Chart generator weights.** `draw::weighted` (00c) almost always returns the first positive
+  weight (see Requests to 99), so `compose_chart` picks each slot's generator with a `draw::chance`
+  chain over the spec weights (1.5/1.5/0.5, i.e. 3/7, 3/7, 1/7) and hands `compose_bulk` that one
+  generator. An earlier version rotated the list by a uniform draw (≈ 1/3 each).
+- **Nested chart forms.** `chart_add`/`chart_remove` nest exactly when `compose_bulk` asks for the
+  opt-in variant (1/4 per slot), always with the opt-in, as `M/apply_surface.go`
+  maybeAddSkippableReason does; there is no nested form without the opt-in. The enforcement gen
+  keeps its nested-without-opt-in form (1/2), which the four mode × form coverage probes need.
+- **Recreate-probe reads.** Retried (≤ 3 times, 200 ms apart) and then skipped on outcomes that
+  say nothing about the ledger: the old driver's `internal.IsTolerated` set (no answer,
+  Unavailable, DeadlineExceeded, Canceled, `EXTERNAL_SERVICE_ERROR`, `WRITES_BLOCKED_DISK_FULL`)
+  plus client-local errors, answers without a code, and Unknown / Aborted / ResourceExhausted
+  (node restarts, overload). Internal remains an answer, as in the old driver. The reads share the
+  probe's 12 s chain deadline (each RPC timeout is capped by what is left), so the rule never
+  blocks for more than the chain budget plus a 2 s cleanup grace.
+- **Probe cleanup.** Both deletion probes delete their reserved ledger on every early return after
+  the create (inconclusive pre-writes, no slots, budget spent, unacknowledged seeds), with a 2 s
+  grace past the chain budget. `ledger_delete_race` stops when its pre-writes are inconclusive.
+- **Maintenance window lifecycle.** The window claim is an `Arc` held by every piece of the window
+  (the enable's follow-up, the disable and its follow-up, a disable retry) and released when the
+  last one goes: a definitively failed or dropped enable (rule or resolver) releases it, a
+  `/write/end` error after a committed enable does not, and the claim outlives the post-disable
+  probe. A disable that fails definitively (rule or resolver) is sent again by a quiet-blocking
+  retry job (up to 30 times, 1 s apart). Oracle refusals of the disable's begin: back-pressure is
+  retried; anything else is retried 5 times with backoff and then the driver enters degraded mode
+  explicitly before disabling untracked, so no untracked `setMaintenanceMode` is sent while the
+  oracle is healthy (DESIGN §3).
+- **Ledger-scoped reads** (`get_ledger`, `schema_status`) also target live mirrors, as the old
+  model's ledger pool did.
+- **Deletion coverage side table** (`ledgercheck` `pendingDeleted`) is capped at 256 names, since
+  nothing recreates the rule-owned probe ledgers.
 
 ## Reachability (must-hit)
 
@@ -132,6 +172,17 @@ inside `unshare -rn` (private loopback, so the fixed UDP ports 7777/7778 do not 
 other native runs on the machine) and with `HEALTH_WAL_THRESHOLD=HEALTH_DATA_THRESHOLD=0.995`
 exported, because the shared disk was above the server's 80 % write-block threshold.
 
+Re-run after the review fixes (machine load average 10–40 from parallel agents; same
+`unshare -rn` and threshold setup): all nine rules for 180 s, PASS, 0 findings; maintenance
+enable/disable, both probe Sometimes, `a write attempt hits maintenance mode`, the delete-race
+literals hit; the cluster sat in maintenance most of the run (one window right after another),
+so only ~270 tracked writes went through and the recreate probe never got past its create. Without
+`maintenance_window` (150 s): PASS, 0 findings, ~2000 writes, every recreate-probe literal hit, but
+`chart_bulk` (last in the rule list) never ran. `chart_bulk,ledger_lifecycle,smoke_tx` for 90 s:
+PASS, 0 findings, ~9600 writes, all apply-surface probes and the promotion probe hit; chart orders
+were add 2774 / remove 2837 / enforcement 1013 (≈ 3/7, 3/7, 1/7), with the opt-in nested form on a
+quarter of adds and removes.
+
 ## Requests to 99
 
 - `oracle: coverage mirror promotion and write recovery verified` needs task 02/03 writes on a
@@ -143,10 +194,20 @@ exported, because the shared disk was above the server's 80 % write-block thresh
   the old literal, so it is not added.
 - `draw::weighted` (00c) draws a 32-bit integer that hegel biases toward small values, so the
   first positive weight wins almost every draw (first native run: 0 enforcement orders out of
-  ~150 chart bulks). `chart_bulk` works around it by rotating its generator list by a drawn
-  offset per slot (`chart::compose_chart`); `compose_bulk` users in other families (task 02's
+  ~150 chart bulks). `chart_bulk` works around it with a `draw::chance` chain over the spec
+  weights per slot (`chart::pick_chart_gen`); `compose_bulk` users in other families (task 02's
   `tx_bulk`) are affected the same way. Suggest `weighted` use a small-range draw (e.g. a
   cumulative pick over an integer scale of 1000) or `chance` chains.
+- `oracle: coverage Apply rejected invalid skip opt-in` is registered by `ledgercheck`
+  (this task's spec assigns it here). Its failure hook fires for any family's bulk carrying an
+  invalid skip reason; if another family registers the same literal, `RegisterCoverage` collides
+  at merge, and the other registration should be dropped.
+- Rule selection does not look proportional to the rule weights: in the 150 s run above
+  `list_ledgers` (1.0) ran 561 reads, `get_ledger` (1.5) 264, and `chart_bulk` (1.0, last in the
+  list) never ran. Rule order may bias hegel's rule draw, as `draw::weighted` is biased.
+- `maintenance_window` (0.4) starts a new window as soon as the last one closes, so the cluster
+  can stay in maintenance most of the time on a slow machine, which starves the 12 s probe chains.
+  Consider a cool-down between windows if the Docker runs show the same.
 - Rule-owned ledgers accumulate as tombstones in the model (each `ledger_delete_race` /
   `ledger_recreate_probe` run leaves one or two deleted `o-<run>-own<N>`); at weight 0.4 each this
   is several hundred per hour. Watch `LiveLedgers`/candidate-search cost in long runs.
