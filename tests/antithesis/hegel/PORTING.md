@@ -3094,7 +3094,7 @@ Sometimes / Reachable: `restore base backup completes`, `a restore cut has a non
 | `restore base backup completes` | `restore_base` | no faults |
 | `a restore cut has a non-empty delta`, `a restore cut fence holds`, `restore_cut completes within its quiet budget` | `restore_cut` (weight 6 in BaseTaken; the delta seed guarantees S > F) | no faults (needs quiet periods: a run of ≥ 10 min) |
 | `an online restore download succeeds`, `a restored cluster serves`, `a restore round trip verifies with a non-empty delta`, `a restore cycle completes within its wall budget` | `restore_step` (online path, 3/4 of plans) | no faults |
-| `a canceled restore download is retried` | `restore_plan` cancel perturbation (1/2 of online plans, after the first or second running poll) | no faults (needs a download that is still running at the first poll; tiny backups can finish first — then not hit locally) |
+| `a canceled restore download is retried` | `restore_plan` cancel perturbation (1/2 of online plans, after the first or second running poll; it fires only when the job then reports CANCELED and a later download succeeds, so a cancel that lands after the download finished does not count) | no faults (needs a download that is still running at the first poll; tiny backups can finish first — then not hit locally) |
 | `a finalize before validate is refused` | `restore_plan` finalize-early perturbation (1/2 of online plans) | no faults |
 | `an offline bootstrap with validation succeeds`, `an offline bootstrap without validation succeeds` | offline plans (1/4, validate 1/2) | no faults |
 | `a chained restore verifies` | chained plans (1/4) | no faults |

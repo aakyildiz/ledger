@@ -269,6 +269,22 @@ fn restart_and_perturbations_are_handled() {
 }
 
 #[test]
+fn a_cancel_that_lands_after_the_download_finished_is_no_retry() {
+    let (d, ft, env) = setup();
+    script_download(&ft, 40);
+    // The boot probe (Unimplemented, then NotFound), then RUNNING (the
+    // cancel is sent), then SUCCEEDED: the cancel came too late.
+    ft.script("restore", "GetDownloadStatus", vec![err("Unimplemented", ""), err("NotFound", "unknown job id"), ok(json!({"state": "DOWNLOAD_STATE_RUNNING"})), ok(json!({"state": "DOWNLOAD_STATE_SUCCEEDED"}))]);
+    ft.set_default("restore", "FinalizeRestore", FakeReply::Lost(None));
+    env.with_agent(0, |a| a.marker_on_status = true);
+    let p = Perturb { cancel_mid: true, cancel_after_polls: 0, ..Perturb::default() };
+    let cx = Cx::new(&d, 0, 1);
+    assert_eq!(stage::online(&cx, &sc(40, p)), StageResult::Staged);
+    assert_eq!(ft.calls_of("restore", "CancelDownload").len(), 1);
+    assert!(!testkit::fired("a canceled restore download is retried"));
+}
+
+#[test]
 fn a_corrupt_backup_is_unreachable_and_a_transport_failure_is_retried() {
     let (d, ft, _env) = setup();
     script_download(&ft, 40);
