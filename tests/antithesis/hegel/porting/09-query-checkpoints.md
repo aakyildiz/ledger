@@ -124,6 +124,14 @@ and failure hook `checkpoint-limit` (coverage only; 00a's commit path keeps
 | oracle: coverage a checkpoint served the frozen fleet listing | checkpoint_read ListLedgers arm | no faults |
 | a write burst follows a query checkpoint create | checkpoint_burst job | no faults |
 
+Local runs: hegel's swarm testing draws, at machine creation, a set of rules
+disabled for the whole test case, and a driver process runs one test case.
+A native run can therefore lose `checkpoint_write` entirely (observed in the
+first 180 s run: no deletion or schedule coverage, every create from
+`checkpoint_burst`); the deletion, schedule-set and schedule-deletion probes
+and the deleted-read probe need `checkpoint_write`, so judge them over
+several runs.
+
 ## Requests to 99
 
 - `TestRejectionStages` should build its model with
