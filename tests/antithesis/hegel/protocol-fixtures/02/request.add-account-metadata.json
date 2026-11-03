@@ -1,0 +1,19 @@
+{
+  "apply": {
+    "action": {
+      "addMetadata": {
+        "metadata": {
+          "k2": {
+            "stringValue": "x"
+          }
+        },
+        "target": {
+          "account": {
+            "addr": "t-0:9"
+          }
+        }
+      }
+    },
+    "ledger": "o-1a2b-l1"
+  }
+}

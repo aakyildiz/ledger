@@ -1,0 +1,80 @@
+{
+  "apply": {
+    "action": {
+      "createTransaction": {
+        "accountMetadata": {
+          "t-4:1": {
+            "values": {
+              "k1": {
+                "stringValue": "7"
+              }
+            }
+          }
+        },
+        "force": true,
+        "metadata": {
+          "k0": {
+            "intValue": "-200"
+          },
+          "k1": {
+            "uintValue": "5000000000"
+          },
+          "k2": {
+            "boolValue": true
+          },
+          "k3": {
+            "stringValue": "v0"
+          },
+          "k4": {
+            "datetimeValue": "1700000000000000"
+          },
+          "k5": {
+            "nullValue": {
+              "original": "030"
+            }
+          },
+          "k6": {
+            "nullValue": {}
+          }
+        },
+        "postings": [
+          {
+            "amount": {},
+            "asset": "USD/2",
+            "color": "AB",
+            "destination": "t-3:42",
+            "source": "world"
+          },
+          {
+            "amount": {
+              "v0": "18446744073709551615",
+              "v1": "18446744073709551615",
+              "v2": "18446744073709551615",
+              "v3": "18446744073709551615"
+            },
+            "asset": "COIN",
+            "destination": "t-3:42",
+            "source": "t-3:42"
+          },
+          {
+            "amount": {
+              "v3": "9223372036854775808"
+            },
+            "asset": "EUR/2",
+            "color": "Z",
+            "destination": "t-4:1",
+            "source": "world"
+          }
+        ],
+        "reference": "o-1a2b-ref7",
+        "timestamp": {
+          "data": "1499999999999999"
+        }
+      }
+    },
+    "ledger": "o-1a2b-l2",
+    "skippableReasons": [
+      "ERROR_REASON_TRANSACTION_REFERENCE_CONFLICT"
+    ]
+  }
+}

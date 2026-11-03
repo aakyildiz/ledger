@@ -6,6 +6,7 @@ use crate::machine::Driver;
 use hegel::stateful::ConcurrentRule;
 pub mod smoke;
 // ==== 02-tx-writes mods ====
+pub mod tx;
 // ==== end 02-tx-writes mods ====
 // ==== 03-reverts-metadata-idempotency mods ====
 // ==== end 03-reverts-metadata-idempotency mods ====
@@ -44,6 +45,7 @@ pub fn rules() -> Vec<ConcurrentRule<Driver>> {
     let mut v = Vec::new();
     v.extend(smoke::rules());
     // ==== 02-tx-writes rules ====
+    v.extend(tx::rules());
     // ==== end 02-tx-writes rules ====
     // ==== 03-reverts-metadata-idempotency rules ====
     // ==== end 03-reverts-metadata-idempotency rules ====
@@ -85,6 +87,7 @@ pub fn order_gens() -> Vec<crate::write::OrderGen> {
     let mut v = Vec::new();
     v.extend(std::iter::empty()); // families extend below
     // ==== 02-tx-writes order_gens ====
+    v.extend(tx::order_gens());
     // ==== end 02-tx-writes order_gens ====
     // ==== 03-reverts-metadata-idempotency order_gens ====
     // ==== end 03-reverts-metadata-idempotency order_gens ====
@@ -205,6 +208,7 @@ pub fn setup_hooks() -> Vec<crate::setup::SetupHook> {
     let mut v = Vec::new();
     v.extend(std::iter::empty()); // families extend below
     // ==== 02-tx-writes setup_hooks ====
+    v.extend(tx::setup_hooks());
     // ==== end 02-tx-writes setup_hooks ====
     // ==== 03-reverts-metadata-idempotency setup_hooks ====
     // ==== end 03-reverts-metadata-idempotency setup_hooks ====
