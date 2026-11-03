@@ -1,0 +1,911 @@
+package match
+
+import (
+	"math/big"
+	"testing"
+
+	"github.com/formancehq/ledger/v3/internal/domain/indexes"
+	"github.com/formancehq/ledger/v3/internal/proto/commonpb"
+	"github.com/formancehq/ledger/v3/internal/proto/servicepb"
+	"github.com/formancehq/ledger/v3/tests/oracle"
+	"github.com/formancehq/ledger/v3/tests/oracle/oracletest"
+	"github.com/stretchr/testify/require"
+)
+
+// buildLedger applies reqs as one committed bulk on an empty-chart ledger "L"
+// and returns its state. An empty chart disables account-type enforcement, so
+// transactions to arbitrary addresses commit and populate volumes.
+//
+// One bulk is the default because the fixtures are written against end-of-bulk
+// semantics — a shared proposal date, and ephemeral cells judged once at the end
+// of the bulk. A fixture that reverts a transaction the same bulk creates must
+// use buildLedgerSeparateBulks instead.
+func buildLedger(t *testing.T, reqs ...*servicepb.Request) oracle.LedgerState {
+	t.Helper()
+
+	return buildGlobal(t, reqs...).Ledger("L")
+}
+
+// buildLedgerSeparateBulks commits each request as its own bulk. Reserved for
+// fixtures that revert a transaction an earlier request creates: the server
+// rejects that within one bulk, because admission cannot declare the volume
+// coverage the revert needs when the target is not yet in the local store.
+func buildLedgerSeparateBulks(t *testing.T, reqs ...*servicepb.Request) oracle.LedgerState {
+	t.Helper()
+
+	return buildGlobalSeparateBulks(t, reqs...).Ledger("L")
+}
+
+const (
+	accounts = commonpb.QueryTarget_QUERY_TARGET_ACCOUNTS
+	txns     = commonpb.QueryTarget_QUERY_TARGET_TRANSACTIONS
+)
+
+func TestFilterNeedsIndex(t *testing.T) {
+	t.Parallel()
+
+	require.False(t, FilterNeedsIndex(nil, accounts))
+	require.False(t, FilterNeedsIndex(nil, txns))
+
+	// Address is index-free on accounts, index-backed on transactions.
+	require.False(t, FilterNeedsIndex(FilterAddrPrefix("acc:"), accounts))
+	require.True(t, FilterNeedsIndex(FilterAddrPrefix("acc:"), txns))
+
+	require.False(t, FilterNeedsIndex(FilterReverted(true), txns))
+	require.False(t, FilterNeedsIndex(FilterTxIDRange(1, 5), txns))
+
+	// Metadata fields are index-backed on either target.
+	require.True(t, FilterNeedsIndex(FilterMetaExists("k"), accounts))
+	require.True(t, FilterNeedsIndex(FilterMetaExists("k"), txns))
+
+	// Boolean nodes propagate their children's index needs.
+	require.False(t, FilterNeedsIndex(FilterAnd(FilterReverted(true), FilterTxIDRange(1, 5)), txns))
+	require.True(t, FilterNeedsIndex(FilterAnd(FilterReverted(true), FilterMetaExists("k")), txns))
+	require.True(t, FilterNeedsIndex(FilterNot(FilterMetaExists("k")), accounts))
+	require.False(t, FilterNeedsIndex(FilterNot(FilterReverted(true)), txns))
+}
+
+func TestFilterInvalidForTarget(t *testing.T) {
+	t.Parallel()
+
+	// Transactions-only conditions are invalid on the accounts target.
+	require.True(t, FilterInvalidForTarget(FilterReverted(true), accounts))
+	require.True(t, FilterInvalidForTarget(FilterTxIDRange(1, 5), accounts))
+	// The accounts-only condition is invalid on the transactions target.
+	require.True(t, FilterInvalidForTarget(FilterHasAsset("USD", 2), txns))
+
+	// Each is valid on its own target.
+	require.False(t, FilterInvalidForTarget(FilterReverted(true), txns))
+	require.False(t, FilterInvalidForTarget(FilterTxIDRange(1, 5), txns))
+	require.False(t, FilterInvalidForTarget(FilterHasAsset("USD", 2), accounts))
+
+	// Address is valid on both targets; nil (universe) is always valid.
+	require.False(t, FilterInvalidForTarget(FilterAddrPrefix("acc:"), accounts))
+	require.False(t, FilterInvalidForTarget(FilterAddrPrefix("acc:"), txns))
+	require.False(t, FilterInvalidForTarget(nil, accounts))
+
+	// Combinators propagate an invalid child; a fully-valid tree stays valid.
+	require.True(t, FilterInvalidForTarget(FilterAnd(FilterAddrExact("acc:1"), FilterReverted(true)), accounts))
+	require.True(t, FilterInvalidForTarget(FilterNot(FilterReverted(true)), accounts))
+	require.False(t, FilterInvalidForTarget(FilterAnd(FilterAddrExact("acc:1"), FilterAddrPrefix("x:")), accounts))
+}
+
+func TestMatchAccountFilter(t *testing.T) {
+	t.Parallel()
+
+	// world → acc:1 in USD/2, so both hold a USD/2 (base "USD", precision 2)
+	// volume cell; neither holds EUR.
+	ls := buildLedger(t, oracletest.TxReq("world", "acc:1", "USD/2", 5))
+
+	require.True(t, MatchAccountFilter(ls, nil, "anything")) // universe
+
+	require.True(t, MatchAccountFilter(ls, FilterAddrPrefix("acc:"), "acc:1"))
+	require.False(t, MatchAccountFilter(ls, FilterAddrPrefix("acc:"), "world"))
+
+	require.True(t, MatchAccountFilter(ls, FilterAddrExact("acc:1"), "acc:1"))
+	require.False(t, MatchAccountFilter(ls, FilterAddrExact("acc:1"), "acc:2"))
+
+	require.True(t, MatchAccountFilter(ls, FilterAnd(FilterAddrPrefix("acc:"), FilterAddrExact("acc:1")), "acc:1"))
+	require.False(t, MatchAccountFilter(ls, FilterAnd(FilterAddrPrefix("acc:"), FilterAddrExact("acc:1")), "acc:2"))
+
+	require.True(t, MatchAccountFilter(ls, FilterOr(FilterAddrExact("acc:1"), FilterAddrExact("acc:2")), "acc:2"))
+	require.False(t, MatchAccountFilter(ls, FilterOr(FilterAddrExact("acc:1"), FilterAddrExact("acc:2")), "acc:3"))
+
+	require.True(t, MatchAccountFilter(ls, FilterNot(FilterAddrPrefix("acc:")), "world"))
+	require.False(t, MatchAccountFilter(ls, FilterNot(FilterAddrPrefix("acc:")), "acc:1"))
+
+	// has-asset: matches an account with a volume cell in the (base, precision).
+	require.True(t, MatchAccountFilter(ls, FilterHasAsset("USD", 2), "acc:1"))
+	require.True(t, MatchAccountFilter(ls, FilterHasAsset("USD", 2), "world"))
+	require.False(t, MatchAccountFilter(ls, FilterHasAsset("EUR", 2), "acc:1"))
+	require.False(t, MatchAccountFilter(ls, FilterHasAsset("USD", 2), "acc:absent"))
+	// Composed with an index-free address leaf.
+	require.True(t, MatchAccountFilter(ls, FilterAnd(FilterHasAsset("USD", 2), FilterAddrPrefix("acc:")), "acc:1"))
+	require.False(t, MatchAccountFilter(ls, FilterAnd(FilterHasAsset("USD", 2), FilterAddrPrefix("acc:")), "world"))
+
+	// Zero operands: And is vacuously true (the universe), Or vacuously false,
+	// matching the compiler. An empty And nested in a conjunction is therefore
+	// the identity operand, not an annihilator.
+	require.True(t, MatchAccountFilter(ls, FilterAnd(), "acc:1"))
+	require.False(t, MatchAccountFilter(ls, FilterOr(), "acc:1"))
+	require.True(t, MatchAccountFilter(ls, FilterAnd(FilterAddrPrefix("acc:"), FilterAnd()), "acc:1"))
+	require.False(t, MatchAccountFilter(ls, FilterAnd(FilterAddrPrefix("acc:"), FilterAnd()), "world"))
+}
+
+func TestMatchTxIDBounds(t *testing.T) {
+	t.Parallel()
+
+	lo, hi := uint64(2), uint64(4)
+	inclusive := &commonpb.UintCondition{Min: &lo, Max: &hi}
+	require.False(t, MatchUintBounds(inclusive, 1))
+	require.True(t, MatchUintBounds(inclusive, 2))
+	require.True(t, MatchUintBounds(inclusive, 4))
+	require.False(t, MatchUintBounds(inclusive, 5))
+
+	exclusive := &commonpb.UintCondition{Min: &lo, Max: &hi, MinExclusive: true, MaxExclusive: true}
+	require.False(t, MatchUintBounds(exclusive, 2))
+	require.True(t, MatchUintBounds(exclusive, 3))
+	require.False(t, MatchUintBounds(exclusive, 4))
+
+	openMax := &commonpb.UintCondition{Min: &lo}
+	require.True(t, MatchUintBounds(openMax, 1000))
+	require.False(t, MatchUintBounds(openMax, 1))
+}
+
+func TestMatchTxFilter(t *testing.T) {
+	t.Parallel()
+
+	// Two funding transactions, then revert the first: tx 1 is reverted, tx 3 is
+	// the compensating transaction (tx 2 is the second funding tx). Separate
+	// bulks because the revert targets a transaction this setup creates.
+	ls := buildLedgerSeparateBulks(t,
+		oracletest.TxReq("world", "acc:1", "USD", 5),
+		oracletest.TxReq("world", "acc:2", "USD", 5),
+		oracletest.RevertReqL("L", 1, true),
+	)
+	txs := ls.Txs()
+	require.Equal(t, 3, txs.Len())
+
+	// These leaves never read a server stamp, so every verdict must be known.
+	matchKnown := func(f *commonpb.QueryFilter, rec TxRecordView) bool {
+		m, known := MatchTxFilter(ls, f, rec)
+		require.True(t, known)
+
+		return m
+	}
+
+	require.True(t, matchKnown(FilterReverted(true), txs.Get(int(0))))
+	require.False(t, matchKnown(FilterReverted(false), txs.Get(int(0))))
+	require.True(t, matchKnown(FilterReverted(false), txs.Get(int(1))))
+
+	require.True(t, matchKnown(FilterTxIDRange(1, 2), txs.Get(int(0))))
+	require.False(t, matchKnown(FilterTxIDRange(1, 2), txs.Get(int(2))))
+
+	require.True(t, matchKnown(FilterNot(FilterReverted(true)), txs.Get(int(1))))
+	require.True(t, matchKnown(FilterAnd(FilterReverted(true), FilterTxIDRange(1, 2)), txs.Get(int(0))))
+
+	// Zero operands, as on accounts: And is the universe, Or the empty set.
+	require.True(t, matchKnown(FilterAnd(), txs.Get(int(0))))
+	require.False(t, matchKnown(FilterOr(), txs.Get(int(0))))
+	require.True(t, matchKnown(FilterAnd(FilterReverted(true), FilterAnd()), txs.Get(int(0))))
+	require.False(t, matchKnown(FilterAnd(FilterReverted(false), FilterAnd()), txs.Get(int(0))))
+}
+
+func TestAccountUniverse_OrderIsByteAscending(t *testing.T) {
+	t.Parallel()
+
+	ls := buildLedger(t,
+		oracletest.TxReq("world", "acc:2", "USD", 5),
+		oracletest.TxReq("world", "acc:10", "USD", 5),
+	)
+
+	// "acc:10" < "acc:2" bytewise ('1' < '2'), and both precede "world".
+	require.Equal(t, []string{"acc:10", "acc:2", "world"}, AccountUniverse(ls))
+}
+
+func TestAccountWindow(t *testing.T) {
+	t.Parallel()
+
+	ls := buildLedger(t,
+		oracletest.TxReq("world", "acc:1", "USD", 5),
+		oracletest.TxReq("world", "acc:2", "USD", 5),
+		oracletest.TxReq("world", "acc:3", "USD", 5),
+	)
+	// Universe: acc:1, acc:2, acc:3, world.
+
+	require.Equal(t, []string{"acc:1", "acc:2"},
+		AccountWindow(ls, nil, "", 2, false))
+
+	// Cursor is exclusive: forward drops addresses <= cursor.
+	require.Equal(t, []string{"acc:2", "acc:3", "world"},
+		AccountWindow(ls, nil, "acc:1", 10, false))
+
+	require.Equal(t, []string{"world", "acc:3", "acc:2", "acc:1"},
+		AccountWindow(ls, nil, "", 10, true))
+
+	// Reverse cursor drops addresses >= cursor.
+	require.Equal(t, []string{"acc:2", "acc:1"},
+		AccountWindow(ls, nil, "acc:3", 10, true))
+
+	// An address filter excludes world.
+	require.Equal(t, []string{"acc:1", "acc:2", "acc:3"},
+		AccountWindow(ls, FilterAddrPrefix("acc:"), "", 10, false))
+}
+
+// The page a base predicts comes with the resume token that base implies: one
+// naming the last row served when a row is still waiting, none when the page
+// exhausted the window.
+func TestAccountPageMatches_JudgesTheResumeToken(t *testing.T) {
+	t.Parallel()
+
+	served := func(addr, input, output string) *commonpb.Account {
+		return &commonpb.Account{
+			Address: addr,
+			Volumes: []*commonpb.AccountVolume{{
+				Asset:   "USD",
+				Volumes: &commonpb.VolumesWithBalance{Input: commonpb.MustBigUintFromDecimal(input), Output: commonpb.MustBigUintFromDecimal(output)},
+			}},
+		}
+	}
+
+	ls := buildLedger(t,
+		oracletest.TxReq("world", "acc:1", "USD", 5),
+		oracletest.TxReq("world", "acc:2", "USD", 5),
+		oracletest.TxReq("world", "acc:3", "USD", 5),
+	)
+	// Universe: acc:1, acc:2, acc:3, world.
+
+	cut := []*commonpb.Account{served("acc:1", "5", "0"), served("acc:2", "5", "0")}
+	require.True(t, AccountPageMatches(ls, nil, "", 2, false, cut, "acc:2"))
+	require.False(t, AccountPageMatches(ls, nil, "", 2, false, cut, ""), "two accounts are still waiting")
+	require.False(t, AccountPageMatches(ls, nil, "", 2, false, cut, "acc:3"), "the token names the last row sent, not the peeked one")
+
+	whole := append(append([]*commonpb.Account{}, cut...), served("acc:3", "5", "0"), served("world", "0", "15"))
+	require.True(t, AccountPageMatches(ls, nil, "", 10, false, whole, ""))
+	require.False(t, AccountPageMatches(ls, nil, "", 10, false, whole, "world"), "a token promises a page that does not exist")
+}
+
+func TestTransactionWindow(t *testing.T) {
+	t.Parallel()
+
+	ls := buildLedger(t,
+		oracletest.TxReq("world", "acc:1", "USD", 1),
+		oracletest.TxReq("world", "acc:2", "USD", 1),
+		oracletest.TxReq("world", "acc:3", "USD", 1),
+		oracletest.TxReq("world", "acc:4", "USD", 1),
+	)
+	// Transactions: ids 1, 2, 3, 4. The endpoint inverts reverse: reverse=false
+	// is newest-first (descending); reverse=true is oldest-first (ascending).
+
+	// reverse=false → descending, newest first.
+	require.Equal(t, []uint64{4, 3},
+		TransactionWindow(ls, nil, 0, 2, false))
+
+	// Descending cursor is exclusive older-than: drops ids >= afterID.
+	require.Equal(t, []uint64{1},
+		TransactionWindow(ls, nil, 2, 10, false))
+
+	// reverse=true → ascending, oldest first.
+	require.Equal(t, []uint64{1, 2, 3, 4},
+		TransactionWindow(ls, nil, 0, 10, true))
+
+	// Ascending cursor is exclusive newer-than: drops ids <= afterID.
+	require.Equal(t, []uint64{4},
+		TransactionWindow(ls, nil, 3, 10, true))
+
+	// Filtered, reverse=false → matches ids 2,3 in descending order.
+	require.Equal(t, []uint64{3, 2},
+		TransactionWindow(ls, FilterTxIDRange(2, 3), 0, 10, false))
+}
+
+func stamp(v uint64) *commonpb.Timestamp { return &commonpb.Timestamp{Data: v} }
+
+// buildGlobal applies reqs as one bulk and returns the global state, for tests
+// that need LearnTxStamps on top of the applied records. See buildLedger for
+// why one bulk is the default.
+func buildGlobal(t *testing.T, reqs ...*servicepb.Request) oracle.GlobalState {
+	t.Helper()
+
+	res := oracle.NewGlobalState().Apply(oracle.Bulk{Requests: reqs})
+	require.True(t, res.OK, "setup bulk rejected: %s", res.Reason)
+
+	return res.State
+}
+
+// buildGlobalSeparateBulks commits each request as its own bulk — the global
+// counterpart of buildLedgerSeparateBulks, and reserved for the same reason.
+//
+// Splitting is not free: end-of-bulk semantics stop applying. Each request gets
+// its own proposal date, and an ephemeral cell washed back to zero across two
+// bulks is indexed by the first and then only dropped from the query universe by
+// the second, which is a different mechanism (TestMatchTxAddress_UniverseDrop).
+// Do not move a fixture here to make it pass.
+func buildGlobalSeparateBulks(t *testing.T, reqs ...*servicepb.Request) oracle.GlobalState {
+	t.Helper()
+
+	state := oracle.NewGlobalState()
+
+	for i, req := range reqs {
+		res := state.Apply(oracle.Bulk{Requests: []*servicepb.Request{req}})
+		require.True(t, res.OK, "setup request %d rejected: %s", i, res.Reason)
+
+		state = res.State
+	}
+
+	return state
+}
+
+// serverTxFromRec builds the wire transaction the server would return for a
+// fully-known model record, so txWindowMatches' content check passes.
+func serverTxFromRec(rec TxRecordView) *commonpb.Transaction {
+	return &commonpb.Transaction{
+		Id:                    rec.Id(),
+		Reference:             rec.Reference(),
+		Reverted:              rec.Reverted(),
+		RevertedByTransaction: rec.RevertedBy(),
+		RevertsTransaction:    rec.RevertsTransaction(),
+		Timestamp:             rec.Timestamp(),
+		InsertedAt:            rec.InsertedAt(),
+		// Stamped from the same proposal date as inserted_at and never bumped.
+		UpdatedAt:         rec.InsertedAt(),
+		RevertedAt:        rec.RevertedAt(),
+		Postings:          rec.Postings(),
+		Metadata:          rec.Metadata(),
+		PostCommitVolumes: serverPCVFromRec(rec),
+	}
+}
+
+// serverPCVFromRec renders the model's frozen snapshot the way the server
+// sends it, so a row built from the record is the row the server owes.
+func serverPCVFromRec(rec TxRecordView) *commonpb.PostCommitVolumes {
+	model := rec.PostCommitVolumes()
+	if len(model) == 0 {
+		return nil
+	}
+
+	byAccount := map[string]*commonpb.VolumesByAssets{}
+
+	for key, vp := range model {
+		entry := byAccount[key.Address]
+		if entry == nil {
+			entry = &commonpb.VolumesByAssets{}
+			byAccount[key.Address] = entry
+		}
+
+		entry.Volumes = append(entry.Volumes, &commonpb.VolumeEntry{
+			Asset:   key.Asset,
+			Color:   key.Color,
+			Volumes: &commonpb.Volumes{Input: commonpb.MustBigUintFromDecimal(vp.Input.Dec()), Output: commonpb.MustBigUintFromDecimal(vp.Output.Dec())},
+		})
+	}
+
+	out := &commonpb.PostCommitVolumes{VolumesByAccount: byAccount}
+	out.SortVolumes()
+
+	return out
+}
+
+func TestMatchTxFilter_TxBuiltinLeaves(t *testing.T) {
+	t.Parallel()
+
+	// tx 1 (ref r1), tx 2, tx 3 = revert of 2. Stamps learned as the checker
+	// would from the commit response; tx 2's reverted_at is tx 3's timestamp.
+	// Separate bulks because the revert targets a transaction this setup creates.
+	gs := buildGlobalSeparateBulks(t,
+		oracletest.TxReqRefL("L", "r1", "world", "acc:1", "USD", 5),
+		oracletest.TxReqL("L", "world", "acc:2", "USD", 5),
+		oracletest.RevertReqL("L", 2, true),
+	)
+	gs.LearnTxStamps("L", 1, stamp(100), stamp(110), nil)
+	gs.LearnTxStamps("L", 2, stamp(200), stamp(210), nil)
+	gs.LearnTxStamps("L", 3, stamp(300), stamp(310), nil)
+	gs.LearnTxStamps("L", 2, nil, nil, stamp(300))
+
+	txs := gs.Ledger("L").Txs()
+
+	known := func(f *commonpb.QueryFilter, rec TxRecordView) bool {
+		m, k := MatchTxFilter(gs.Ledger("L"), f, rec)
+		require.True(t, k)
+
+		return m
+	}
+
+	// Reference: exact match; records without one never match, nor does "".
+	require.True(t, known(FilterReference("r1"), txs.Get(int(0))))
+	require.False(t, known(FilterReference("r1"), txs.Get(int(1))))
+	require.False(t, known(FilterReference("absent"), txs.Get(int(0))))
+	require.False(t, known(FilterReference(""), txs.Get(int(2))))
+
+	// Learned timestamp / inserted_at ranges.
+	require.False(t, known(FilterDateRange(commonpb.TransactionBuiltinIndex_TX_BUILTIN_INDEX_TIMESTAMP, 150, 250), txs.Get(int(0))))
+	require.True(t, known(FilterDateRange(commonpb.TransactionBuiltinIndex_TX_BUILTIN_INDEX_TIMESTAMP, 150, 250), txs.Get(int(1))))
+	require.True(t, known(FilterDateRange(commonpb.TransactionBuiltinIndex_TX_BUILTIN_INDEX_INSERTED_AT, 305, 315), txs.Get(int(2))))
+
+	// reverted_at: only the reverted original matches; un-reverted is a known miss.
+	rvat := FilterDateRange(commonpb.TransactionBuiltinIndex_TX_BUILTIN_INDEX_REVERTED_AT, 250, 350)
+	require.True(t, known(rvat, txs.Get(int(1))))
+	require.False(t, known(rvat, txs.Get(int(0))))
+	require.False(t, known(rvat, txs.Get(int(2))))
+}
+
+func TestMatchTxFilter_UnknownStamps(t *testing.T) {
+	t.Parallel()
+
+	// No stamps learned: date verdicts are unknown, and booleans propagate
+	// Kleene-style — decided by a known false (AND) or known true (OR).
+	ls := buildLedger(t, oracletest.TxReq("world", "acc:1", "USD", 5))
+	rec := ls.Txs().Get(int(0))
+
+	tsLeaf := FilterDateRange(commonpb.TransactionBuiltinIndex_TX_BUILTIN_INDEX_TIMESTAMP, 1, 2)
+
+	_, k := MatchTxFilter(ls, tsLeaf, rec)
+	require.False(t, k)
+
+	_, k = MatchTxFilter(ls, FilterNot(tsLeaf), rec)
+	require.False(t, k)
+
+	m, k := MatchTxFilter(ls, FilterAnd(FilterReverted(true), tsLeaf), rec)
+	require.True(t, k, "AND decided by the known-false reverted leaf")
+	require.False(t, m)
+
+	m, k = MatchTxFilter(ls, FilterOr(FilterReverted(false), tsLeaf), rec)
+	require.True(t, k, "OR decided by the known-true reverted leaf")
+	require.True(t, m)
+
+	_, k = MatchTxFilter(ls, FilterOr(FilterReverted(true), tsLeaf), rec)
+	require.False(t, k, "OR undecided when the known leaf misses")
+}
+
+func TestTxWindowMatches_OptionalRows(t *testing.T) {
+	t.Parallel()
+
+	// Three creates; stamps learned for 1 and 3 only — under a date filter
+	// covering both, tx 2 is an optional row (unknown verdict).
+	gs := buildGlobal(t,
+		oracletest.TxReqL("L", "world", "acc:1", "USD", 5),
+		oracletest.TxReqL("L", "world", "acc:2", "USD", 5),
+		oracletest.TxReqL("L", "world", "acc:3", "USD", 5),
+	)
+	gs.LearnTxStamps("L", 1, stamp(100), stamp(100), nil)
+	gs.LearnTxStamps("L", 3, stamp(300), stamp(300), nil)
+
+	ls := gs.Ledger("L")
+	txs := ls.Txs()
+	filter := FilterDateRange(commonpb.TransactionBuiltinIndex_TX_BUILTIN_INDEX_TIMESTAMP, 50, 400)
+
+	// reverse=true is ascending on the transactions target.
+	page := func(ids ...uint64) []*commonpb.Transaction {
+		out := make([]*commonpb.Transaction, len(ids))
+		for i, id := range ids {
+			out[i] = serverTxFromRec(txs.Get(int(id - 1)))
+		}
+
+		return out
+	}
+
+	require.True(t, TxWindowMatches(ls, filter, 0, 10, true, page(1, 3), ""), "optional row absent")
+	require.True(t, TxWindowMatches(ls, filter, 0, 10, true, page(1, 2, 3), ""), "optional row present")
+	require.False(t, TxWindowMatches(ls, filter, 0, 10, true, page(3, 1), ""), "order violation")
+	require.False(t, TxWindowMatches(ls, filter, 0, 10, true, page(1), ""), "required row missing with page room")
+	require.True(t, TxWindowMatches(ls, filter, 0, 1, true, page(1), "1"), "full page truncates the rest, naming its last row")
+	require.False(t, TxWindowMatches(ls, filter, 0, 1, true, page(1), ""), "a truncated page must hand back a resume token")
+	require.False(t, TxWindowMatches(ls, filter, 0, 10, true, page(2, 3), ""), "required first row missing")
+	require.True(t, TxWindowMatches(ls, filter, 1, 10, true, page(2, 3), ""), "cursor drops tx 1; optional 2 present")
+	require.True(t, TxWindowMatches(ls, filter, 1, 10, true, page(3), ""), "cursor drops tx 1; optional 2 absent")
+}
+
+func TestMatchTxAddress_RolesAndExclusions(t *testing.T) {
+	t.Parallel()
+
+	// One bulk on purpose: an ephemeral wash on e:1 (its cell is zero, and so
+	// excluded, at end of bulk) and a normal funding of a:1. tx 1 is the wash,
+	// tx 2 the funding. Splitting the wash across bulks would index e:1 on the
+	// funding leg and exercise the universe drop instead — see
+	// buildGlobalSeparateBulks.
+	gs := buildGlobal(t,
+		oracletest.AddTypeReqP("e", commonpb.AccountTypePersistence_ACCOUNT_TYPE_EPHEMERAL),
+		oracletest.AddTypeReqP("a", commonpb.AccountTypePersistence_ACCOUNT_TYPE_NORMAL),
+		oracletest.TxReqL("L", "world", "e:1", "USD", 5),
+		oracletest.TxReqL("L", "e:1", "world", "USD", 5),
+		oracletest.TxReqL("L", "world", "a:1", "USD", 7),
+	)
+	ls := gs.Ledger("L")
+	txs := ls.Txs()
+	require.Equal(t, 3, txs.Len())
+
+	anyRole := commonpb.AddressRole_ADDRESS_ROLE_ANY
+	src := commonpb.AddressRole_ADDRESS_ROLE_SOURCE
+	dst := commonpb.AddressRole_ADDRESS_ROLE_DESTINATION
+
+	addr := func(f *commonpb.QueryFilter) *commonpb.AddressMatch {
+		return f.GetFilter().(*commonpb.QueryFilter_Address).Address
+	}
+
+	// The excluded ephemeral cell strips e:1 membership from both wash txs. The
+	// membership assertion is what separates this from the universe drop
+	// (TestMatchTxAddress_UniverseDrop), where the rows stay indexed and only
+	// the address match stops resolving — matchTxAddress alone would be false
+	// under either mechanism.
+	require.Zero(t, txs.Get(int(0)).IndexedAddrs()["e:1"], "same-bulk exclusion suppresses index membership")
+	require.Zero(t, txs.Get(int(1)).IndexedAddrs()["e:1"], "same-bulk exclusion suppresses index membership")
+	require.False(t, MatchTxAddress(ls, addr(FilterAddrExactRole("e:1", anyRole)), txs.Get(int(0))))
+	require.False(t, MatchTxAddress(ls, addr(FilterAddrExactRole("e:1", anyRole)), txs.Get(int(1))))
+
+	// world's side of the wash is a kept NORMAL cell — still indexed.
+	require.True(t, MatchTxAddress(ls, addr(FilterAddrExactRole("world", src)), txs.Get(int(0))))
+	require.True(t, MatchTxAddress(ls, addr(FilterAddrExactRole("world", dst)), txs.Get(int(1))))
+
+	// Role bits on the funding tx: world is the source, a:1 the destination.
+	require.True(t, MatchTxAddress(ls, addr(FilterAddrExactRole("a:1", anyRole)), txs.Get(int(2))))
+	require.True(t, MatchTxAddress(ls, addr(FilterAddrExactRole("a:1", dst)), txs.Get(int(2))))
+	require.False(t, MatchTxAddress(ls, addr(FilterAddrExactRole("a:1", src)), txs.Get(int(2))))
+	require.True(t, MatchTxAddress(ls, addr(FilterAddrPrefixRole("a:", dst)), txs.Get(int(2))))
+	require.False(t, MatchTxAddress(ls, addr(FilterAddrPrefixRole("b:", anyRole)), txs.Get(int(2))))
+}
+
+func TestMatchTxAddress_UniverseDrop(t *testing.T) {
+	t.Parallel()
+
+	// Bulk 1 funds ephemeral e:1 (non-zero at end of bulk → kept and indexed).
+	res1 := oracle.NewGlobalState().Apply(oracle.Bulk{Requests: []*servicepb.Request{
+		oracletest.AddTypeReqP("e", commonpb.AccountTypePersistence_ACCOUNT_TYPE_EPHEMERAL),
+		oracletest.TxReqL("L", "world", "e:1", "USD", 5),
+	}})
+	require.True(t, res1.OK)
+
+	ls1 := res1.State.Ledger("L")
+	exact := func(a string) *commonpb.AddressMatch {
+		return FilterAddrExactRole(a, commonpb.AddressRole_ADDRESS_ROLE_ANY).GetFilter().(*commonpb.QueryFilter_Address).Address
+	}
+	require.True(t, MatchTxAddress(ls1, exact("e:1"), ls1.Txs().Get(int(0))))
+
+	// Bulk 2 drains it to zero: the cell is purged, dropping e:1 from the V+M
+	// universe — tx 1 keeps its index membership but stops being reachable
+	// through an address match, exactly like the server's attributes-zone
+	// account resolution.
+	res2 := res1.State.Apply(oracle.Bulk{Requests: []*servicepb.Request{
+		oracletest.TxReqL("L", "e:1", "world", "USD", 5),
+	}})
+	require.True(t, res2.OK)
+
+	ls2 := res2.State.Ledger("L")
+	rec := ls2.Txs().Get(int(0))
+	require.NotZero(t, rec.IndexedAddrs()["e:1"], "membership itself is monotone")
+	require.False(t, ls2.HasAccount("e:1"))
+	require.False(t, MatchTxAddress(ls2, exact("e:1"), rec))
+}
+
+func TestNeededIndexCanonicals_AddressRoles(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		role    commonpb.AddressRole
+		builtin commonpb.TransactionBuiltinIndex
+	}{
+		{commonpb.AddressRole_ADDRESS_ROLE_ANY, commonpb.TransactionBuiltinIndex_TX_BUILTIN_INDEX_ADDRESS},
+		{commonpb.AddressRole_ADDRESS_ROLE_SOURCE, commonpb.TransactionBuiltinIndex_TX_BUILTIN_INDEX_SOURCE_ADDRESS},
+		{commonpb.AddressRole_ADDRESS_ROLE_DESTINATION, commonpb.TransactionBuiltinIndex_TX_BUILTIN_INDEX_DESTINATION_ADDRESS},
+	} {
+		needed := map[string]struct{}{}
+		NeededIndexCanonicals(FilterAddrPrefixRole("t-", tc.role), txns, needed)
+		require.Len(t, needed, 1)
+		require.Contains(t, needed, TxBuiltinCanonical(tc.builtin))
+	}
+}
+
+func TestOracle_MetadataIndexLifecycle(t *testing.T) {
+	t.Parallel()
+
+	acct := commonpb.TargetType_TARGET_TYPE_ACCOUNT
+	id := indexes.MetadataID(acct, "k1")
+	canonical := indexes.Canonical(id)
+
+	// CreateIndex on an undeclared field is rejected with the server's reason.
+	rejected := oracle.NewGlobalState().Apply(oracle.Bulk{Requests: []*servicepb.Request{
+		oracletest.CreateIndexReq(id),
+	}})
+	require.False(t, rejected.OK)
+	require.Equal(t, "METADATA_FIELD_NOT_IN_SCHEMA", rejected.Reason)
+
+	// Declared → create lands ambiguous; removing the declaration drops it.
+	declared := oracle.NewGlobalState().Apply(oracle.Bulk{Requests: []*servicepb.Request{
+		oracletest.SetFieldTypeReq(acct, "k1", commonpb.MetadataType_METADATA_TYPE_INT64),
+		oracletest.CreateIndexReq(id),
+	}})
+	require.True(t, declared.OK)
+	exists, active := declared.State.Ledger("L").IndexState(canonical)
+	require.True(t, exists)
+	require.False(t, active)
+
+	removed := declared.State.Apply(oracle.Bulk{Requests: []*servicepb.Request{
+		oracletest.RemoveFieldTypeReq(acct, "k1"),
+	}})
+	require.True(t, removed.OK)
+	exists, _ = removed.State.Ledger("L").IndexState(canonical)
+	require.False(t, exists)
+}
+
+func TestMatchFieldCondition_Coercion(t *testing.T) {
+	t.Parallel()
+
+	acct := commonpb.TargetType_TARGET_TYPE_ACCOUNT
+	str := func(s string) *commonpb.MetadataValue {
+		return &commonpb.MetadataValue{Type: &commonpb.MetadataValue_StringValue{StringValue: s}}
+	}
+
+	// k1 declared INT64; values stored verbatim: "5" coerces to 5, "junk" to
+	// null. k2 declared STRING holding an int value: coerces to its rendering.
+	gs := buildGlobal(t,
+		oracletest.SetFieldTypeReq(acct, "k1", commonpb.MetadataType_METADATA_TYPE_INT64),
+		oracletest.SetFieldTypeReq(acct, "k2", commonpb.MetadataType_METADATA_TYPE_STRING),
+		oracletest.TxReqL("L", "world", "a:1", "USD", 5),
+		oracletest.AddAccountMetaReq("a:1", "k1", str("5")),
+		oracletest.AddAccountMetaReq("a:1", "k2", &commonpb.MetadataValue{Type: &commonpb.MetadataValue_IntValue{IntValue: 7}}),
+		oracletest.TxReqL("L", "world", "a:2", "USD", 5),
+		oracletest.AddAccountMetaReq("a:2", "k1", str("junk")),
+	)
+	ls := gs.Ledger("L")
+
+	lo, hi := int64(1), int64(9)
+	intRange := FilterFieldInt("k1", &lo, &hi).GetField()
+
+	lookup := func(addr string) func(string) (*commonpb.MetadataValue, bool) {
+		return func(key string) (*commonpb.MetadataValue, bool) {
+			v, ok := ls.Metadata().Get(oracle.MetaKey{Address: addr, Key: key})
+
+			return v, ok
+		}
+	}
+
+	// "5" on an INT64 field coerces into range; "junk" coerces to null.
+	require.True(t, MatchFieldCondition(ls.AccountFieldTypes(), lookup("a:1"), intRange))
+	require.False(t, MatchFieldCondition(ls.AccountFieldTypes(), lookup("a:2"), intRange))
+
+	// Exists: null-coerced values are excluded unless include_null.
+	require.True(t, MatchFieldCondition(ls.AccountFieldTypes(), lookup("a:1"), FilterFieldExists("k1", false).GetField()))
+	require.False(t, MatchFieldCondition(ls.AccountFieldTypes(), lookup("a:2"), FilterFieldExists("k1", false).GetField()))
+	require.True(t, MatchFieldCondition(ls.AccountFieldTypes(), lookup("a:2"), FilterFieldExists("k1", true).GetField()))
+
+	// Int 7 on a STRING field coerces to its string rendering.
+	require.True(t, MatchFieldCondition(ls.AccountFieldTypes(), lookup("a:1"), FilterFieldString("k2", "7").GetField()))
+	require.False(t, MatchFieldCondition(ls.AccountFieldTypes(), lookup("a:1"), FilterFieldString("k2", "8").GetField()))
+
+	// Undeclared key or absent value never match.
+	require.False(t, MatchFieldCondition(ls.AccountFieldTypes(), lookup("a:1"), FilterFieldString("k9", "x").GetField()))
+	require.False(t, MatchFieldCondition(ls.AccountFieldTypes(), lookup("world"), intRange))
+
+	// Kind mismatch classification: a string condition on the INT64 field.
+	require.True(t, FieldKindMismatch(ls, FilterFieldString("k1", "x"), accounts))
+	require.False(t, FieldKindMismatch(ls, intRange2Filter(intRange), accounts))
+	require.False(t, FieldKindMismatch(ls, FilterFieldString("k9", "x"), accounts), "undeclared is not a mismatch")
+
+	// Field-filtered account window: only a:1 matches the int range.
+	require.Equal(t, []string{"a:1"}, AccountWindow(ls, intRange2Filter(intRange), "", 10, false))
+
+	// Needed-set classification per target.
+	needed := map[string]struct{}{}
+	NeededIndexCanonicals(intRange2Filter(intRange), accounts, needed)
+	require.Contains(t, needed, MetadataCanonical(accounts, "k1"))
+}
+
+// intRange2Filter rewraps a FieldCondition into a QueryFilter (test helper).
+func intRange2Filter(fc *commonpb.FieldCondition) *commonpb.QueryFilter {
+	return &commonpb.QueryFilter{Filter: &commonpb.QueryFilter_Field{Field: fc}}
+}
+
+// TestTxRecordMatches_LearnedInsertedAt pins inserted_at's place in row
+// equality: once the stamp is learned it also drives inserted_at filter
+// evaluation, so a row serving a different value must fail the match — while
+// an unlearned (nil) stamp keeps the server-dated tolerance.
+func TestTxRecordMatches_LearnedInsertedAt(t *testing.T) {
+	t.Parallel()
+
+	gs := buildGlobal(t, oracletest.TxReqL("L", "world", "acc:1", "USD", 5))
+	gs.LearnTxStamps("L", 1, stamp(100), stamp(110), nil)
+
+	rec := gs.Ledger("L").Txs().Get(0)
+
+	require.True(t, TxRecordMatches(rec, serverTxFromRec(rec)))
+
+	mismatched := serverTxFromRec(rec)
+	mismatched.InsertedAt, mismatched.UpdatedAt = stamp(999), stamp(999)
+	require.False(t, TxRecordMatches(rec, mismatched),
+		"a learned inserted_at must reject a row serving a different value")
+
+	unlearned := buildGlobal(t, oracletest.TxReqL("L", "world", "acc:1", "USD", 5)).Ledger("L").Txs().Get(0)
+	anyStamp := serverTxFromRec(unlearned)
+	anyStamp.InsertedAt, anyStamp.UpdatedAt = stamp(123), stamp(123)
+	require.True(t, TxRecordMatches(unlearned, anyStamp),
+		"an unlearned inserted_at stays server-dated and unchecked")
+}
+
+// updated_at is stamped from the same proposal date as inserted_at and nothing
+// bumps it afterwards, so a row where the two disagree is corrupt regardless of
+// what the model learned.
+func TestTxRecordMatches_UpdatedAtTracksInsertedAt(t *testing.T) {
+	t.Parallel()
+
+	gs := buildGlobal(t, oracletest.TxReqL("L", "world", "acc:1", "USD", 5))
+	gs.LearnTxStamps("L", 1, stamp(100), stamp(110), nil)
+
+	rec := gs.Ledger("L").Txs().Get(0)
+	require.True(t, TxRecordMatches(rec, serverTxFromRec(rec)))
+
+	drifted := serverTxFromRec(rec)
+	drifted.UpdatedAt = stamp(111)
+	require.False(t, TxRecordMatches(rec, drifted), "a bumped updated_at is a finding")
+
+	missing := serverTxFromRec(rec)
+	missing.UpdatedAt = nil
+	require.False(t, TxRecordMatches(rec, missing), "so is dropping it")
+}
+
+// The post-commit snapshot is frozen at the transaction's own sequence, so a
+// read must echo it whatever the balances have done since. It is compared in
+// both directions: a missing cell and an invented one are equally wrong.
+func TestTxRecordMatches_ComparesPostCommitVolumes(t *testing.T) {
+	t.Parallel()
+
+	// The second transaction moves acc:1 again, so the first one's snapshot no
+	// longer equals any current balance.
+	gs := buildGlobal(t,
+		oracletest.TxReqL("L", "world", "acc:1", "USD", 5),
+		oracletest.TxReqL("L", "world", "acc:1", "USD", 7),
+	)
+
+	rec := gs.Ledger("L").Txs().Get(0)
+	require.NotEmpty(t, rec.PostCommitVolumes(), "the model froze a snapshot")
+	require.True(t, TxRecordMatches(rec, serverTxFromRec(rec)))
+
+	current := serverTxFromRec(rec)
+	current.PostCommitVolumes.GetVolumesByAccount()["acc:1"].Volumes[0].Volumes.Input = commonpb.MustBigUintFromDecimal("12")
+	require.False(t, TxRecordMatches(rec, current),
+		"serving the current balance instead of the snapshot is a finding")
+
+	dropped := serverTxFromRec(rec)
+	delete(dropped.GetPostCommitVolumes().GetVolumesByAccount(), "acc:1")
+	require.False(t, TxRecordMatches(rec, dropped), "a missing cell is a finding")
+
+	invented := serverTxFromRec(rec)
+	invented.PostCommitVolumes.GetVolumesByAccount()["ghost:1"] = &commonpb.VolumesByAssets{
+		Volumes: []*commonpb.VolumeEntry{{Asset: "USD", Volumes: &commonpb.Volumes{Input: commonpb.MustBigUintFromDecimal("1"), Output: commonpb.MustBigUintFromDecimal("0")}}},
+	}
+	require.False(t, TxRecordMatches(rec, invented), "an invented cell is a finding")
+
+	coloured := serverTxFromRec(rec)
+	coloured.PostCommitVolumes.GetVolumesByAccount()["acc:1"].Volumes[0].Color = "GRANTS"
+	require.False(t, TxRecordMatches(rec, coloured),
+		"the snapshot names one bucket, so the same amounts under another colour is a different cell")
+}
+
+// The posting carries the colour of the funds that moved, so a served
+// transaction is held to it: a recoloured posting moves a different bucket, and
+// a stripped one claims the uncolored bucket moved.
+func TestTxRecordMatches_ComparesPostingColour(t *testing.T) {
+	t.Parallel()
+
+	gs := buildGlobal(t, oracletest.TxReqColoredL("L", "world", "acc:1", "USD", "GRANTS", 5))
+	rec := gs.Ledger("L").Txs().Get(0)
+	require.True(t, TxRecordMatches(rec, serverTxFromRec(rec)))
+
+	// serverTxFromRec hands out the record's own posting slice, so each variant
+	// gets a fresh one.
+	served := func(postings ...*commonpb.Posting) *commonpb.Transaction {
+		tx := serverTxFromRec(rec)
+		tx.Postings = postings
+
+		return tx
+	}
+
+	require.False(t, TxRecordMatches(rec, served(
+		commonpb.NewColoredPosting("world", "acc:1", "USD", "GOLD", big.NewInt(5)),
+	)), "a recoloured posting moves a bucket the model never touched")
+
+	require.False(t, TxRecordMatches(rec, served(
+		commonpb.NewPosting("world", "acc:1", "USD", big.NewInt(5)),
+	)), "dropping the colour claims the uncolored bucket moved")
+}
+
+// assembleAccount never stamps these, so the oracle pins them absent rather
+// than waving through whatever a future change starts sending.
+func TestAccountMatches_RejectsUnmodelledTimestamps(t *testing.T) {
+	t.Parallel()
+
+	ls := buildGlobal(t, oracletest.TxReqL("L", "world", "acc:1", "USD", 5)).Ledger("L")
+
+	base := func() *commonpb.Account {
+		return &commonpb.Account{
+			Address: "acc:1",
+			Volumes: []*commonpb.AccountVolume{
+				{Asset: "USD", Volumes: &commonpb.VolumesWithBalance{Input: commonpb.MustBigUintFromDecimal("5"), Output: commonpb.MustBigUintFromDecimal("0"), Balance: commonpb.MustSignedBigIntFromDecimal("5")}},
+			},
+		}
+	}
+
+	require.True(t, AccountMatches(ls, "acc:1", base()))
+
+	for name, mutate := range map[string]func(*commonpb.Account){
+		"first_usage":    func(a *commonpb.Account) { a.FirstUsage = stamp(1) },
+		"insertion_date": func(a *commonpb.Account) { a.InsertionDate = stamp(1) },
+		"updated_at":     func(a *commonpb.Account) { a.UpdatedAt = stamp(1) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			acct := base()
+			mutate(acct)
+			require.False(t, AccountMatches(ls, "acc:1", acct))
+		})
+	}
+}
+
+// Buckets are compared one for one: a colour the model does not hold is a
+// fabricated row, and a colour it does hold must come back under that colour.
+func TestAccountMatches_SegregatesColourBuckets(t *testing.T) {
+	t.Parallel()
+
+	ls := buildGlobal(t,
+		oracletest.TxReqL("L", "world", "acc:1", "USD", 5),
+		oracletest.TxReqColoredL("L", "world", "acc:1", "USD", "GRANTS", 7),
+	).Ledger("L")
+
+	bucket := func(color, in, bal string) *commonpb.AccountVolume {
+		return &commonpb.AccountVolume{
+			Asset: "USD", Color: color,
+			Volumes: &commonpb.VolumesWithBalance{
+				Input:   commonpb.MustBigUintFromDecimal(in),
+				Output:  commonpb.MustBigUintFromDecimal("0"),
+				Balance: commonpb.MustSignedBigIntFromDecimal(bal),
+			},
+		}
+	}
+	account := func(vols ...*commonpb.AccountVolume) *commonpb.Account {
+		return &commonpb.Account{Address: "acc:1", Volumes: vols}
+	}
+
+	require.True(t, AccountMatches(ls, "acc:1", account(bucket("", "5", "5"), bucket("GRANTS", "7", "7"))))
+
+	require.False(t, AccountMatches(ls, "acc:1", account(bucket("", "5", "5"), bucket("GOLD", "7", "7"))),
+		"a bucket the model does not hold")
+
+	require.False(t, AccountMatches(ls, "acc:1", account(bucket("", "12", "12"))),
+		"summing across buckets hides the segregation")
+}
+
+// The volume lists carry one entry per asset. A repeat collapses into the
+// comparison's map and is counted once, so without an explicit check it would
+// pass — and only the first copy is ever read, hiding whatever the second one
+// carries.
+func TestVolumeComparisons_RejectDuplicateRows(t *testing.T) {
+	t.Parallel()
+
+	ls := buildGlobal(t, oracletest.TxReqL("L", "world", "acc:1", "USD", 5)).Ledger("L")
+
+	usd := func(in, out, bal string) *commonpb.AccountVolume {
+		return &commonpb.AccountVolume{
+			Asset: "USD",
+			Volumes: &commonpb.VolumesWithBalance{
+				Input:   commonpb.MustBigUintFromDecimal(in),
+				Output:  commonpb.MustBigUintFromDecimal(out),
+				Balance: commonpb.MustSignedBigIntFromDecimal(bal),
+			},
+		}
+	}
+
+	acct := &commonpb.Account{Address: "acc:1", Volumes: []*commonpb.AccountVolume{usd("5", "0", "5")}}
+	require.True(t, AccountMatches(ls, "acc:1", acct))
+
+	acct.Volumes = append(acct.Volumes, usd("5", "0", "5"))
+	require.False(t, AccountMatches(ls, "acc:1", acct), "an exact repeat is still malformed")
+
+	rec := ls.Txs().Get(0)
+	snapshot := serverPCVFromRec(rec)
+	require.True(t, PCVSnapshotMatches(rec.PostCommitVolumes(), snapshot))
+
+	byAccount := snapshot.GetVolumesByAccount()["acc:1"]
+	byAccount.Volumes = append(byAccount.Volumes, &commonpb.VolumeEntry{
+		Asset: "USD", Volumes: &commonpb.Volumes{Input: commonpb.MustBigUintFromDecimal("999"), Output: commonpb.MustBigUintFromDecimal("0")},
+	})
+	require.False(t, PCVSnapshotMatches(rec.PostCommitVolumes(), snapshot),
+		"the second copy is never read, so it must not be tolerated")
+}
