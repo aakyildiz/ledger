@@ -65,6 +65,9 @@ pub struct CheckpointExt {
     pub burst_ready: AtomicBool,
     /// Bursts completed (for tests and logs).
     pub bursts: AtomicU64,
+    /// A burst job is queued or running: `checkpoint_burst` waits for it, so
+    /// the job queue never accumulates bursts.
+    pub burst_pending: AtomicBool,
 }
 
 pub fn burst_ledger(run: &str) -> String {
@@ -584,7 +587,7 @@ pub fn burst_body(run: &str, user: u64, amount: u64) -> Value {
 /// still be in the checkpoint's gated window (server-signals §1.1, §1.2).
 pub fn checkpoint_burst(d: &Driver, tc: TestCase) {
     d.guarded("checkpoint_burst", &tc, |d, tc| {
-        if !d.s.oracle_ok() {
+        if !d.s.oracle_ok() || d.s.ext::<CheckpointExt>().burst_pending.load(Ordering::SeqCst) {
             return None;
         }
         let n = draw::int_in(tc, 50, 200) as usize;
@@ -598,12 +601,23 @@ pub fn checkpoint_burst(d: &Driver, tc: TestCase) {
     });
 }
 
+struct BurstPending(std::sync::Arc<CheckpointExt>);
+
+impl Drop for BurstPending {
+    fn drop(&mut self) {
+        self.0.burst_pending.store(false, Ordering::SeqCst);
+    }
+}
+
 /// Submits the burst job (no draws inside).
 pub fn submit_burst(d: &Driver, writes: Vec<(Route, Value)>) {
+    d.s.ext::<CheckpointExt>().burst_pending.store(true, Ordering::SeqCst);
     d.submit_job(Job {
         name: "checkpoint-burst",
         blocks_quiet: false,
         run: Box::new(move |d: &Driver| {
+            // Cleared on every exit, a panic included (the runner catches it).
+            let _pending = BurstPending(d.s.ext::<CheckpointExt>());
             ensure_burst_ledger(d, 2);
             let clients = d.s.clients.len().max(1);
             let mut by_client: Vec<Vec<(Route, Value)>> = vec![Vec::new(); clients];
@@ -864,7 +878,8 @@ mod tests {
         let writes: Vec<(Route, Value)> = (0..9).map(|i| (Route::plain(i % 3), burst_body(&d.s.run, i as u64, 1))).collect();
         submit_burst(&d, writes);
         let ext = d.s.ext::<CheckpointExt>();
-        testkit::wait_until(Duration::from_secs(5), || ext.bursts.load(Ordering::SeqCst) == 1);
+        // Once done, the next burst may start.
+        testkit::wait_until(Duration::from_secs(5), || ext.bursts.load(Ordering::SeqCst) == 1 && !ext.burst_pending.load(Ordering::SeqCst));
         let applies: Vec<Value> = ft.calls_of("bucket", "Apply").into_iter().filter(|a| a["request"]["unsigned"]["requests"][0]["apply"]["ledger"] == json!(burst_ledger(&d.s.run))).collect();
         assert_eq!(applies.len(), 9);
         assert!(applies.iter().all(|a| a["request"]["unsigned"].get("idempotencyKey").is_none()), "unkeyed");
