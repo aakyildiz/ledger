@@ -31,8 +31,10 @@ const FORCED_ACCOUNTS: usize = 2;
 const ASSETS: [&str; 3] = ["USD/2", "EUR/2", "COIN"];
 const META_KEYS: [&str; 3] = ["tier", "status", "owner"];
 /// Chance per round of starting a quiet period: about one every few minutes
-/// at the ~25 rounds/s measured locally. QUIET_PROBABILITY overrides it.
-const P_QUIET: f64 = 1.0 / 4000.0;
+/// of a timeline at the round rate seen in Antithesis runs (timelines are
+/// short, so quiet periods must start early to happen in many of them).
+/// QUIET_PROBABILITY overrides it.
+const P_QUIET: f64 = 1.0 / 800.0;
 const QUIET: Duration = Duration::from_secs(90);
 const DEADLINE: Duration = Duration::from_secs(60);
 
@@ -155,7 +157,7 @@ impl Driver {
     }
 
     /// Records a new transaction in the model before it is sent.
-    fn register_tx(&self, l: usize, postings: &[Posting], reference: &str, force: bool, key: Option<String>, doomed: bool) -> usize {
+    fn register_tx(&self, l: usize, postings: &[Posting], reference: &str, force: bool, key: Option<String>, doomed: bool, request: Option<&Value>) -> usize {
         let mut m = self.model.lock().unwrap();
         if force {
             for p in postings {
@@ -175,6 +177,7 @@ impl Driver {
             tx_id: None,
             reason: String::new(),
             doomed_batch: doomed,
+            request: request.cloned(),
         });
         let idx = lm.txs.len() - 1;
         lm.by_ref.insert(reference.to_string(), idx);
@@ -348,7 +351,7 @@ impl Driver {
         };
         let skip = chance(&tc, 0.1);
         let req = Self::create_tx_request(LEDGERS[l], &postings, &reference, force, skip, tx_meta.as_ref(), acct_meta.as_ref());
-        let idx = self.register_tx(l, &postings, &reference, force, key.clone(), false);
+        let idx = self.register_tx(l, &postings, &reference, force, key.clone(), false, Some(&req));
         let op = self.clients.next_op_id();
         if let Some((addr, k, v)) = &acct_meta {
             self.register_meta(l, addr, k, Some(v.clone()), op);
@@ -424,7 +427,7 @@ impl Driver {
         let found = {
             let m = self.model.lock().unwrap();
             let lm = &m.ledgers[l];
-            let cands: Vec<usize> = (0..lm.txs.len()).filter(|&i| lm.txs[i].key.is_some() && !lm.txs[i].doomed_batch).collect();
+            let cands: Vec<usize> = (0..lm.txs.len()).filter(|&i| lm.txs[i].key.is_some() && lm.txs[i].request.is_some()).collect();
             if cands.is_empty() {
                 None
             } else {
@@ -437,13 +440,13 @@ impl Driver {
         let key = rec.key.clone().unwrap();
         // A changed payload is only meaningful once the key is known to be taken.
         let mutate = rec.status == Status::Acked && chance(&tc, 0.3);
-        let mut postings = rec.postings.clone();
+        // Replay the exact original request, or change one byte of its meaning.
+        let mut req = rec.request.clone().unwrap();
         if mutate {
-            postings[0].amount = postings[0].amount.wrapping_add(1).max(1);
+            if let Some(ct) = req.pointer_mut("/apply/action/createTransaction") {
+                ct["reference"] = json!(format!("{}-changed", rec.reference));
+            }
         }
-        let req = Self::create_tx_request(LEDGERS[l], &postings, &rec.reference, rec.force, false, None, None);
-        // The original carried metadata only sometimes; replay what defines the
-        // batch: replays of a metadata-carrying original are payload changes.
         let (op, out) = self.clients.apply(client, vec![req], Some(&key));
         if mutate {
             if let Outcome::Ok(resp) = &out {
@@ -465,10 +468,7 @@ impl Driver {
                 let log = resp.pointer("/logs/0").cloned().unwrap_or(Value::Null);
                 if let Some(tx) = created_transaction(&log) {
                     let was = rec.status;
-                    let meta_differs = tx.get("metadata").is_some();
-                    if !meta_differs {
-                        self.record_created(l, idx, tx, Instant::now());
-                    }
+                    self.record_created(l, idx, tx, Instant::now());
                     assert_always!(was != Status::Rejected, "a rejected write stays rejected when its idempotency key is replayed", &json!({
                         "reference": rec.reference, "reason": rec.reason
                     }));
@@ -479,10 +479,8 @@ impl Driver {
             _ if !ambiguous(&out) => {
                 let m = self.model.lock().unwrap();
                 let st = m.ledgers[l].txs[idx].status;
-                // A replay of an acknowledged write may be refused only for a payload change
-                // (a metadata-carrying original).
                 assert_always!(
-                    st != Status::Acked || out.reason() == "IDEMPOTENCY_KEY_CONFLICT",
+                    st != Status::Acked,
                     "replaying an acknowledged write under its idempotency key never fails",
                     &json!({"reference": rec.reference, "outcome": out.summary(), "op": op})
                 );
@@ -769,7 +767,7 @@ impl Driver {
                 self.draw_postings_for(&tc, force)
             };
             reqs.push(Self::create_tx_request(LEDGERS[l], &postings, &reference, force, false, None, None));
-            idxs.push(self.register_tx(l, &postings, &reference, force, Some(key.clone()), doomed));
+            idxs.push(self.register_tx(l, &postings, &reference, force, Some(key.clone()), doomed, None));
         }
         let (op, out) = self.clients.apply(client, reqs, Some(&key));
         match &out {
@@ -809,10 +807,10 @@ impl Driver {
         let key = self.uniq("k");
         let script = format!("vars {{ account $dest }}\nsend [COIN {amount}] (\n  source = @world\n  destination = $dest\n)\n");
         let postings = vec![Posting { source: "world".into(), destination: dest.clone(), amount, asset: "COIN".into() }];
-        let idx = self.register_tx(l, &postings, &reference, false, Some(key.clone()), false);
         let req = json!({"apply": {"ledger": LEDGERS[l], "action": {"createTransaction": {
             "script": {"plain": script, "vars": {"dest": dest}}, "reference": reference
         }}}});
+        let idx = self.register_tx(l, &postings, &reference, false, Some(key.clone()), false, Some(&req));
         let (op, out) = self.clients.apply(client, vec![req], Some(&key));
         self.resolve_tx(l, idx, op, &out);
         assert_sometimes!(out.is_ok(), "a numscript transaction commits", &json!({"outcome": out.summary()}));
@@ -945,8 +943,9 @@ impl Driver {
                     let ps = vec![Posting { source: "world".into(), destination: "fees".into(), amount: 1, asset: "COIN".into() }];
                     let reference = self.uniq("r");
                     let key = self.uniq("k");
-                    let idx = self.register_tx(l, &ps, &reference, false, Some(key.clone()), false);
-                    let (op, out) = self.clients.apply(client, vec![Self::create_tx_request(LEDGERS[l], &ps, &reference, false, false, None, None)], Some(&key));
+                    let req = Self::create_tx_request(LEDGERS[l], &ps, &reference, false, false, None, None);
+                    let idx = self.register_tx(l, &ps, &reference, false, Some(key.clone()), false, Some(&req));
+                    let (op, out) = self.clients.apply(client, vec![req], Some(&key));
                     self.resolve_tx(l, idx, op, &out);
                     assert_sometimes!(out.reason() == "MAINTENANCE_MODE", "a write during maintenance is refused", &json!({}));
                 }

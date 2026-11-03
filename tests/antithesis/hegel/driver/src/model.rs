@@ -33,6 +33,9 @@ pub struct TxRec {
     pub reason: String,
     /// Part of a batch the driver built to fail atomically.
     pub doomed_batch: bool,
+    /// The exact request sent, for replays under the same idempotency key.
+    /// None for a transaction sent as part of a batch.
+    pub request: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug)]

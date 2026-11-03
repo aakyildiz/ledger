@@ -1,8 +1,11 @@
 // Command client is the Antithesis client program for the hegel driver
 // (tests/antithesis/hegel). It holds one shared gRPC connection to the ledger
-// cluster, built exactly like the workload's (internal.NewConn: round-robin
-// over every node, retry interceptors with backoff, classification), and
+// cluster, configured as ledgerctl configures its own (the protocol revision
+// header and actions.GRPCRetryPolicy), round-robin over every node, and
 // executes the RPCs the driver sends it.
+//
+// It deliberately imports nothing from the workload's internal package: that
+// package declares Antithesis assertions this program would never reach.
 //
 // Protocol (HTTP on :8080):
 //
@@ -30,6 +33,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -48,7 +52,10 @@ import (
 	"github.com/formancehq/ledger/v3/internal/proto/servicepb"
 	"github.com/formancehq/ledger/v3/pkg/grpcprotocol"
 
-	"github.com/formancehq/ledger/v3/tests/antithesis/workload/internal"
+	"google.golang.org/grpc/resolver"
+	"google.golang.org/grpc/resolver/manual"
+
+	"github.com/formancehq/ledger/v3/pkg/actions"
 )
 
 var (
@@ -132,7 +139,7 @@ func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 	log.Printf("client boot=%s", boot)
 
-	conn, err := internal.NewGRPCConn()
+	conn, err := dial(os.Getenv("LEDGER_GRPC_ADDR"))
 	if err != nil {
 		log.Fatalf("dial: %v", err)
 	}
@@ -152,12 +159,45 @@ func main() {
 		log.Printf("client shutting down")
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		_ = httpServer.Shutdown(ctx)
+		if err := httpServer.Shutdown(ctx); err != nil {
+			log.Printf("shutdown: %v", err)
+		}
 	}()
 	if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("listen: %v", err)
 	}
-	_ = conn.Close()
+	if err := conn.Close(); err != nil {
+		log.Printf("closing connection: %v", err)
+	}
+}
+
+// dial connects to every node in addrs (comma-separated), round-robin, with
+// ledgerctl's retry policy.
+func dial(addrs string) (*grpc.ClientConn, error) {
+	var policy map[string]any
+	if err := json.Unmarshal([]byte(actions.GRPCRetryPolicy), &policy); err != nil {
+		return nil, fmt.Errorf("parsing retry policy: %w", err)
+	}
+	policy["loadBalancingConfig"] = []any{map[string]any{"round_robin": map[string]any{}}}
+	serviceConfig, err := json.Marshal(policy)
+	if err != nil {
+		return nil, err
+	}
+	r := manual.NewBuilderWithScheme("ledger")
+	var state resolver.State
+	for _, a := range strings.Split(addrs, ",") {
+		if a = strings.TrimSpace(a); a != "" {
+			state.Addresses = append(state.Addresses, resolver.Address{Addr: a})
+		}
+	}
+	r.InitialState(state)
+
+	return grpc.NewClient("ledger:///",
+		grpcprotocol.ClientOption(),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithDefaultServiceConfig(string(serviceConfig)),
+		grpc.WithResolvers(r),
+	)
 }
 
 // dialOutcome resolves the outcome address, retrying once a second, in the
@@ -255,7 +295,11 @@ func call(ctx context.Context, conn *grpc.ClientConn, method protoreflect.Method
 		if err := conn.Invoke(ctx, fullMethod, in, out); err != nil {
 			return errOutcome(err)
 		}
-		b, _ := marshal.Marshal(out)
+		b, err := marshal.Marshal(out)
+		if err != nil {
+			return outcome{Code: "Internal", Message: "marshal response: " + err.Error()}
+		}
+
 		return outcome{OK: true, Response: b}
 	}
 
@@ -291,7 +335,10 @@ func call(ctx context.Context, conn *grpc.ClientConn, method protoreflect.Method
 		if err != nil {
 			return errOutcome(err)
 		}
-		b, _ := marshal.Marshal(item)
+		b, err := marshal.Marshal(item)
+		if err != nil {
+			return outcome{Code: "Internal", Message: "marshal item: " + err.Error()}
+		}
 		items = append(items, b)
 		if len(items) >= maxItems {
 			return outcome{OK: true, Items: items, Complete: false}
@@ -310,20 +357,34 @@ func (s *server) report(req opRequest, out outcome) {
 	if s.udp == nil {
 		return
 	}
-	b, _ := json.Marshal(event{Boot: boot, OpID: req.OpID, Outcome: out})
+	b, err := json.Marshal(event{Boot: boot, OpID: req.OpID, Outcome: out})
+	if err != nil {
+		log.Printf("op=%d marshal event: %v", req.OpID, err)
+
+		return
+	}
 	if len(b) > 60000 {
 		small := out
 		small.Items = nil
 		small.Response = nil
 		small.Message = "truncated"
-		b, _ = json.Marshal(event{Boot: boot, OpID: req.OpID, Outcome: small})
+		b, err = json.Marshal(event{Boot: boot, OpID: req.OpID, Outcome: small})
+		if err != nil {
+			log.Printf("op=%d marshal event: %v", req.OpID, err)
+
+			return
+		}
 	}
 	s.udpMu.Lock()
+	// Best effort: a lost event leaves the operation unknown to the driver,
+	// which the model already allows.
 	_, _ = s.udp.Write(b)
 	s.udpMu.Unlock()
 }
 
 func errOutcome(err error) outcome {
+	// A non-status error converts to codes.Unknown with its message, which is
+	// what the outcome should say.
 	st, _ := status.FromError(err)
 	out := outcome{Code: st.Code().String(), Message: st.Message()}
 	for _, d := range st.Details() {
@@ -331,9 +392,6 @@ func errOutcome(err error) outcome {
 			out.Reason = info.GetReason()
 			out.Metadata = info.GetMetadata()
 		}
-	}
-	if out.Reason == "" {
-		out.Reason = internal.ErrorReason(err)
 	}
 	return out
 }
@@ -364,5 +422,8 @@ func newMessage(d protoreflect.MessageDescriptor) (proto.Message, error) {
 
 func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(v)
+	if err := json.NewEncoder(w).Encode(v); err != nil {
+		// The driver gave up on the request; the UDP event carries the outcome.
+		log.Printf("writing response: %v", err)
+	}
 }

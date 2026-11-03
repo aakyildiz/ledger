@@ -23,6 +23,14 @@ x-ledger: &ledger
     BLOOM_METADATA_EXPECTED_KEYS: "1000000"
     BLOOM_REFERENCES_EXPECTED_KEYS: "1000000"
     SENTINEL_MODE: "true"
+    # The Antithesis VM's disk is ~5 GiB. Pebble preallocates each WAL file to
+    # the memtable size (256Mi by default), which filled it within minutes and
+    # tripped the "disk usage exceeds threshold" assertion. Smaller memtables
+    # also flush and compact more often.
+    PEBBLE_MEMTABLE_SIZE: 32Mi
+    READ_INDEX_MEMTABLE_SIZE: 16Mi
+    # Three nodes share one VM; the 1Gi default block cache each is too much.
+    PEBBLE_CACHE_SIZE: 128Mi
     AWS_ACCESS_KEY_ID: minioadmin
     AWS_SECRET_ACCESS_KEY: minioadmin
     LOG_FORWARD_ADDR: driver:7777
@@ -85,7 +93,16 @@ services:
     container_name: nats
     hostname: nats
     restart: on-failure
-    command: ["-js"]
+    # nats-server exits 1 on SIGTERM; report a signalled shutdown as clean so
+    # Antithesis's stop faults don't count as unexpected exits.
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        nats-server -js & pid=$$!
+        trap 'kill -TERM $$pid' TERM INT
+        wait $$pid; status=$$?
+        if [ $$status -gt 128 ]; then wait $$pid; status=$$?; [ $$status -eq 1 ] && status=0; fi
+        exit $$status
 
   client1: { <<: *client, container_name: client1, hostname: client1 }
   client2: { <<: *client, container_name: client2, hostname: client2 }
