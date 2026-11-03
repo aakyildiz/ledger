@@ -1,0 +1,9 @@
+{
+  "name": "03 delete of an absent ledger metadata key",
+  "setup": [
+    {"createLedger": {"name": "o-rej-l1"}},
+    {"saveLedgerMetadata": {"ledger": "o-rej-l1", "metadata": {"k0": {"stringValue": "v0"}}}}
+  ],
+  "requests": [{"deleteLedgerMetadata": {"ledger": "o-rej-l1", "key": "k3"}}],
+  "expectReason": "METADATA_NOT_FOUND"
+}

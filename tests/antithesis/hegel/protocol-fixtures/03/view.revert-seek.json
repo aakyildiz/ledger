@@ -1,0 +1,6 @@
+{
+  "endpoint": "POST /view",
+  "request": {"views": [{"name": "revertSeek", "ledger": "o-18f6c2a1b3d4e-l1", "probe": "40"}]},
+  "status": 200,
+  "response": {"bootId": "1793836800123456789", "version": 4711, "views": [{"ledger": "o-18f6c2a1b3d4e-l1", "found": true, "wrapped": false, "entry": {"id": "43", "revertsTransaction": "12", "reverted": false}}]}
+}

@@ -1,0 +1,14 @@
+{
+  "endpoint": "POST /read/end",
+  "request": {
+    "ticket": 914,
+    "kind": "Replay",
+    "request": {"unsigned": {"requests": [{"apply": {"ledger": "o-18f6c2a1b3d4e-l1", "action": {"createTransaction": {"postings": [{"source": "world", "destination": "users:3", "amount": {"v0": "9"}, "asset": "COIN"}]}}}}], "idempotencyKey": "o-18f6c2a1b3d4e-k77"}},
+    "outcome": {"ok": true, "response": {"logs": [{"sequence": "812"}]}, "peer": "ledger-1:8888", "elapsedMs": 3},
+    "route": {"client": 1, "route": "lib", "node": "", "consistency": "linearizable"},
+    "hint": {"status": "committed", "reason": ""},
+    "params": {"wid": "w99"}
+  },
+  "status": 200,
+  "response": {"bootId": "1793836800123456789", "verdict": {"ok": true, "skipped": false, "violations": []}, "coverage": ["oracle: idempotency replay exercised"]}
+}

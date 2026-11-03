@@ -1,0 +1,9 @@
+{
+  "name": "03 meta_bulk shape: a committed add then a delete of an absent key without opt-in",
+  "setup": [{"createLedger": {"name": "o-rej-l1"}}],
+  "requests": [
+    {"apply": {"ledger": "o-rej-l1", "action": {"addMetadata": {"target": {"account": {"addr": "t-0:1"}}, "metadata": {"k0": {"uintValue": "7"}}}}}},
+    {"apply": {"ledger": "o-rej-l1", "action": {"deleteMetadata": {"target": {"account": {"addr": "t-0:1"}}, "key": "absent-k0"}}}}
+  ],
+  "expectReason": "METADATA_NOT_FOUND"
+}
