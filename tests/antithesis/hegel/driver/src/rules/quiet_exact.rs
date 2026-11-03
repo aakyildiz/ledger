@@ -39,12 +39,14 @@ const ATTEMPTS: usize = 4;
 const NODE_WAIT: Duration = Duration::from_secs(30);
 
 pub fn quiet_hooks() -> Vec<QuietHook> {
-    vec![QuietHook { name: "exact", budget: BUDGET, needs_oracle: true, weight: exact_weight, plan, run }]
+    vec![QuietHook { name: "exact", budget: BUDGET, needs_oracle: true, weight: exact_weight, completions: 1, plan, run }]
 }
 
 /// The weight while `exact` is overdue (the other flavours weigh about 11
 /// together): before the first completed check of the process, and once
-/// `OVERDUE_AFTER` quiet periods passed without one.
+/// `OVERDUE_AFTER` quiet periods passed without one. While other flavours
+/// are still pending after the first completed check, they take turns and
+/// `exact` is drawn only when overdue (`quiet::flavour_weights`).
 pub const OVERDUE_WEIGHT: f64 = 50.0;
 /// The weight otherwise.
 pub const BASE_WEIGHT: f64 = 10.0;

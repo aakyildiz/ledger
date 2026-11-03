@@ -52,7 +52,7 @@ fn quiet_weight(_: &crate::shared::Shared) -> f64 {
 }
 
 pub fn quiet_hooks() -> Vec<QuietHook> {
-    vec![QuietHook { name: "numscript_state", budget: QUIET_BUDGET, needs_oracle: false, weight: quiet_weight, plan: quiet_plan, run: quiet_run }]
+    vec![QuietHook { name: "numscript_state", budget: QUIET_BUDGET, needs_oracle: false, weight: quiet_weight, completions: 1, plan: quiet_plan, run: quiet_run }]
 }
 
 fn lock(st: &NsState) -> MutexGuard<'_, Vec<NsLedger>> {
@@ -810,6 +810,7 @@ fn quiet_run(d: &Driver, ctx: &mut QuietCtx, plan: &HookPlan) {
         }
     }
     check_sometimes!(complete, "numscript_state completes within its quiet budget", json!({"swap": swap, "remainingMs": ctx.remaining().as_millis() as u64}));
+    ctx.reached = Some(complete);
 }
 
 #[cfg(test)]

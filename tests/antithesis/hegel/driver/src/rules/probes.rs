@@ -95,8 +95,8 @@ pub fn rules() -> Vec<ConcurrentRule<Driver>> {
 
 pub fn quiet_hooks() -> Vec<QuietHook> {
     vec![
-        QuietHook { name: "quiesce_and_absence", budget: Duration::from_secs(45), needs_oracle: false, weight: weight_one, plan: plan_quiesce, run: run_quiesce_hook },
-        QuietHook { name: "eventually_correct", budget: Duration::from_secs(90), needs_oracle: false, weight: weight_one, plan: plan_eventually_correct, run: run_eventually_correct_hook },
+        QuietHook { name: "quiesce_and_absence", budget: Duration::from_secs(45), needs_oracle: false, weight: weight_one, completions: 1, plan: plan_quiesce, run: run_quiesce_hook },
+        QuietHook { name: "eventually_correct", budget: Duration::from_secs(90), needs_oracle: false, weight: weight_one, completions: 1, plan: plan_eventually_correct, run: run_eventually_correct_hook },
     ]
 }
 

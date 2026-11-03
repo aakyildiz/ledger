@@ -65,9 +65,9 @@ pub const FOLD_LOG_LIMIT: u64 = 5000;
 
 pub fn quiet_hooks() -> Vec<QuietHook> {
     vec![
-        QuietHook { name: "cross_node_identity", budget: CROSS_NODE_BUDGET, needs_oracle: false, weight: weight_one, plan: plan_client, run: run_cross_node },
-        QuietHook { name: "stats_convergence", budget: STATS_BUDGET, needs_oracle: true, weight: weight_one, plan: plan_stats, run: run_stats },
-        QuietHook { name: "cluster_config_convergence", budget: CLUSTER_CONFIG_BUDGET, needs_oracle: false, weight: weight_half, plan: plan_client, run: run_cluster_config },
+        QuietHook { name: "cross_node_identity", budget: CROSS_NODE_BUDGET, needs_oracle: false, weight: weight_one, completions: 1, plan: plan_client, run: run_cross_node },
+        QuietHook { name: "stats_convergence", budget: STATS_BUDGET, needs_oracle: true, weight: weight_one, completions: 1, plan: plan_stats, run: run_stats },
+        QuietHook { name: "cluster_config_convergence", budget: CLUSTER_CONFIG_BUDGET, needs_oracle: false, weight: weight_half, completions: 2, plan: plan_client, run: run_cluster_config },
     ]
 }
 
@@ -1131,14 +1131,15 @@ fn stats_attempt(d: &Driver, client: usize, cands: &[String], tracked: &BTreeMap
 
 /// The stats convergence hook body. `begin == None` (oracle skipped or
 /// degraded) returns at once: not a finding.
-pub fn stats_convergence(d: &Driver, client: usize, nodes: &NodeMap, begin: Option<&Value>, seed: u64, deadline: Instant, w: Windows) {
+/// Returns whether it reached its verdicts (not skipped, not cut).
+pub fn stats_convergence(d: &Driver, client: usize, nodes: &NodeMap, begin: Option<&Value>, seed: u64, deadline: Instant, w: Windows) -> bool {
     let Some(begin) = begin else {
         println!("driver: stats_convergence skipped: no /quiet/begin");
-        return;
+        return false;
     };
     let Some(tracked) = tracked_expectations(begin) else {
         println!("driver: stats_convergence skipped: /quiet/begin carries no providers.usage");
-        return;
+        return false;
     };
     let cands = candidates(d, nodes);
     // Discovery answered (the old per-node dial), or a candidate answers below.
@@ -1169,13 +1170,14 @@ pub fn stats_convergence(d: &Driver, client: usize, nodes: &NodeMap, begin: Opti
     let completed = !cut && Instant::now() <= deadline;
     check_sometimes!(completed, "stats_convergence completes within its quiet budget", json!({"failures": failures}));
     if !completed {
-        return;
+        return false;
     }
     check_always!(connected, "stats convergence oracle connects to replicas", json!({"candidates": cands, "failures": failures}));
     check_always!(qualified_verdict(report.is_some(), &failures), "stats oracle obtains a qualified observation within its bounded retry budget", json!({"attempts": failures}));
     if let Some(r) = &report {
         publish_stats(r);
     }
+    true
 }
 
 /// Usage verdicts only for members with a certified sweep (or a definitive
@@ -1201,7 +1203,7 @@ pub fn publish_stats(r: &StatsReport) {
 fn run_stats(d: &Driver, ctx: &mut QuietCtx, plan: &HookPlan) {
     let client = plan_of(d, ctx, plan);
     let begin = ctx.begin.clone();
-    stats_convergence(d, client, &ctx.nodes, begin.as_ref(), seed_of(plan), ctx.deadline, STATS_WINDOWS);
+    ctx.reached = Some(stats_convergence(d, client, &ctx.nodes, begin.as_ref(), seed_of(plan), ctx.deadline, STATS_WINDOWS));
 }
 
 // ---------------------------------------------------------------- cluster config convergence
@@ -1253,7 +1255,8 @@ fn config_attempt(d: &Driver, client: usize, cands: &[String], deadline: Instant
 }
 
 /// The cluster-config convergence hook body.
-pub fn cluster_config_convergence(d: &Driver, client: usize, nodes: &NodeMap, deadline: Instant) {
+/// Returns whether it compared the configs (published its verdicts).
+pub fn cluster_config_convergence(d: &Driver, client: usize, nodes: &NodeMap, deadline: Instant) -> bool {
     let cands = candidates(d, nodes);
     let mut report = None;
     let mut failures = Vec::new();
@@ -1281,20 +1284,21 @@ pub fn cluster_config_convergence(d: &Driver, client: usize, nodes: &NodeMap, de
     let completed = !cut && Instant::now() <= deadline;
     check_sometimes!(completed, "cluster_config_convergence completes within its quiet budget", json!({"failures": failures}));
     if !completed {
-        return;
+        return false;
     }
     let Some(r) = report else {
         println!("driver: cluster_config_convergence: no qualified observation: {failures:?}");
-        return;
+        return false;
     };
     let lead = r.configs.get(&r.leader).cloned().unwrap_or(Value::Null);
     if !config_persisted(&lead) {
         // The leader never persisted a ClusterConfig: every node answers its
         // own local fallback, which is not a replicated state to compare.
         println!("driver: cluster_config_convergence: the leader's cluster config is not persisted ({lead}); not compared");
-        return;
+        return false;
     }
     publish_config(d, &r);
+    true
 }
 
 pub fn publish_config(d: &Driver, r: &ConfigReport) {
@@ -1314,7 +1318,7 @@ pub fn publish_config(d: &Driver, r: &ConfigReport) {
 
 fn run_cluster_config(d: &Driver, ctx: &mut QuietCtx, plan: &HookPlan) {
     let client = plan_of(d, ctx, plan);
-    cluster_config_convergence(d, client, &ctx.nodes, ctx.deadline);
+    ctx.reached = Some(cluster_config_convergence(d, client, &ctx.nodes, ctx.deadline));
 }
 
 #[cfg(test)]
@@ -1611,9 +1615,9 @@ mod tests {
         let dig = |_: &Driver, _: usize, _: &Value| -> Result<Value, String> { Ok(sections()) };
         cross_node_identity(&d, 0, &nodes1(), Instant::now(), short(), &dig);
         assert!(!hit("cross_node_identity completes within its quiet budget").unwrap().cond);
-        stats_convergence(&d, 0, &nodes1(), Some(&usage_begin()), 0, Instant::now(), short());
+        assert!(!stats_convergence(&d, 0, &nodes1(), Some(&usage_begin()), 0, Instant::now(), short()), "cut");
         assert!(!hit("stats_convergence completes within its quiet budget").unwrap().cond);
-        cluster_config_convergence(&d, 0, &nodes1(), Instant::now());
+        assert!(!cluster_config_convergence(&d, 0, &nodes1(), Instant::now()), "cut");
         assert!(!hit("cluster_config_convergence completes within its quiet budget").unwrap().cond);
         assert_eq!(always_count(), 0, "{:?}", testkit::assertions());
 
@@ -1648,7 +1652,7 @@ mod tests {
         let (d, ft, _) = testkit::driver();
         testkit::reset();
         stats_fakes(&ft);
-        stats_convergence(&d, 2, &nodes1(), Some(&usage_begin()), 0, soon(), short());
+        assert!(stats_convergence(&d, 2, &nodes1(), Some(&usage_begin()), 0, soon(), short()), "verdicts reached");
         for m in [
             "stats_convergence completes within its quiet budget",
             "stats convergence oracle connects to replicas",
@@ -1808,7 +1812,7 @@ mod tests {
     fn stats_without_quiet_begin_returns_quietly() {
         let (d, ft, _) = testkit::driver();
         testkit::reset();
-        stats_convergence(&d, 0, &nodes1(), None, 0, soon(), short());
+        assert!(!stats_convergence(&d, 0, &nodes1(), None, 0, soon(), short()), "skipped");
         stats_convergence(&d, 0, &nodes1(), Some(&json!({"providers": {}})), 0, soon(), short());
         assert!(ft.calls().is_empty());
         assert!(testkit::assertions().is_empty());
@@ -1847,7 +1851,7 @@ mod tests {
         let a = json!({"rotationThreshold": "50", "bloomVolumes": {"expectedKeys": "1000000"}});
         ft.set_default("cluster", "GetClusterState", ok(cs1(100, a.clone())));
         ft.script("bucket", "Barrier", barriers(&[10, 11, 12]));
-        cluster_config_convergence(&d, 0, &nodes1(), Instant::now() + Duration::from_secs(10));
+        assert!(cluster_config_convergence(&d, 0, &nodes1(), Instant::now() + Duration::from_secs(10)));
         assert!(hit("cluster_config_convergence completes within its quiet budget").unwrap().cond);
         assert!(hit("every node's cluster config equals the leader's at a common horizon").unwrap().cond);
         assert!(hit("cluster config convergence verified").is_some());
@@ -1856,7 +1860,7 @@ mod tests {
         testkit::reset();
         ft.set_default("cluster", "GetClusterState", ok(cs1(100, json!({"rotationThreshold": "64", "bloomVolumes": {"expectedKeys": "1000001"}}))));
         ft.script("bucket", "Barrier", barriers(&[20, 21, 22]));
-        cluster_config_convergence(&d, 0, &nodes1(), Instant::now() + Duration::from_secs(10));
+        assert!(cluster_config_convergence(&d, 0, &nodes1(), Instant::now() + Duration::from_secs(10)));
         assert!(hit("a cluster config change was observed between quiet periods").unwrap().cond);
         assert!(ft.calls_of("cluster", "GetClusterState").iter().any(|c| c["request"] == json!({"nodeId": "1"}) && c["node"] == "ledger-0:8888"));
     }
@@ -1870,7 +1874,7 @@ mod tests {
         assert!(config_persisted(&json!({"rotationThreshold": "50", "bloomVolumes": {}})));
         ft.set_default("cluster", "GetClusterState", ok(cs1(100, json!({"rotationThreshold": "50"}))));
         ft.script("bucket", "Barrier", barriers(&[10, 11, 12]));
-        cluster_config_convergence(&d, 0, &nodes1(), Instant::now() + Duration::from_secs(10));
+        assert!(!cluster_config_convergence(&d, 0, &nodes1(), Instant::now() + Duration::from_secs(10)), "not compared: the run does not count as completed");
         assert!(hit("cluster_config_convergence completes within its quiet budget").unwrap().cond);
         assert!(hit("every node's cluster config equals the leader's at a common horizon").is_none());
         assert!(hit("a cluster config change was observed between quiet periods").is_none());
