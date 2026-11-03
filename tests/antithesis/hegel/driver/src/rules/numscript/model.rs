@@ -305,6 +305,8 @@ pub struct TxRec {
     /// Every postings list the script could produce (one per template the
     /// selector could resolve to).
     pub candidates: Vec<Vec<Posting>>,
+    /// The `latest` floor taken when the transaction was sent (`NsLedger::floor`).
+    pub floor: Option<Semver>,
     pub status: Status,
     pub tx_id: Option<u64>,
     /// The postings the system reported (ack or quiet listing).
@@ -441,6 +443,10 @@ pub struct Evaluation {
     pub rejected_checked: usize,
     /// Unknown/pending records found committed in the listing.
     pub resolved_committed: usize,
+    /// Unknown/pending records found committed with postings that are none
+    /// of their candidates (re-evaluated against the library as of the
+    /// listing, so a `latest` resolved after the driver gave up is covered).
+    pub resolved_wrong: Vec<String>,
     /// Unknown/pending records not in the listing (stay unknown).
     pub unresolved: usize,
     /// Listed transactions whose reference the model never sent.
@@ -454,11 +460,21 @@ pub struct Evaluation {
 /// Resolves Unknown/Pending records against a complete listing (reference →
 /// committed?), then evaluates the survival, rejection and balance
 /// expectations. Resolution mutates the model: a listed Unknown becomes Acked
-/// with the listed postings.
+/// with the listed postings, after its postings are checked against its
+/// candidates (recomputed for `latest` from the library as it is now: the
+/// write may have been applied after the driver stopped waiting for it).
 pub fn evaluate(l: &mut NsLedger, listed: &[ListedTx]) -> Evaluation {
     let by_ref: HashMap<&str, &ListedTx> = listed.iter().map(|t| (t.reference.as_str(), t)).collect();
+    let fresh: Vec<Option<Vec<Vec<Posting>>>> = l
+        .txs
+        .iter()
+        .map(|r| {
+            let open = matches!(r.status, Status::Unknown | Status::Pending) && by_ref.contains_key(r.reference.as_str());
+            (open && matches!(r.selector, Selector::Latest(_))).then(|| l.candidates_since(&r.selector, &r.vars, r.floor))
+        })
+        .collect();
     let mut e = Evaluation::default();
-    for rec in l.txs.iter_mut() {
+    for (rec, fresh) in l.txs.iter_mut().zip(fresh) {
         let hit = by_ref.get(rec.reference.as_str()).copied();
         match rec.status {
             Status::Acked => {
@@ -476,6 +492,12 @@ pub fn evaluate(l: &mut NsLedger, listed: &[ListedTx]) -> Evaluation {
             }
             Status::Unknown | Status::Pending => match hit {
                 Some(t) => {
+                    if let Some(c) = fresh {
+                        rec.candidates = c;
+                    }
+                    if !rec.candidates.contains(&t.postings) {
+                        e.resolved_wrong.push(rec.reference.clone());
+                    }
                     rec.status = Status::Acked;
                     rec.tx_id = Some(t.id);
                     rec.committed = Some(t.postings.clone());
@@ -602,7 +624,7 @@ mod tests {
         assert_eq!(l.candidates(&Selector::Pinned("s-1".into(), Semver::new(1, 0, 0)), &v), vec![Template::Transfer.postings(&v)]);
         assert_eq!(l.candidates(&Selector::Inline, &v), vec![Template::Transfer.postings(&v)]);
         assert!(l.candidates(&Selector::Latest("nope".into()), &v).is_empty());
-        l.record_tx(TxRec { reference: "r".into(), key: "k".into(), selector: Selector::Latest("s-1".into()), vars: v.clone(), candidates: c, status: Status::Pending, tx_id: None, committed: None });
+        l.record_tx(TxRec { reference: "r".into(), key: "k".into(), selector: Selector::Latest("s-1".into()), vars: v.clone(), candidates: c, floor: None, status: Status::Pending, tx_id: None, committed: None });
         assert!(l.overdraft.contains("t-1:2") && l.overdraft.contains("t-3:4") && l.overdraft.contains(HUB) && l.overdraft.contains("world"));
     }
 
@@ -633,6 +655,7 @@ mod tests {
             selector: Selector::Inline,
             vars: vars("world", "t-0:0", 1),
             candidates: vec![postings.clone()],
+            floor: None,
             status,
             tx_id: None,
             committed: if status == Status::Acked { Some(postings) } else { None },
@@ -685,5 +708,40 @@ mod tests {
         // an acked transaction listed with other postings is lost too
         let listed3 = vec![ListedTx { id: 0, reference: "a".into(), postings: p("world", "t-0:1", 6) }, ListedTx { id: 1, reference: "b".into(), postings: p("t-0:1", "t-0:2", 2) }];
         assert_eq!(evaluate(&mut l, &listed3).acked_lost, vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn resolved_unknowns_are_checked_against_their_candidates() {
+        let p = |s: &str, d: &str, a: u64| vec![Posting::new(s, d, a, "COIN")];
+        let mut l = NsLedger::new("r-ns-x-1");
+        l.record_tx(rec("ok", Status::Unknown, p("world", "t-0:1", 5)));
+        l.record_tx(rec("bad", Status::Unknown, p("world", "t-0:2", 5)));
+        l.record_tx(rec("pend", Status::Pending, p("world", "t-0:3", 5)));
+        let listed = vec![
+            ListedTx { id: 0, reference: "ok".into(), postings: p("world", "t-0:1", 5) },
+            ListedTx { id: 1, reference: "bad".into(), postings: p("world", "t-0:2", 6) },
+            ListedTx { id: 2, reference: "pend".into(), postings: p("t-0:3", "world", 5) },
+        ];
+        let e = evaluate(&mut l, &listed);
+        assert_eq!(e.resolved_wrong, vec!["bad".to_string(), "pend".to_string()]);
+        assert_eq!(e.resolved_committed, 3);
+        // `latest` on an s-<N> whose newer version (saved after the driver
+        // gave up on the transaction) is the one applied: not a violation.
+        let v = vars("t-1:2", "t-3:4", 9);
+        let mut s = ScriptRec::default();
+        s.versions.insert(Semver::new(1, 0, 0), VersionRec { content: String::new(), template: Template::Transfer, status: Status::Acked });
+        l.library.insert("s-1".into(), s);
+        let sel = Selector::Latest("s-1".into());
+        let floor = l.floor(&sel);
+        let cands = l.candidates_since(&sel, &v, floor);
+        l.record_tx(TxRec { reference: "late".into(), key: "k".into(), selector: sel.clone(), vars: v.clone(), candidates: cands.clone(), floor, status: Status::Unknown, tx_id: None, committed: None });
+        l.record_tx(TxRec { reference: "late2".into(), key: "k".into(), selector: sel, vars: v.clone(), candidates: cands, floor, status: Status::Unknown, tx_id: None, committed: None });
+        l.library.get_mut("s-1").unwrap().versions.insert(Semver::new(2, 0, 0), VersionRec { content: String::new(), template: Template::Reversed, status: Status::Acked });
+        let listed = vec![
+            ListedTx { id: 3, reference: "late".into(), postings: Template::Reversed.postings(&v) },
+            ListedTx { id: 4, reference: "late2".into(), postings: Template::ViaHub.postings(&v) },
+        ];
+        let e = evaluate(&mut l, &listed);
+        assert_eq!(e.resolved_wrong, vec!["late2".to_string()], "ViaHub was never saved");
     }
 }

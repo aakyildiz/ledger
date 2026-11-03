@@ -16,7 +16,7 @@ use crate::draw;
 use crate::machine::{rule, Driver};
 use crate::quiet::{HookPlan, QuietCtx, QuietHook};
 use crate::setup::SetupHook;
-use crate::wire::{apply_logs, created_transaction, postings_of, str_field, u64_field, Posting};
+use crate::wire::{apply_logs, created_transaction, parse_biguint_full, postings_of, str_field, u64_field, BigUint, Posting, U256};
 use crate::write::UntrackedSend;
 use hegel::stateful::ConcurrentRule;
 use hegel::TestCase;
@@ -73,6 +73,14 @@ fn status_of(out: &Outcome) -> Status {
     } else {
         Status::Unknown
     }
+}
+
+/// The answer to a re-save of an acked version: success is judged by the
+/// immutability property; a definitive refusal must be
+/// `NUMSCRIPT_VERSION_ALREADY_EXISTS` with kind AlreadyExists
+/// (`processor_numscript_library.go:46-48`, `domain/errors.go`).
+fn resave_refusal_ok(out: &Outcome) -> bool {
+    out.is_ok() || !definitive(out) || (out.reason == "NUMSCRIPT_VERSION_ALREADY_EXISTS" && out.code == "AlreadyExists")
 }
 
 fn save_request(ledger: &str, name: &str, version: Semver, content: &str) -> Value {
@@ -286,10 +294,8 @@ pub fn ns_save(d: &Driver, tc: TestCase) {
         let out = &r.outcome;
         let details = json!({"ledger": ledger, "scriptName": name, "version": version.to_string(), "outcome": out.summary(), "attempts": r.attempts.len()});
         if resave {
-            check_always_or_unreachable!(!out.is_ok(), "a saved numscript version is immutable", details);
-            if definitive(out) && !out.is_ok() && out.reason != "NUMSCRIPT_VERSION_ALREADY_EXISTS" {
-                println!("driver: ns_save: re-save of {name}@{version} refused with {} (expected NUMSCRIPT_VERSION_ALREADY_EXISTS)", out.reason);
-            }
+            check_always_or_unreachable!(!out.is_ok(), "a saved numscript version is immutable", details.clone());
+            check_always_or_unreachable!(resave_refusal_ok(out), "a re-save of a saved numscript version is refused as already existing", details);
             return Some(());
         }
         {
@@ -399,12 +405,20 @@ pub fn ns_read(d: &Driver, tc: TestCase) {
     });
 }
 
+/// A server refusal that says the script or version does not exist: a
+/// definitive reason, or the bare `NotFound` code GetNumscript answers with.
+fn refused_as_missing(out: &Outcome) -> bool {
+    !out.is_ok() && (definitive(out) || (!out.local && !out.is_unknown() && out.code == "NotFound"))
+}
+
 /// GetNumscript on a name with an acked version matching the selector.
 fn eval_get(st: &NsState, li: usize, ledger: &str, name: &str, selector: &str, w: &ReadWindow, out: &Outcome) {
     let details = |extra: Value| json!({"ledger": ledger, "scriptName": name, "selector": selector, "ackedBefore": w.acked_before.iter().map(|v| v.to_string()).collect::<Vec<_>>(), "possibleAfter": w.possible_after.iter().map(|v| v.to_string()).collect::<Vec<_>>(), "got": extra});
     if !out.is_ok() {
-        if definitive(out) {
-            // A definitive refusal (NotFound, …) of a selector some acked version matches.
+        if refused_as_missing(out) {
+            // A definitive refusal of a selector some acked version matches. The
+            // server answers a missing script with a bare gRPC NotFound, no reason
+            // (`controller_default.go` GetNumscript, `adapter/grpc/server.go:662-664`).
             check_always_or_unreachable!(false, "a numscript read returns a saved version and its content", details(out.summary()));
         }
         return;
@@ -428,9 +442,14 @@ fn list_numscripts(d: &Driver, route: &Route, ledger: &str, page_size: u64) -> (
     let deadline = Instant::now() + READ_BUDGET;
     let mut items = Vec::new();
     let mut cursor = String::new();
-    for _ in 0..16 {
+    loop {
+        // Each page gets what is left of the rule's read budget.
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left < Duration::from_millis(200) {
+            return (items, false, None);
+        }
         let req = json!({"ledger": ledger, "options": {"pageSize": page_size, "cursor": cursor}});
-        let (_, out) = d.call(route, "bucket", "ListNumscripts", req, &CallOpts::default().max_items(1001));
+        let (_, out) = d.call(route, "bucket", "ListNumscripts", req, &CallOpts::default().timeout(left.min(crate::clients::RPC_TIMEOUT)).max_items(1001));
         if !out.is_ok() {
             return (items, false, Some(out));
         }
@@ -442,11 +461,7 @@ fn list_numscripts(d: &Driver, route: &Route, ledger: &str, page_size: u64) -> (
             return (items, true, None);
         }
         cursor = out.next_cursor.clone();
-        if Instant::now() >= deadline {
-            break;
-        }
     }
-    (items, false, None)
 }
 
 fn eval_list(st: &NsState, li: usize, ledger: &str, before: &BTreeMap<String, BTreeSet<Semver>>, after: &BTreeMap<String, BTreeSet<Semver>>, items: &[Value]) {
@@ -469,7 +484,7 @@ fn eval_list(st: &NsState, li: usize, ledger: &str, before: &BTreeMap<String, BT
 fn eval_versions(ledger: &str, name: &str, w: &ReadWindow, out: &Outcome) {
     let win = json!({"ackedBefore": w.acked_before.iter().map(|v| v.to_string()).collect::<Vec<_>>(), "possibleAfter": w.possible_after.iter().map(|v| v.to_string()).collect::<Vec<_>>()});
     if !out.is_ok() {
-        if definitive(out) {
+        if refused_as_missing(out) {
             check_always_or_unreachable!(false, "a numscript read returns a saved version and its content", json!({"ledger": ledger, "scriptName": name, "op": "ListNumscriptVersions", "outcome": out.summary(), "window": win}));
         }
         return;
@@ -479,21 +494,91 @@ fn eval_versions(ledger: &str, name: &str, w: &ReadWindow, out: &Outcome) {
     let legal = Semver::parse(&latest).is_some_and(|v| w.legal_latest(v));
     check_always_or_unreachable!(legal, "latest pointer should be the greatest saved semver", json!({"ledger": ledger, "scriptName": name, "latest": latest, "window": win}));
     let listed: Option<BTreeSet<Semver>> = resp.get("versions").and_then(Value::as_array).unwrap_or(&vec![]).iter().map(|e| Semver::parse(str_field(e, "version"))).collect();
+    // `latestVersion` and `versions` come from one read handle
+    // (`query/numscript.go` ReadAllNumscriptVersions): the pointer is the
+    // greatest listed version, whatever saves were concurrent.
+    let max_listed = listed.as_ref().and_then(|l| l.iter().next_back().copied());
+    let pointer_ok = max_listed.is_some() && Semver::parse(&latest) == max_listed;
+    check_always_or_unreachable!(
+        pointer_ok,
+        "latest pointer should be the greatest saved semver",
+        json!({"ledger": ledger, "scriptName": name, "latest": latest, "maxListed": max_listed.map(|v| v.to_string()), "versions": resp.get("versions")})
+    );
     let ok = listed.as_ref().is_some_and(|l| w.legal_listing(l));
     check_always_or_unreachable!(ok, "a numscript read returns a saved version and its content", json!({"ledger": ledger, "scriptName": name, "op": "ListNumscriptVersions", "versions": resp.get("versions"), "window": win}));
 }
 
 // ------------------------------------------------------------- ns_exec
 
-/// The created transaction of a successful single-request Apply: whether
-/// its postings are one of the candidates, the postings, and the id.
-pub(crate) fn check_exec_response(resp: Option<&Value>, candidates: &[Vec<Posting>]) -> (bool, Option<Vec<Posting>>, Option<u64>) {
+/// The checked parts of a successful single-request Apply.
+pub(crate) struct ExecCheck {
+    /// One log whose created transaction's postings are one of the candidates.
+    pub ok: bool,
+    pub postings: Option<Vec<Posting>>,
+    pub id: Option<u64>,
+    /// Problems with the created transaction's `postCommitVolumes` (empty
+    /// when there is no created transaction: `ok` already fails then).
+    pub volume_problems: Vec<String>,
+}
+
+/// The created transaction of a successful single-request Apply.
+pub(crate) fn check_exec_response(resp: Option<&Value>, candidates: &[Vec<Posting>]) -> ExecCheck {
     let logs = resp.map(apply_logs).unwrap_or_default();
     let tx = logs.first().and_then(created_transaction).cloned();
     let postings = tx.as_ref().and_then(postings_of);
     let id = tx.as_ref().map(|t| u64_field(t, "id"));
     let ok = logs.len() == 1 && postings.as_ref().is_some_and(|p| candidates.contains(p));
-    (ok, postings, id)
+    let volume_problems = match (&tx, &postings) {
+        (Some(t), Some(p)) => post_commit_volume_problems(t, p),
+        _ => Vec::new(),
+    };
+    ExecCheck { ok, postings, id, volume_problems }
+}
+
+/// The old `CheckPostCommitVolumes` (`workload/internal/checks.go:56-87`,
+/// reached from `MD/parallel_driver_numscripts` via `CheckCreatedTransaction`),
+/// strengthened: when `postCommitVolumes` is present, every posting's
+/// (account, asset) has an uncolored entry with decodable input and output
+/// (the server always sets both, `processor_volumes.go:60-80`), and each
+/// cumulative volume covers what this transaction moved: input ≥ the
+/// amounts received, output ≥ the amounts sent. An absent
+/// `postCommitVolumes` is tolerated, like the old helper.
+pub(crate) fn post_commit_volume_problems(tx: &Value, postings: &[Posting]) -> Vec<String> {
+    let Some(pcv) = tx.get("postCommitVolumes") else { return Vec::new() };
+    let by_account = pcv.get("volumesByAccount").and_then(Value::as_object);
+    let zero = U256::from(0u64);
+    let mut moved: BTreeMap<(String, String), (U256, U256)> = BTreeMap::new();
+    for p in postings {
+        let src = moved.entry((p.source.clone(), p.asset.clone())).or_insert((zero, zero));
+        src.1 = src.1.checked_add(&p.amount).unwrap_or(src.1);
+        let dst = moved.entry((p.destination.clone(), p.asset.clone())).or_insert((zero, zero));
+        dst.0 = dst.0.checked_add(&p.amount).unwrap_or(dst.0);
+    }
+    let mut out = Vec::new();
+    for ((account, asset), (got_in, got_out)) in &moved {
+        let entry = by_account
+            .and_then(|m| m.get(account))
+            .and_then(|v| v.get("volumes"))
+            .and_then(Value::as_array)
+            .and_then(|es| es.iter().find(|e| str_field(e, "asset") == asset && str_field(e, "color").is_empty()));
+        let Some(entry) = entry else {
+            out.push(format!("{account} {asset}: no post-commit volume entry"));
+            continue;
+        };
+        let vols = entry.get("volumes");
+        let field = |k: &str| vols.and_then(|v| v.get(k)).filter(|x| x.is_object()).and_then(parse_biguint_full);
+        match (field("input"), field("output")) {
+            (Some(i), Some(o)) => {
+                // Beyond 256 bits counts as large enough.
+                let below = |v: &BigUint, moved: &U256| v.to_u256().is_some_and(|v| v < *moved);
+                if below(&i, got_in) || below(&o, got_out) {
+                    out.push(format!("{account} {asset}: post-commit input {} output {} below this transaction's in {} out {}", vols.and_then(|v| v.get("input")).unwrap_or(&Value::Null), vols.and_then(|v| v.get("output")).unwrap_or(&Value::Null), got_in.to_json(), got_out.to_json()));
+                }
+            }
+            _ => out.push(format!("{account} {asset}: post-commit volume entry has a missing or invalid input/output: {entry}")),
+        }
+    }
+    out
 }
 
 fn exec_request(ledger: &str, sel: &Selector, vars: &Vars, reference: &str) -> Value {
@@ -546,7 +631,7 @@ pub fn ns_exec(d: &Driver, tc: TestCase) {
             if candidates.is_empty() {
                 return None;
             }
-            let idx = l.record_tx(TxRec { reference: reference.clone(), key: key.clone(), selector: sel.clone(), vars: vars.clone(), candidates, status: Status::Pending, tx_id: None, committed: None });
+            let idx = l.record_tx(TxRec { reference: reference.clone(), key: key.clone(), selector: sel.clone(), vars: vars.clone(), candidates, floor, status: Status::Pending, tx_id: None, committed: None });
             (l.name.clone(), floor, idx)
         };
         let mut send = UntrackedSend::new(vec![exec_request(&ledger, &sel, &vars, &reference)], Some(key));
@@ -562,12 +647,14 @@ pub fn ns_exec(d: &Driver, tc: TestCase) {
         let candidates = lock(&st).get(li).map(|l| l.candidates_since(&sel, &vars, floor)).unwrap_or_default();
         let (mut committed, mut tx_id) = (None, None);
         if out.is_ok() {
-            let (ok, postings, id) = check_exec_response(out.response.as_ref(), &candidates);
+            let c = check_exec_response(out.response.as_ref(), &candidates);
             details["expected"] = json!(candidates.iter().map(|c| c.iter().map(Posting::to_json).collect::<Vec<_>>()).collect::<Vec<_>>());
-            details["got"] = json!(postings.as_ref().map(|p| p.iter().map(Posting::to_json).collect::<Vec<_>>()));
-            check_always!(ok, "a numscript transaction commits exactly the postings its script implies", details);
-            committed = postings;
-            tx_id = id;
+            details["got"] = json!(c.postings.as_ref().map(|p| p.iter().map(Posting::to_json).collect::<Vec<_>>()));
+            check_always!(c.ok, "a numscript transaction commits exactly the postings its script implies", details.clone());
+            details["volumeProblems"] = json!(c.volume_problems);
+            check_always!(c.volume_problems.is_empty(), "a numscript transaction reports consistent post-commit volumes", details);
+            committed = c.postings;
+            tx_id = c.id;
         }
         {
             let mut g = lock(&st);
@@ -615,6 +702,9 @@ fn list_all(d: &Driver, route: &Route, method: &str, ledger: &str, deadline: Ins
                 println!("driver: numscript_state: {method} {ledger} failed: {}", out.summary());
                 return None;
             }
+            // Back off (300, 600, 900 ms) inside the deadline before retrying the page.
+            let pause = Duration::from_millis(300 * failures as u64).min(deadline.saturating_duration_since(Instant::now()));
+            std::thread::sleep(pause);
             continue;
         }
         items.extend(out.items.clone().unwrap_or_default());
@@ -652,30 +742,58 @@ fn check_ledger(d: &Driver, route: &Route, li: usize, deadline: Instant) -> Opti
     if !ready {
         return Some(());
     }
-    let txs = listed_txs(&list_all(d, route, "ListTransactions", &ledger, deadline)?)?;
-    let accounts = list_all(d, route, "ListAccounts", &ledger, deadline)?;
+    let mut txs = listed_txs(&list_all(d, route, "ListTransactions", &ledger, deadline)?)?;
+    let mut accounts = list_all(d, route, "ListAccounts", &ledger, deadline)?;
     let opts = CallOpts::default().timeout(deadline.saturating_duration_since(Instant::now()).min(Duration::from_secs(5)));
     let (_, stats) = d.call(route, "bucket", "GetLedgerStats", json!({"ledger": ledger}), &opts);
     if !stats.is_ok() || Instant::now() > deadline {
         return None;
     }
     let count = stats.response.as_ref().map(|r| u64_field(r, "numscriptExecutionCount")).unwrap_or(0);
-    let volumes = listed_volumes(&accounts);
-    let (e, overdraft) = {
-        let mut g = lock(&st);
-        let l = g.get_mut(li)?;
-        (evaluate(l, &txs), l.overdraft.len())
-    };
-    let mismatches = compare_volumes(&e.expected, &volumes);
-    let base = json!({"ledger": ledger, "listed": txs.len(), "acked": e.acked_checked, "resolved": e.resolved_committed, "unresolved": e.unresolved, "foreign": e.foreign, "overdraftable": overdraft});
+    let mut resolved_wrong = Vec::new();
+    let mut e;
+    let mut mismatches;
+    let mut overdraft;
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        (e, overdraft) = {
+            let mut g = lock(&st);
+            let l = g.get_mut(li)?;
+            (evaluate(l, &txs), l.overdraft.len())
+        };
+        // Resolution is sticky (a record resolved here is Acked next time), so
+        // keep every pass's verdicts.
+        resolved_wrong.append(&mut e.resolved_wrong);
+        mismatches = compare_volumes(&e.expected, &listed_volumes(&accounts));
+        if mismatches.is_empty() || attempt >= 3 {
+            break;
+        }
+        // The two listings are separate snapshots: a write the driver gave up
+        // on can still land between them (a client-side retry outlives the Q1
+        // barrier). Re-read accounts, then transactions (so every commit the
+        // accounts reflect is listed), and judge again; only a mismatch that
+        // persists over three reads is asserted.
+        println!("driver: numscript_state: {ledger}: {} volume mismatches on read {attempt}, re-reading", mismatches.len());
+        accounts = list_all(d, route, "ListAccounts", &ledger, deadline)?;
+        txs = listed_txs(&list_all(d, route, "ListTransactions", &ledger, deadline)?)?;
+    }
+    let base = json!({"ledger": ledger, "listed": txs.len(), "acked": e.acked_checked, "resolved": e.resolved_committed, "unresolved": e.unresolved, "foreign": e.foreign, "overdraftable": overdraft, "reads": attempt});
     check_always!(e.acked_lost.is_empty(), "an acknowledged numscript transaction survives faults", json!({"summary": base, "lost": e.acked_lost.iter().take(20).collect::<Vec<_>>()}));
     check_always!(e.rejected_listed.is_empty(), "a definitively rejected numscript transaction never takes effect", json!({"summary": base, "committed": e.rejected_listed.iter().take(20).collect::<Vec<_>>()}));
     check_always!(mismatches.is_empty(), "a numscript ledger's balances equal its committed postings", json!({"summary": base, "mismatches": mismatches.iter().take(20).collect::<Vec<_>>()}));
-    if e.unresolved == 0 {
-        check_sometimes!(count == e.committed_scripts, "numscript execution count caught up", json!({"ledger": ledger, "count": count, "committed": e.committed_scripts}));
-    }
-    if count > e.committed_scripts && e.unresolved == 0 {
-        println!("driver: numscript_state: {ledger}: execution count {count} above {} committed script transactions", e.committed_scripts);
+    // An unacknowledged transaction found committed: its listed postings must
+    // be one its script could produce (the ack path checks this in ns_exec).
+    check_always!(
+        resolved_wrong.is_empty(),
+        "a numscript transaction commits exactly the postings its script implies",
+        json!({"summary": base, "op": "quiet resolution", "wrong": resolved_wrong.iter().take(20).collect::<Vec<_>>()})
+    );
+    // The count of committed script transactions does not depend on records
+    // that stay unresolved (they are not committed as of this listing).
+    check_sometimes!(count == e.committed_scripts, "numscript execution count caught up", json!({"ledger": ledger, "count": count, "committed": e.committed_scripts, "unresolved": e.unresolved}));
+    if count > e.committed_scripts {
+        println!("driver: numscript_state: {ledger}: execution count {count} above {} committed script transactions ({} unresolved)", e.committed_scripts, e.unresolved);
     }
     Some(())
 }
@@ -815,14 +933,15 @@ mod tests {
         let v = Vars { from: "world".into(), to: "t-1:1".into(), amount: u64::MAX, asset: "COIN".into() };
         let cands = vec![Template::Transfer.postings(&v)];
         let resp = |ps: &[Posting]| json!({"logs": [{"sequence": "3", "payload": {"apply": {"log": {"data": {"createdTransaction": {"transaction": {"id": "7", "postings": ps.iter().map(Posting::to_json).collect::<Vec<_>>()}}}}}}}]});
-        let (ok, p, id) = check_exec_response(Some(&resp(&cands[0])), &cands);
-        assert!(ok);
-        assert_eq!(p, Some(cands[0].clone()));
-        assert_eq!(id, Some(7));
+        let c = check_exec_response(Some(&resp(&cands[0])), &cands);
+        assert!(c.ok);
+        assert_eq!(c.postings, Some(cands[0].clone()));
+        assert_eq!(c.id, Some(7));
+        assert!(c.volume_problems.is_empty(), "no postCommitVolumes is tolerated");
         let other = Template::Reversed.postings(&v);
-        assert!(!check_exec_response(Some(&resp(&other)), &cands).0);
-        assert!(!check_exec_response(Some(&json!({})), &cands).0, "no created transaction");
-        assert!(check_exec_response(Some(&resp(&other)), &[cands[0].clone(), other.clone()]).0, "any candidate");
+        assert!(!check_exec_response(Some(&resp(&other)), &cands).ok);
+        assert!(!check_exec_response(Some(&json!({})), &cands).ok, "no created transaction");
+        assert!(check_exec_response(Some(&resp(&other)), &[cands[0].clone(), other.clone()]).ok, "any candidate");
         let req = exec_request("L", &Selector::Pinned("s-1".into(), Semver::new(1, 2, 3)), &v, "ref");
         assert_eq!(req["apply"]["action"]["createTransaction"]["scriptReference"], json!({"name": "s-1", "version": "1.2.3", "vars": {"from": "world", "to": "t-1:1", "amount": "COIN 18446744073709551615"}}));
         assert_eq!(exec_request("L", &Selector::Latest("transfer".into()), &v, "r")["apply"]["action"]["createTransaction"]["scriptReference"]["version"], "latest");
@@ -901,7 +1020,7 @@ mod tests {
         {
             let mut g = lock(&st);
             g[1].ready = false; // the fake serves one listing for every ledger
-            let mk = |r: &str, status| TxRec { reference: r.into(), key: "k".into(), selector: Selector::Inline, vars: v.clone(), candidates: vec![postings.clone()], status, tx_id: None, committed: if status == Status::Acked { Some(postings.clone()) } else { None } };
+            let mk = |r: &str, status| TxRec { reference: r.into(), key: "k".into(), selector: Selector::Inline, vars: v.clone(), candidates: vec![postings.clone()], floor: None, status, tx_id: None, committed: if status == Status::Acked { Some(postings.clone()) } else { None } };
             g[0].record_tx(mk("a", Status::Acked));
             g[0].record_tx(mk("b", Status::Unknown));
             g[0].record_tx(mk("c", Status::Rejected));
@@ -923,6 +1042,7 @@ mod tests {
             "a numscript ledger's balances equal its committed postings",
             "numscript execution count caught up",
             "numscript_state completes within its quiet budget",
+            "a numscript transaction commits exactly the postings its script implies",
         ] {
             assert!(a.iter().any(|r| r.message == m && r.cond), "{m}: {:?}", a.iter().filter(|r| r.message == m).collect::<Vec<_>>());
         }
@@ -934,6 +1054,120 @@ mod tests {
         let a = testkit::assertions();
         assert!(a.iter().any(|r| r.message == "an acknowledged numscript transaction survives faults" && !r.cond));
         assert!(a.iter().any(|r| r.message == "a definitively rejected numscript transaction never takes effect" && !r.cond));
+    }
+
+    #[test]
+    fn quiet_hook_flags_wrong_resolved_postings_and_rereads_on_mismatch() {
+        let (d, ft, _) = testkit::driver();
+        setup(&d);
+        let st = d.s.ext::<NsState>();
+        let v = Vars { from: "world".into(), to: "t-0:1".into(), amount: 10, asset: "COIN".into() };
+        let postings = Template::Transfer.postings(&v);
+        {
+            let mut g = lock(&st);
+            g[1].ready = false;
+            g[0].record_tx(TxRec { reference: "u".into(), key: "k".into(), selector: Selector::Inline, vars: v.clone(), candidates: vec![postings.clone()], floor: None, status: Status::Unknown, tx_id: None, committed: None });
+            g[0].record_tx(TxRec { reference: "late".into(), key: "k".into(), selector: Selector::Inline, vars: v.clone(), candidates: vec![postings.clone()], floor: None, status: Status::Unknown, tx_id: None, committed: None });
+        }
+        let tx = |id: &str, r: &str, ps: &[Posting]| json!({"id": id, "reference": r, "postings": ps.iter().map(Posting::to_json).collect::<Vec<_>>()});
+        let wrong = Template::Reversed.postings(&v);
+        let list = |items: Vec<Value>| FakeReply::Outcome(Outcome::from_json(&json!({"ok": true, "complete": true, "items": items})));
+        // First listing: "u" committed with the reversed postings, "late" not yet.
+        // Accounts already reflect both (a late commit between the listings);
+        // the re-read lists "late" too, so balances agree on the second read.
+        ft.script("bucket", "ListTransactions", vec![list(vec![tx("0", "u", &wrong)]), list(vec![tx("0", "u", &wrong), tx("1", "late", &postings)])]);
+        let big = |m: &str| if m.is_empty() { json!({}) } else { json!({"magnitude": m}) };
+        // world: in 10 (u reversed) out 10 (late); t-0:1: in 10 out 10. 10 = "Cg=="
+        let vol = json!({"asset": "COIN", "volumes": {"input": big("Cg=="), "output": big("Cg=="), "balance": {}}});
+        ft.set_default("bucket", "ListAccounts", list(vec![json!({"address": "world", "volumes": [vol.clone()]}), json!({"address": "t-0:1", "volumes": [vol]})]));
+        ft.set_default("bucket", "GetLedgerStats", ok(json!({"numscriptExecutionCount": "2"})));
+        testkit::reset();
+        crate::quiet::run_quiet(&d, Some(&quiet_hooks()[0]), Some(Box::new(false)));
+        let a = testkit::assertions();
+        let has = |m: &str, c: bool| a.iter().any(|r| r.message == m && r.cond == c);
+        assert!(has("a numscript transaction commits exactly the postings its script implies", false), "the resolved record's postings are none of its candidates");
+        assert!(has("a numscript ledger's balances equal its committed postings", true), "the re-read reconciles the late commit");
+        assert!(!has("a numscript ledger's balances equal its committed postings", false));
+        assert!(has("numscript execution count caught up", true));
+        assert_eq!(ft.calls_of("bucket", "ListTransactions").len(), 2);
+    }
+
+    #[test]
+    fn count_caught_up_is_evaluated_with_unresolved_records() {
+        let (d, ft, _) = testkit::driver();
+        setup(&d);
+        let st = d.s.ext::<NsState>();
+        let v = Vars { from: "world".into(), to: "t-0:1".into(), amount: 10, asset: "COIN".into() };
+        {
+            let mut g = lock(&st);
+            g[1].ready = false;
+            g[0].record_tx(TxRec { reference: "lost".into(), key: "k".into(), selector: Selector::Inline, vars: v.clone(), candidates: vec![Template::Transfer.postings(&v)], floor: None, status: Status::Unknown, tx_id: None, committed: None });
+        }
+        let empty = FakeReply::Outcome(Outcome::from_json(&json!({"ok": true, "complete": true, "items": []})));
+        ft.set_default("bucket", "ListTransactions", empty.clone());
+        ft.set_default("bucket", "ListAccounts", empty);
+        ft.set_default("bucket", "GetLedgerStats", ok(json!({"numscriptExecutionCount": "0"})));
+        testkit::reset();
+        crate::quiet::run_quiet(&d, Some(&quiet_hooks()[0]), Some(Box::new(false)));
+        assert!(testkit::assertions().iter().any(|r| r.message == "numscript execution count caught up" && r.cond));
+    }
+
+    #[test]
+    fn post_commit_volumes_are_checked() {
+        let v = Vars { from: "t-0:1".into(), to: "t-0:2".into(), amount: 10, asset: "COIN".into() };
+        let ps = Template::ViaHub.postings(&v);
+        let b = |m: &str| if m.is_empty() { json!({}) } else { json!({"magnitude": m}) };
+        let e = |asset: &str, i: &str, o: &str| json!({"asset": asset, "volumes": {"input": b(i), "output": b(o)}});
+        // 10 = "Cg==", 9 = "CQ==", 30 = "Hg=="
+        let tx = |pcv: Value| json!({"postings": ps.iter().map(Posting::to_json).collect::<Vec<_>>(), "postCommitVolumes": pcv});
+        let good = json!({"volumesByAccount": {"t-0:1": {"volumes": [e("COIN", "", "Cg==")]}, "ns:hub": {"volumes": [e("COIN", "Hg==", "Hg==")]}, "t-0:2": {"volumes": [e("COIN", "Cg==", "")]}}});
+        assert!(post_commit_volume_problems(&tx(good.clone()), &ps).is_empty(), "{:?}", post_commit_volume_problems(&tx(good), &ps));
+        let missing = json!({"volumesByAccount": {"t-0:1": {"volumes": [e("COIN", "", "Cg==")]}, "ns:hub": {"volumes": [e("COIN", "Hg==", "Hg==")]}}});
+        assert_eq!(post_commit_volume_problems(&tx(missing), &ps).len(), 1, "t-0:2 has no entry");
+        let low = json!({"volumesByAccount": {"t-0:1": {"volumes": [e("COIN", "", "CQ==")]}, "ns:hub": {"volumes": [e("COIN", "Hg==", "Hg==")]}, "t-0:2": {"volumes": [e("COIN", "Cg==", "")]}}});
+        assert_eq!(post_commit_volume_problems(&tx(low), &ps).len(), 1, "output 9 below the 10 sent");
+        let no_out = json!({"volumesByAccount": {"t-0:1": {"volumes": [{"asset": "COIN", "volumes": {"input": {}}}]}, "ns:hub": {"volumes": [e("COIN", "Hg==", "Hg==")]}, "t-0:2": {"volumes": [e("COIN", "Cg==", "")]}}});
+        assert_eq!(post_commit_volume_problems(&tx(no_out), &ps).len(), 1, "output field missing");
+        let bad_b64 = json!({"volumesByAccount": {"t-0:1": {"volumes": [e("COIN", "", "!!")]}, "ns:hub": {"volumes": [e("COIN", "Hg==", "Hg==")]}, "t-0:2": {"volumes": [e("COIN", "Cg==", "")]}}});
+        assert_eq!(post_commit_volume_problems(&tx(bad_b64), &ps).len(), 1, "undecodable output");
+        let colored = json!({"volumesByAccount": {"t-0:1": {"volumes": [{"asset": "COIN", "color": "red", "volumes": {"input": {}, "output": b("Cg==")}}]}, "ns:hub": {"volumes": [e("COIN", "Hg==", "Hg==")]}, "t-0:2": {"volumes": [e("COIN", "Cg==", "")]}}});
+        assert_eq!(post_commit_volume_problems(&tx(colored), &ps).len(), 1, "only a colored entry");
+        assert!(post_commit_volume_problems(&json!({"postings": []}), &ps).is_empty(), "absent postCommitVolumes is tolerated");
+    }
+
+    #[test]
+    fn read_checks_cover_bare_not_found_pointer_consistency_and_resave_reasons() {
+        let (d, _, _) = testkit::driver();
+        setup(&d);
+        let st = d.s.ext::<NsState>();
+        let w = ReadWindow { acked_before: [V1].into_iter().collect(), possible_after: [V1, V2].into_iter().collect() };
+        let fails = |m: &str| testkit::assertions().iter().any(|a| a.message == m && !a.cond);
+        // GetNumscript answers a missing script with a bare NotFound.
+        testkit::reset();
+        eval_get(&st, 0, "L", TRANSFER, "1.0.0", &w, &Outcome::from_json(&json!({"ok": false, "code": "NotFound", "message": "numscript \"transfer\" not found"})));
+        assert!(fails("a numscript read returns a saved version and its content"));
+        testkit::reset();
+        eval_get(&st, 0, "L", TRANSFER, "1.0.0", &w, &Outcome::from_json(&json!({"ok": false, "code": "NotFound", "local": true})));
+        assert!(testkit::assertions().is_empty(), "a client-local error checks nothing");
+        testkit::reset();
+        eval_get(&st, 0, "L", TRANSFER, "1.0.0", &w, &Outcome::from_json(&json!({"ok": false, "code": "Unavailable"})));
+        assert!(testkit::assertions().is_empty());
+        // ListNumscriptVersions: the pointer must be the greatest listed version.
+        testkit::reset();
+        eval_versions("L", TRANSFER, &w, &Outcome::from_json(&json!({"ok": true, "response": {"latestVersion": "1.0.0", "versions": [{"version": "2.0.0"}, {"version": "1.0.0"}]}})));
+        assert!(fails("latest pointer should be the greatest saved semver"), "2.0.0 is listed above the pointer");
+        testkit::reset();
+        eval_versions("L", TRANSFER, &w, &Outcome::from_json(&json!({"ok": true, "response": {"latestVersion": "2.0.0", "versions": [{"version": "2.0.0"}, {"version": "1.0.0"}]}})));
+        assert!(testkit::assertions().iter().all(|a| a.cond), "{:?}", testkit::assertions());
+        testkit::reset();
+        eval_versions("L", TRANSFER, &w, &Outcome::from_json(&json!({"ok": true, "response": {"latestVersion": "", "versions": []}})));
+        assert!(fails("latest pointer should be the greatest saved semver"));
+        // Re-save refusals.
+        let refusal = |r: &str, c: &str| Outcome::from_json(&json!({"ok": false, "code": c, "reason": r}));
+        assert!(resave_refusal_ok(&refusal("NUMSCRIPT_VERSION_ALREADY_EXISTS", "AlreadyExists")));
+        assert!(!resave_refusal_ok(&refusal("NUMSCRIPT_PARSE_ERROR", "InvalidArgument")));
+        assert!(!resave_refusal_ok(&refusal("NUMSCRIPT_VERSION_ALREADY_EXISTS", "InvalidArgument")));
+        assert!(resave_refusal_ok(&Outcome::unknown("timeout")));
     }
 
     #[test]
