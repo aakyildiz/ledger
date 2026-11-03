@@ -1,10 +1,26 @@
-# Local coverage runs: `go build -cover` ledger nodes writing to a shared volume.
-# Use with docker-compose.local.yaml.
+# Local coverage runs: `go build -cover` ledger nodes, clients, restore targets
+# (the ledger-server child and ledgerctl) and the oracle (information only),
+# each writing to its own directory of a shared volume. Use with
+# docker-compose.local.yaml:
+#   COMPOSE_FILE=docker-compose.yaml:docker-compose.local.yaml:docker-compose.coverage.yaml
+# Go writes counters when the process exits normally: stop the stack with
+# `docker compose stop` (SIGTERM) before reading the volume; a killed
+# process loses its counters since its last start.
 x-cov: &cov
   build:
     context: ../../..
     dockerfile: tests/antithesis/hegel/ledger/Dockerfile.coverage
   image: ledger-hegel-coverage:latest
+x-cov-client: &cov-client
+  build:
+    context: ../../..
+    dockerfile: tests/antithesis/hegel/client/Dockerfile.coverage
+  image: ledger-hegel-client-coverage:latest
+x-cov-restore: &cov-restore
+  build:
+    context: ../../..
+    dockerfile: tests/antithesis/hegel/restore/Dockerfile.coverage
+  image: ledger-hegel-restore-coverage:latest
 services:
   ledger-0:
     <<: *cov
@@ -17,6 +33,34 @@ services:
   ledger-2:
     <<: *cov
     environment: { GOCOVERDIR: /coverage/ledger-2 }
+    volumes: [coverage:/coverage]
+  client1:
+    <<: *cov-client
+    environment: { GOCOVERDIR: /coverage/client1 }
+    volumes: [coverage:/coverage]
+  client2:
+    <<: *cov-client
+    environment: { GOCOVERDIR: /coverage/client2 }
+    volumes: [coverage:/coverage]
+  client3:
+    <<: *cov-client
+    environment: { GOCOVERDIR: /coverage/client3 }
+    volumes: [coverage:/coverage]
+  restore-0:
+    <<: *cov-restore
+    environment: { GOCOVERDIR: /coverage/restore-0 }
+    volumes: [coverage:/coverage]
+  restore-1:
+    <<: *cov-restore
+    environment: { GOCOVERDIR: /coverage/restore-1 }
+    volumes: [coverage:/coverage]
+  oracle:
+    build:
+      context: ../../..
+      dockerfile: tests/antithesis/hegel/oracle/Dockerfile.coverage
+    image: ledger-hegel-oracle-coverage:latest
+    entrypoint: ["/bin/sh", "-c", "mkdir -p \"$$GOCOVERDIR\" && exec /usr/local/bin/oracle"]
+    environment: { GOCOVERDIR: /coverage/oracle }
     volumes: [coverage:/coverage]
 volumes:
   coverage:

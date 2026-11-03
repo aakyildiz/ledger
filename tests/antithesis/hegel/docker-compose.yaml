@@ -37,9 +37,16 @@ x-ledger: &ledger
     # clock jitter would otherwise break replay determinism.
     IDEMPOTENCY_TTL: 0s
     QUERY_CHECKPOINT_LIMIT: *qcl
-    # CACHE_ROTATION_THRESHOLD and BLOOM_VOLUMES_EXPECTED_KEYS differ per node
-    # (services below): a leadership change then bumps the cache epoch and
-    # rebuilds the bloom filter.
+    # BLOOM_VOLUMES_EXPECTED_KEYS differs per node (services below): a
+    # leadership change then rebuilds the bloom filter. CACHE_ROTATION_THRESHOLD
+    # is the SAME on every node for now (DESIGN §8 wants 50/64/80): with
+    # different thresholds, the two nodes that join the bootstrap node never
+    # apply ledger-scoped entries (GetLog sequence 3 is createLedger on node 1
+    # and missing on nodes 2 and 3 right after setup; every tracked read on a
+    # follower answers "ledger not found"). Node-local configuration must not
+    # change how a committed entry is applied (CLAUDE.md invariant 2): a server
+    # finding reported by task 99. Restore 50/64/80 once it is fixed.
+    CACHE_ROTATION_THRESHOLD: "50"
     BLOOM_METADATA_EXPECTED_KEYS: "1000000"
     BLOOM_REFERENCES_EXPECTED_KEYS: "1000000"
     SENTINEL_MODE: "true"
@@ -73,19 +80,19 @@ services:
     <<: *ledger
     container_name: ledger-0
     hostname: ledger-0
-    environment: { <<: *ledger-env, NODE_ID: "1", CACHE_ROTATION_THRESHOLD: "50", BLOOM_VOLUMES_EXPECTED_KEYS: "1000000" }
+    environment: { <<: *ledger-env, NODE_ID: "1", BLOOM_VOLUMES_EXPECTED_KEYS: "1000000" }
     volumes: [ledger-0-wal:/data/raft, ledger-0-data:/data/app]
   ledger-1:
     <<: *ledger
     container_name: ledger-1
     hostname: ledger-1
-    environment: { <<: *ledger-env, NODE_ID: "2", CACHE_ROTATION_THRESHOLD: "64", BLOOM_VOLUMES_EXPECTED_KEYS: "1000001" }
+    environment: { <<: *ledger-env, NODE_ID: "2", BLOOM_VOLUMES_EXPECTED_KEYS: "1000001" }
     volumes: [ledger-1-wal:/data/raft, ledger-1-data:/data/app]
   ledger-2:
     <<: *ledger
     container_name: ledger-2
     hostname: ledger-2
-    environment: { <<: *ledger-env, NODE_ID: "3", CACHE_ROTATION_THRESHOLD: "80", BLOOM_VOLUMES_EXPECTED_KEYS: "1000002" }
+    environment: { <<: *ledger-env, NODE_ID: "3", BLOOM_VOLUMES_EXPECTED_KEYS: "1000002" }
     volumes: [ledger-2-wal:/data/raft, ledger-2-data:/data/app]
 
   minio:

@@ -372,6 +372,13 @@ func TestAggregateVolumes(t *testing.T) {
 		requireFinding(t, validate(t, s, pc.KindAggregateVolumes, req(l1, f, match.AggOptions{}), okOut(t, render(f, match.AggOptions{}))), pc.EvAggOutsideModel)
 		requireFinding(t, validate(t, s, pc.KindAggregateVolumes, req(l1, f, match.AggOptions{}), oc.Outcome{Code: "Internal"}), pc.EvAggUnexpectedError)
 	})
+	t.Run("filter the compiler must refuse: FILTER_COMPILATION_ERROR is explained (99)", func(t *testing.T) {
+		compile := oc.Outcome{Code: "InvalidArgument", Reason: "FILTER_COMPILATION_ERROR"}
+		overflow := match.FilterHasAsset("USD", 326)
+		requireClean(t, validate(t, s, pc.KindAggregateVolumes, req(l1, overflow, match.AggOptions{}), compile))
+		// The same refusal on a valid index-free filter is still a finding.
+		requireFinding(t, validate(t, s, pc.KindAggregateVolumes, req(l1, free, match.AggOptions{}), compile), pc.EvAggregateVolumesUnexpected)
+	})
 	t.Run("index-free filter refused", func(t *testing.T) {
 		refusal := oc.Outcome{Code: "FailedPrecondition", Reason: "INDEX_NOT_FOUND"}
 		requireFinding(t, validate(t, s, pc.KindAggregateVolumes, req(l1, free, match.AggOptions{}), refusal), pc.EvAggregateVolumesUnexpected)

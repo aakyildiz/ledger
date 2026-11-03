@@ -1,0 +1,44 @@
+# Local coverage build of the restore targets: the ledger-server child and
+# ledgerctl built with go -cover (the agent passes GOCOVERDIR to the child and
+# to ledgerctl); the agent itself is harness. Not for Antithesis. Build
+# context: repository root.
+FROM golang:1.27.3-trixie AS server
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY main.go .
+COPY internal internal
+COPY cmd cmd
+COPY pkg pkg
+RUN go build -cover -covermode=atomic -coverpkg=github.com/formancehq/ledger/v3/... -tags "s3,nats" -o /ledger-server . \
+ && go build -cover -covermode=atomic -coverpkg=github.com/formancehq/ledger/v3/... -tags s3 -o /ledgerctl ./cmd/ledgerctl
+
+FROM golang:1.27.3-trixie AS agent
+COPY go.mod go.sum /
+COPY internal /internal
+COPY pkg /pkg
+COPY cmd/server /cmd/server
+COPY tests/oracle /tests/oracle
+COPY tests/antithesis/workload/go.mod tests/antithesis/workload/go.sum /src/
+COPY tests/antithesis/workload/bin/restore-agent /src/bin/restore-agent
+WORKDIR /src
+RUN go build -tags s3 -o /restore-agent ./bin/restore-agent
+
+FROM rust:1-trixie AS log-forward
+RUN rustup target add x86_64-unknown-linux-musl
+COPY tests/antithesis/hegel/log-forward/Cargo.toml /src/Cargo.toml
+COPY tests/antithesis/hegel/log-forward/src /src/src
+RUN cd /src && cargo build --release --target x86_64-unknown-linux-musl
+
+FROM debian:trixie
+RUN apt-get update && apt-get install -y ca-certificates tzdata && rm -rf /var/lib/apt/lists/*
+ENV TZ=UTC
+WORKDIR /app
+COPY --from=server /ledger-server /app/ledger-server
+COPY --from=server /ledgerctl /app/ledgerctl
+COPY --from=agent /restore-agent /app/restore-agent
+COPY --from=log-forward /src/target/x86_64-unknown-linux-musl/release/log-forward /usr/local/bin/
+COPY tests/antithesis/hegel/forward-logs /usr/local/bin/
+RUN chmod 755 /usr/local/bin/forward-logs
+EXPOSE 8090
+ENTRYPOINT ["/bin/sh", "-c", "mkdir -p \"$GOCOVERDIR\" && exec forward-logs /app/restore-agent"]

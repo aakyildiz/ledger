@@ -14,10 +14,14 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
+	"syscall"
 	"time"
 )
 
@@ -40,5 +44,18 @@ func main() {
 	catalogCoverage()
 	log.Printf("oracle: boot %s listening on %s", s.boot, addr)
 	srv := &http.Server{Addr: addr, Handler: s, ReadHeaderTimeout: 30 * time.Second}
-	log.Fatal(srv.ListenAndServe())
+	// SIGTERM ends the process normally, so a `go build -cover` binary writes
+	// its counters (docker-compose.coverage.yaml).
+	go func() {
+		sig := make(chan os.Signal, 1)
+		signal.Notify(sig, syscall.SIGTERM, syscall.SIGINT)
+		<-sig
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx) // best effort: the process is stopping
+	}()
+	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		log.Fatal(err)
+	}
+	log.Printf("oracle: stopped")
 }

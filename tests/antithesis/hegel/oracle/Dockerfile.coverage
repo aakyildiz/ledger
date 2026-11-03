@@ -1,0 +1,25 @@
+# Local coverage build of the oracle service (information only: the oracle is
+# instrumented for its assertions, not for coverage); not for Antithesis.
+# Build context: repository root. Like oracle/Dockerfile, never copies
+# workload/internal.
+FROM golang:1.27.3-trixie AS compiler
+COPY go.mod go.sum /
+COPY internal /internal
+COPY pkg /pkg
+COPY cmd/server /cmd/server
+COPY tests/oracle /tests/oracle
+COPY tests/antithesis/workload/go.mod tests/antithesis/workload/go.sum /src/
+COPY tests/antithesis/workload/oraclecheck /src/oraclecheck
+COPY tests/antithesis/workload/bin/oracle /src/bin/oracle
+WORKDIR /src
+RUN find /src -name '*_test.go' -delete && rm -rf /src/oraclecheck/testdata \
+ && go build -cover -covermode=atomic \
+      -coverpkg=github.com/formancehq/ledger/v3/tests/antithesis/workload/...,github.com/formancehq/ledger/v3/tests/oracle/... \
+      -o /oracle ./bin/oracle
+
+FROM debian:trixie
+RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
+COPY --from=compiler /oracle /usr/local/bin/oracle
+ENV ORACLE_ADDR=:8090
+EXPOSE 8090
+ENTRYPOINT ["/bin/sh", "-c", "mkdir -p \"$GOCOVERDIR\" && exec /usr/local/bin/oracle"]

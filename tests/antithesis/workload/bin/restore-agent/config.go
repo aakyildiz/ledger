@@ -65,7 +65,8 @@ var childEnvNames = map[string]bool{
 	"GORACE": true, "GOMEMLIMIT": true, "GOMAXPROCS": true, "GOCOVERDIR": true, "GOTRACEBACK": true,
 }
 
-var childEnvPrefixes = []string{"PEBBLE_", "READ_INDEX_", "BLOOM_"}
+// HEALTH_ carries the disk-full gate thresholds (raised on local runs only).
+var childEnvPrefixes = []string{"PEBBLE_", "READ_INDEX_", "BLOOM_", "HEALTH_"}
 
 func childEnv(environ []string) []string {
 	var out []string

@@ -1,6 +1,19 @@
 # Local runs only: SDK output to files, frequent quiet periods and exclusive
 # windows, and the oracle's full journal and batch dumps for offline replay.
+# The ledger's disk-full write gate (--health-{wal,data}-threshold, default
+# 0.8) measures the host filesystem the volumes live on; a shared development
+# host is often above 80 %. Antithesis gives every volume its own tmpfs, so
+# only local runs raise it.
+x-local-ledger-env: &local-ledger-env
+  HEALTH_WAL_THRESHOLD: "0.98"
+  HEALTH_DATA_THRESHOLD: "0.98"
+
 services:
+  ledger-0: { environment: *local-ledger-env }
+  ledger-1: { environment: *local-ledger-env }
+  ledger-2: { environment: *local-ledger-env }
+  restore-0: { environment: *local-ledger-env }
+  restore-1: { environment: *local-ledger-env }
   driver:
     environment:
       ANTITHESIS_SDK_LOCAL_OUTPUT: /tmp/sdk.jsonl

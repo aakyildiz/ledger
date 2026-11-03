@@ -3,6 +3,8 @@ package pointcheck
 import (
 	"strings"
 
+	"google.golang.org/grpc/codes"
+
 	"github.com/formancehq/ledger/v3/internal/proto/commonpb"
 	"github.com/formancehq/ledger/v3/internal/proto/servicepb"
 	oc "github.com/formancehq/ledger/v3/tests/antithesis/workload/oraclecheck"
@@ -50,6 +52,16 @@ func ValidateAggregateVolumes(c *oc.ReadCtx) []oc.Event {
 	needed := map[string]struct{}{}
 	match.NeededIndexCanonicals(filter, accounts, needed)
 	rerr := rpcError(c.Outcome)
+
+	// A filter the compiler must refuse whatever the state (a has-asset
+	// precision past the one-byte index cell, a leaf invalid on accounts):
+	// FILTER_COMPILATION_ERROR is its answer (M/aggregates.go ran
+	// classifyRejectedFilter first). Task 06's generators, which this read
+	// draws since task 99, produce these shapes.
+	if rerr.Code == codes.InvalidArgument && rerr.HasReason("FILTER_COMPILATION_ERROR") &&
+		(match.HasAssetPrecisionOverflow(filter) || match.ClassifyRejectedFilter(filter, accounts).Rejected) {
+		return nil
+	}
 
 	if !c.Outcome.OK && len(needed) == 0 {
 		d := outcomeDetails(c.Outcome)
