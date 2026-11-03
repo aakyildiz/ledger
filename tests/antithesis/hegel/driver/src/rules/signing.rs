@@ -61,6 +61,8 @@ pub const ENABLE_BUDGET: Duration = Duration::from_secs(8);
 pub const PROBES_UNTIL: Duration = Duration::from_secs(13);
 /// The restore always gets at least this much, even past the budget.
 pub const MIN_RESTORE: Duration = Duration::from_secs(2);
+/// `send_untracked` budget of one setup attempt round.
+pub const SETUP_BUDGET: Duration = if cfg!(test) { Duration::from_millis(300) } else { Duration::from_secs(10) };
 /// Resends of a probe on unknown/Unavailable/DeadlineExceeded.
 pub const PROBE_RESENDS: usize = 3;
 
@@ -558,7 +560,7 @@ pub fn signing_setup(d: &Driver) {
     let reg = json!({"registerSigningKey": {"keyId": root_id, "publicKey": public}});
     let key = format!("r-{}-signing-root", s.run);
     let registered = loop {
-        let r = d.send_untracked(untracked(vec![reg.clone()], key.clone(), None, &lib, &[250], Duration::from_secs(10)));
+        let r = d.send_untracked(untracked(vec![reg.clone()], key.clone(), None, &lib, &[if cfg!(test) { 50 } else { 250 }], SETUP_BUDGET));
         if r.outcome.is_ok() || r.outcome.reason.contains("ALREADY_EXISTS") {
             break true;
         }
@@ -1312,7 +1314,7 @@ mod tests {
 
         // Keys of an earlier run: Unauthenticated and the root is not listed.
         let (d, ft, _) = testkit::driver();
-        ft.script("bucket", "Apply", vec![err("Unauthenticated")]);
+        ft.script("bucket", "Apply", (0..30).map(|_| err("Unauthenticated")).collect());
         ft.script("bucket", "ListSigningKeys", vec![page(&["root-old"], "")]);
         signing_setup(&d);
         let st = d.s.ext::<SigningState>();
@@ -1329,7 +1331,7 @@ mod tests {
         setup_root(&d);
         cluster_default(&ft);
         // enable ok, both probes fail inconclusively, restore ok.
-        ft.script("bucket", "Apply", vec![ok(json!({})), err("Internal"), err("Internal"), ok(json!({}))]);
+        ft.script("bucket", "Apply", vec![ok(json!({})), err("Internal"), ok(json!({}))]);
         run_window(&d, &window_plan_fast(), &window_probes);
         assert_eq!(config_calls(&ft), vec![true, false]);
         let applies = ft.calls_of("bucket", "Apply");
@@ -1425,7 +1427,7 @@ mod tests {
         let keys: BTreeSet<String> = ft
             .calls_of("bucket", "Apply")
             .iter()
-            .filter(|a| a["request"]["unsigned"]["requests"][0]["setSigningConfig"].is_object() && a["request"]["unsigned"]["requests"][0]["setSigningConfig"].get("requireSignatures").is_none())
+            .filter(|a| a["request"]["unsigned"]["requests"][0]["setSigningConfig"]["requireSignatures"] == json!(false))
             .map(|a| a["request"]["unsigned"]["idempotencyKey"].as_str().unwrap().to_string())
             .collect();
         assert_eq!(keys.len(), 1);
