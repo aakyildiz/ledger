@@ -178,3 +178,8 @@ disk was above the server's 80 % write gate): 26 576 list reads validated (12 52
 ListTransactions, 8 374 ListLogs, 5 680 ListAccounts), zero findings; every must-hit of the
 "no faults" rows above was hit; the only never-hit must-hits were the `oracle: coverage …`
 probes (task 07).
+
+Rerun after the review fixes (same command and environment): 21 727 `/read/end`, zero
+findings, 73 assertions seen; the clean-EOF literals (now gated on reaching an empty
+`nextCursor`) and `a listing spans several pages` were all hit; the only never-hit must-hits
+were again the 12 `oracle: coverage …` probes (task 07).
