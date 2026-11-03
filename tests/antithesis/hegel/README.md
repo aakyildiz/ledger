@@ -172,6 +172,50 @@ The audited packages' statement coverage was 66.8 % (`node`), 70.4 %
 (`admission`). The remaining gaps are fault-only, out of scope, or disabled by
 a knob on purpose.
 
+## Known server bugs found by this workload
+
+Each was reproduced or traced to its root cause outside Antithesis. None is fixed
+in this branch; the workload reports them rather than masking them, except where noted.
+
+1. **Per-node `CACHE_ROTATION_THRESHOLD` makes nodes diverge** (CLAUDE.md
+   invariants 1 and 2). `applyClusterConfig`
+   (`internal/infra/state/machine_technical_updates.go:141-151`) compares the
+   committed threshold with the node's in-memory cache threshold, not the
+   replicated one. A joining node that replays the cluster-config entry resets
+   its cache and bumps its epoch, and `checkStaleProposal` (`machine.go:1229`)
+   then rejects every leader-built order on that node. Reproduced 3/3 with
+   thresholds 50/64/80, 0/2 with equal thresholds. The compose file uses one
+   threshold on every node until this is fixed, so the cache-epoch exploration
+   assertions stay unreached.
+2. **`Backup` answers gRPC `Unknown` when its upload is cancelled** (for
+   example by leadership loss). The transfer manager is built without
+   `FailTimeout` (`internal/infra/backup/s3.go:30`), so the abort runs on the
+   cancelled context and the returned error drops the cancellation; the abort
+   never reaches S3, leaving an orphaned multipart upload.
+3. **False Unreachable on a Numscript `latest` race.** A `scriptReference` to
+   `latest` that races a save of a newer version is correctly rejected as a stale
+   proposal, but the probe at `processor_transaction.go:67` goes through
+   `CheckCoverage`, which fires "admission declared every FSM attribute access"
+   and logs an error (`internal/infra/state/scope.go:378`). Nothing is read
+   undeclared. Fix direction: record the version admission resolved in the
+   order and compare it at apply time (a silent coverage probe would hide a real
+   under-declaration).
+
+## Antithesis results
+
+| Run | Compute hours | Result |
+|---|---|---|
+| `3d8b6ff117f4ff08f7b9b40db1b5e083-67-0` | 12 | Server bugs 2 and 3; workload fixes: quiet-period scheduling, client shutdown, minio wrapper, index coverage |
+| `076d255c6630d44a96dafcde7bb68f03-67-0` | 48 | 744 properties pass; server bug 3; workload fixes: quiet flavours starved by `exact`, rare coverage targets |
+| `adbd1523c1338c3a6a86f11a0c137535-67-0` | 48 | 758 properties pass, no Always/Unreachable failure; 115 exact quiet checks and audit replays verified; restore round trips verified |
+
+Exploration targets still unreached in the last run: the two cache-epoch
+assertions (bug 1 workaround), "snap file recovered from WAL snapshot records"
+(needs a lost `.snap` file), and the rare "a cluster config change was observed
+between quiet periods", "a restore cycle survives a restart of restore-0", "a
+write attempt is refused as a stale proposal" and "a write attempt is refused
+while an index builds".
+
 ## What was not ported
 
 - The k8s operator drivers (`singleton_driver_scaling`, `_scaling_chaos`,
