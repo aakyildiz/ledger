@@ -115,6 +115,9 @@ pub struct Plan {
     pub joiner: bool,
     pub chained: bool,
     pub client: usize,
+    /// Seconds the Serving cycle waits after the quiet period's fault pause
+    /// runs out before it verifies (0: no wait). See `holding`.
+    pub hold_secs: u64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -328,6 +331,24 @@ fn submit(d: &Driver, st: &Arc<RestoreState>, name: &'static str, f: impl FnOnce
 }
 
 // ---------------------------------------------------------------- budget
+
+/// Whether a Serving cycle still waits before its verify job. The cut runs
+/// inside a quiet period whose fault pause (`Timing::q0_pause_secs`, 100 s)
+/// outlasts a whole cycle (run 076d255c…-67-0: every one of the 25 cycles
+/// ended Verified 25–75 s after its cut, none saw a fault on restore-0), so
+/// `a restore cycle survives a restart of restore-0` could never be true.
+/// A plan with `hold_secs` keeps the restored server serving until
+/// `hold_secs` after the pause ends (or after the cut, without a pause), so
+/// faults, restore-0's container kills and stops included, land inside the
+/// cycle. Never past half the cycle budget, so verification keeps its time.
+pub fn holding(hold_secs: u64, started: Option<Instant>, pause_until: Option<Instant>, budget: Duration, now: Instant) -> bool {
+    let Some(started) = started.filter(|_| hold_secs > 0) else { return false };
+    if now.saturating_duration_since(started) >= budget / 2 {
+        return false;
+    }
+    let from = pause_until.map_or(started, |p| p.max(started));
+    now < from + Duration::from_secs(hold_secs)
+}
 
 /// Whether the cycle ran out of its wall budget: from the base until the cut
 /// (`cut_wait`: quiet periods come every 1.5–4 minutes), then `cycle_budget`
@@ -653,6 +674,7 @@ pub fn restore_plan(d: &Driver, tc: TestCase) {
             joiner: joiner_on && draw::chance(tc, 0.5),
             chained: draw::chance(tc, 0.25),
             client: draw::pick(tc, d.s.clients.len().max(1)),
+            hold_secs: if draw::chance(tc, 0.35) { draw::int_in(tc, 10, 60) } else { 0 },
         };
         let mut c = st.cycle();
         if c.phase == Phase::Cut && c.plan.is_none() {
@@ -671,13 +693,15 @@ pub fn restore_step(d: &Driver, tc: TestCase) {
         let st = state(&d.s);
         let client = draw::pick(tc, d.s.clients.len().max(1));
         let backoffs = draw::backoffs(tc, 4);
-        let (phase, gen, has_plan, expired_now, need_delta) = {
+        let (phase, gen, has_plan, expired_now, need_delta, held) = {
             let c = st.cycle();
             if c.job_running || c.phase == Phase::Idle {
                 return None;
             }
             let t = st.env().timing();
-            (c.phase, c.gen, c.plan.is_some(), expired(&c, &t), c.seed.as_ref().is_some_and(|s| s.t3.is_none()))
+            let pause_until = *d.s.fault_pause_until.lock().unwrap_or_else(|e| e.into_inner());
+            let held = holding(c.plan.as_ref().map_or(0, |p| p.hold_secs), c.started, pause_until, t.cycle_budget, Instant::now());
+            (c.phase, c.gen, c.plan.is_some(), expired(&c, &t), c.seed.as_ref().is_some_and(|s| s.t3.is_none()), held)
         };
         if !st.reachable() {
             return None;
@@ -706,7 +730,7 @@ pub fn restore_step(d: &Driver, tc: TestCase) {
             }
             Phase::Cut if has_plan => submit(d, &st, "restore_stage", move |d| stage::stage_job(d, gen)),
             Phase::Staged => submit(d, &st, "restore_serve", move |d| stage::serve_job(d, gen)),
-            Phase::Serving => submit(d, &st, "restore_verify", move |d| stage::verify_job(d, gen)),
+            Phase::Serving if !held => submit(d, &st, "restore_verify", move |d| stage::verify_job(d, gen)),
             _ => {}
         }
         Some(())
