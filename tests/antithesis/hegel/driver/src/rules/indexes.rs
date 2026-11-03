@@ -279,16 +279,24 @@ pub fn metadata_index_bootstrap(d: &Driver, tc: TestCase) {
         if unresolved(lv) {
             return None;
         }
-        let steps = meta_bootstrap_steps(&ledger, lv);
+        // Every step's plan is drawn before the first write (as in
+        // `typed_metadata_cycle`), so the draws do not depend on outcomes.
+        let plans: Vec<(bool, WritePlan)> = meta_bootstrap_steps(&ledger, lv)
+            .into_iter()
+            .enumerate()
+            .map(|(i, req)| {
+                let create = req.get("createIndex").is_some();
+                let mut plan = WritePlan::drawn(FAMILY, vec![req], d, tc);
+                plan.hint = json!({"gen": "metadata_index_bootstrap", "step": i});
+                (create, plan)
+            })
+            .collect();
         let deadline = Instant::now() + CHAIN_BUDGET;
-        for (i, req) in steps.into_iter().enumerate() {
+        for (create, plan) in plans {
             let now = Instant::now();
             if now >= deadline {
                 return None;
             }
-            let create = req.get("createIndex").is_some();
-            let mut plan = WritePlan::drawn(FAMILY, vec![req], d, tc);
-            plan.hint = json!({"gen": "metadata_index_bootstrap", "step": i});
             let unit = d.s.slots.try_acquire_up_to(1)?.take_one()?;
             let ticket = d.begin_write(plan, unit).ok()?;
             let res = ticket.run((deadline - now).min(IN_RULE_BUDGET));
