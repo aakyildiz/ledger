@@ -9,12 +9,12 @@ import (
 	"google.golang.org/protobuf/encoding/protojson"
 
 	"github.com/formancehq/ledger/v3/internal/proto/commonpb"
+	"github.com/formancehq/ledger/v3/tests/antithesis/workload/bin/oracle/servicetest"
 	"github.com/formancehq/ledger/v3/tests/antithesis/workload/internal/sdktest"
 	oc "github.com/formancehq/ledger/v3/tests/antithesis/workload/oraclecheck"
 	"github.com/formancehq/ledger/v3/tests/antithesis/workload/oraclecheck/match/matchtest"
 	qc "github.com/formancehq/ledger/v3/tests/antithesis/workload/oraclecheck/querycheck"
 	"github.com/formancehq/ledger/v3/tests/antithesis/workload/oraclecheck/testutil"
-	"github.com/formancehq/ledger/v3/tests/antithesis/workload/bin/oracle/servicetest"
 )
 
 func queryItems(t *testing.T, txs []*commonpb.Transaction) []json.RawMessage {
