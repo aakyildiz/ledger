@@ -118,6 +118,7 @@ impl Layout {
 
 /// The script's tokens with comments and whitespace removed (Numscript's
 /// lexer skips `WS`, `/* */` and `//…NEWLINE`, `numscript@v0.1.2/Lexer.g4:2-5`).
+#[cfg(test)]
 pub fn normalize(script: &str) -> Vec<String> {
     let mut s = String::with_capacity(script.len());
     let b = script.as_bytes();
