@@ -28,6 +28,7 @@ pub mod smoke;
 // ==== 12-cluster-ops-signals mods ====
 // ==== end 12-cluster-ops-signals mods ====
 // ==== 13-numscript mods ====
+pub mod numscript;
 // ==== end 13-numscript mods ====
 // ==== 14-rust-probes mods ====
 // ==== end 14-rust-probes mods ====
@@ -66,6 +67,7 @@ pub fn rules() -> Vec<ConcurrentRule<Driver>> {
     // ==== 12-cluster-ops-signals rules ====
     // ==== end 12-cluster-ops-signals rules ====
     // ==== 13-numscript rules ====
+    v.extend(numscript::rules());
     // ==== end 13-numscript rules ====
     // ==== 14-rust-probes rules ====
     // ==== end 14-rust-probes rules ====
@@ -147,6 +149,7 @@ pub fn quiet_hooks() -> Vec<crate::quiet::QuietHook> {
     // ==== 12-cluster-ops-signals quiet_hooks ====
     // ==== end 12-cluster-ops-signals quiet_hooks ====
     // ==== 13-numscript quiet_hooks ====
+    v.extend(numscript::quiet_hooks());
     // ==== end 13-numscript quiet_hooks ====
     // ==== 14-rust-probes quiet_hooks ====
     // ==== end 14-rust-probes quiet_hooks ====
@@ -227,6 +230,7 @@ pub fn setup_hooks() -> Vec<crate::setup::SetupHook> {
     // ==== 12-cluster-ops-signals setup_hooks ====
     // ==== end 12-cluster-ops-signals setup_hooks ====
     // ==== 13-numscript setup_hooks ====
+    v.extend(numscript::setup_hooks());
     // ==== end 13-numscript setup_hooks ====
     // ==== 14-rust-probes setup_hooks ====
     // ==== end 14-rust-probes setup_hooks ====
