@@ -1,0 +1,12 @@
+{
+  "name": "01-delete-unknown-ledger",
+  "setup": [],
+  "requests": [
+    {
+      "deleteLedger": {
+        "name": "o-rej-l1"
+      }
+    }
+  ],
+  "expectReason": "LEDGER_NOT_FOUND"
+}

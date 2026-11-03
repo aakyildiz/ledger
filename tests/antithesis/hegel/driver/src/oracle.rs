@@ -671,13 +671,13 @@ mod fixtures {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../protocol-fixtures/core")
     }
 
-    fn rt<T: Serialize + DeserializeOwned>(file: &str, what: &str, v: &Value) {
+    pub(super) fn rt<T: Serialize + DeserializeOwned>(file: &str, what: &str, v: &Value) {
         let t: T = serde_json::from_value(v.clone()).unwrap_or_else(|e| panic!("{file} {what}: {e}"));
         let back = serde_json::to_value(&t).unwrap();
         assert_eq!(&back, v, "{file} {what} does not round-trip");
     }
 
-    fn check_request(file: &str, endpoint: &str, req: &Value) {
+    pub(super) fn check_request(file: &str, endpoint: &str, req: &Value) {
         let path = endpoint.split_once(' ').map(|(_, p)| p).unwrap_or("");
         let path = path.split('?').next().unwrap();
         match path {
@@ -696,7 +696,7 @@ mod fixtures {
         }
     }
 
-    fn check_response(file: &str, endpoint: &str, status: u64, resp: &Value) {
+    pub(super) fn check_response(file: &str, endpoint: &str, status: u64, resp: &Value) {
         if status != 200 {
             rt::<ErrorResp>(file, "error response", resp);
             let code = resp["error"]["code"].as_str().unwrap();
@@ -762,6 +762,61 @@ mod fixtures {
     fn definitive_reasons_copy_is_byte_identical() {
         let fixture = std::fs::read(dir().join("definitive_reasons.txt")).unwrap();
         assert_eq!(crate::clients::DEFINITIVE_REASONS.as_bytes(), &fixture[..]);
+    }
+}
+
+#[cfg(test)]
+mod contract {
+    //! Contract cross-check (00d): the Go test `TestContract_DriverStructs`
+    //! (`W/bin/oracle/contract_test.go`) records a scripted session through the
+    //! real service; every request and response it saw must deserialize into
+    //! the driver's structs and re-serialize to the same JSON. Point
+    //! `ORACLE_CONTRACT_DIR` at the directory the Go test printed:
+    //!
+    //! ```sh
+    //! cd tests/antithesis/workload && ORACLE_CONTRACT_DIR=/tmp/ctr go test ./bin/oracle -run TestContract
+    //! cd tests/antithesis/hegel/driver && ORACLE_CONTRACT_DIR=/tmp/ctr cargo test --locked contract
+    //! ```
+    //!
+    //! Without the variable the test only says how to run it.
+    use super::fixtures::{check_request, check_response};
+    use super::*;
+
+    #[test]
+    fn go_service_session_deserializes_into_driver_structs() {
+        let Ok(dir) = std::env::var("ORACLE_CONTRACT_DIR") else {
+            println!("ORACLE_CONTRACT_DIR unset: run TestContract_DriverStructs in tests/antithesis/workload first");
+            return;
+        };
+        let mut paths: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("{dir}: {e}"))
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("json"))
+            .collect();
+        paths.sort();
+        assert!(!paths.is_empty(), "{dir} holds no recorded calls");
+        let mut endpoints = std::collections::BTreeSet::new();
+        for p in &paths {
+            let file = p.file_name().unwrap().to_string_lossy().to_string();
+            let v: Value = serde_json::from_slice(&std::fs::read(p).unwrap()).unwrap();
+            let endpoint = v["endpoint"].as_str().unwrap();
+            endpoints.insert(endpoint.split('?').next().unwrap().to_string());
+            let status = v["status"].as_u64().unwrap();
+            if !v["request"].is_null() {
+                check_request(&file, endpoint, &v["request"]);
+            }
+            check_response(&file, endpoint, status, &v["response"]);
+            // The verdict carried in successful write/read answers parses too.
+            if status == 200 {
+                if let Some(o) = v["request"].get("outcome") {
+                    let _ = crate::clients::definitive(&serde_json::from_value::<Outcome>(o.clone()).unwrap());
+                }
+            }
+        }
+        println!("contract: {} recorded calls over {} endpoints deserialized", paths.len(), endpoints.len());
+        for ep in ["GET /health", "POST /setup", "POST /view", "POST /write/begin", "POST /write/end", "POST /write/late", "POST /write/abandon", "POST /read/begin", "POST /read/end", "POST /read/abandon", "GET /quiet/status", "POST /quiet/begin", "POST /quiet/section", "POST /quiet/end", "GET /tickets", "GET /journal", "GET /dump"] {
+            assert!(endpoints.contains(ep), "the session recorded no call to {ep}");
+        }
     }
 }
 

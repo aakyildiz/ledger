@@ -1,0 +1,55 @@
+{
+  "name": "01-volume-overflow",
+  "setup": [
+    {
+      "createLedger": {
+        "defaultEnforcementMode": "CHART_ENFORCEMENT_AUDIT",
+        "name": "o-rej-l1"
+      }
+    },
+    {
+      "apply": {
+        "action": {
+          "createTransaction": {
+            "postings": [
+              {
+                "amount": {
+                  "v0": "18446744073709551615",
+                  "v1": "18446744073709551615",
+                  "v2": "18446744073709551615",
+                  "v3": "18446744073709551615"
+                },
+                "asset": "USD",
+                "destination": "users:1",
+                "source": "world"
+              }
+            ]
+          }
+        },
+        "ledger": "o-rej-l1"
+      }
+    }
+  ],
+  "requests": [
+    {
+      "apply": {
+        "action": {
+          "createTransaction": {
+            "postings": [
+              {
+                "amount": {
+                  "v0": "1"
+                },
+                "asset": "USD",
+                "destination": "users:1",
+                "source": "world"
+              }
+            ]
+          }
+        },
+        "ledger": "o-rej-l1"
+      }
+    }
+  ],
+  "expectReason": "VOLUME_OVERFLOW"
+}

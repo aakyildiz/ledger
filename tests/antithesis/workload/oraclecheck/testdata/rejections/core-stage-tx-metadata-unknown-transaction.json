@@ -1,0 +1,31 @@
+{
+  "name": "01-tx-metadata-unknown-transaction",
+  "setup": [
+    {
+      "createLedger": {
+        "defaultEnforcementMode": "CHART_ENFORCEMENT_AUDIT",
+        "name": "o-rej-l1"
+      }
+    }
+  ],
+  "requests": [
+    {
+      "apply": {
+        "action": {
+          "addMetadata": {
+            "metadata": {
+              "k": {
+                "stringValue": "v"
+              }
+            },
+            "target": {
+              "transactionId": "7"
+            }
+          }
+        },
+        "ledger": "o-rej-l1"
+      }
+    }
+  ],
+  "expectReason": "TRANSACTION_NOT_FOUND"
+}

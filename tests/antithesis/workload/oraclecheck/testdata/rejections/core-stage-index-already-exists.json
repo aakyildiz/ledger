@@ -1,0 +1,40 @@
+{
+  "name": "01-index-already-exists",
+  "setup": [
+    {
+      "createLedger": {
+        "defaultEnforcementMode": "CHART_ENFORCEMENT_AUDIT",
+        "name": "o-rej-l1"
+      }
+    },
+    {
+      "setMetadataFieldType": {
+        "key": "k",
+        "ledger": "o-rej-l1"
+      }
+    },
+    {
+      "createIndex": {
+        "id": {
+          "metadata": {
+            "key": "k"
+          }
+        },
+        "ledger": "o-rej-l1"
+      }
+    }
+  ],
+  "requests": [
+    {
+      "createIndex": {
+        "id": {
+          "metadata": {
+            "key": "k"
+          }
+        },
+        "ledger": "o-rej-l1"
+      }
+    }
+  ],
+  "expectReason": "INDEX_ALREADY_EXISTS"
+}

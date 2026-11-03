@@ -1,0 +1,41 @@
+{
+  "name": "01-tx-account-not-matching-type",
+  "setup": [
+    {
+      "createLedger": {
+        "name": "o-rej-l1"
+      }
+    },
+    {
+      "addAccountType": {
+        "accountType": {
+          "name": "users",
+          "pattern": "users:{id}"
+        },
+        "ledger": "o-rej-l1"
+      }
+    }
+  ],
+  "requests": [
+    {
+      "apply": {
+        "action": {
+          "createTransaction": {
+            "postings": [
+              {
+                "amount": {
+                  "v0": "1"
+                },
+                "asset": "USD",
+                "destination": "other:1",
+                "source": "world"
+              }
+            ]
+          }
+        },
+        "ledger": "o-rej-l1"
+      }
+    }
+  ],
+  "expectReason": "ACCOUNT_NOT_MATCHING_TYPE"
+}

@@ -1,0 +1,22 @@
+{
+  "name": "01-empty-create",
+  "setup": [
+    {
+      "createLedger": {
+        "defaultEnforcementMode": "CHART_ENFORCEMENT_AUDIT",
+        "name": "o-rej-l1"
+      }
+    }
+  ],
+  "requests": [
+    {
+      "apply": {
+        "action": {
+          "createTransaction": {}
+        },
+        "ledger": "o-rej-l1"
+      }
+    }
+  ],
+  "expectReason": "VALIDATION"
+}

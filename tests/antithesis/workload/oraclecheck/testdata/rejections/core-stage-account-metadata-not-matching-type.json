@@ -1,0 +1,41 @@
+{
+  "name": "01-account-metadata-not-matching-type",
+  "setup": [
+    {
+      "createLedger": {
+        "name": "o-rej-l1"
+      }
+    },
+    {
+      "addAccountType": {
+        "accountType": {
+          "name": "users",
+          "pattern": "users:{id}"
+        },
+        "ledger": "o-rej-l1"
+      }
+    }
+  ],
+  "requests": [
+    {
+      "apply": {
+        "action": {
+          "addMetadata": {
+            "metadata": {
+              "k": {
+                "stringValue": "v"
+              }
+            },
+            "target": {
+              "account": {
+                "addr": "other:1"
+              }
+            }
+          }
+        },
+        "ledger": "o-rej-l1"
+      }
+    }
+  ],
+  "expectReason": "ACCOUNT_NOT_MATCHING_TYPE"
+}

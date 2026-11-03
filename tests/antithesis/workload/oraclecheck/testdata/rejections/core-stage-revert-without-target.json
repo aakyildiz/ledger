@@ -1,0 +1,24 @@
+{
+  "name": "01-revert-without-target",
+  "setup": [
+    {
+      "createLedger": {
+        "defaultEnforcementMode": "CHART_ENFORCEMENT_AUDIT",
+        "name": "o-rej-l1"
+      }
+    }
+  ],
+  "requests": [
+    {
+      "apply": {
+        "action": {
+          "revertTransaction": {
+            "force": true
+          }
+        },
+        "ledger": "o-rej-l1"
+      }
+    }
+  ],
+  "expectReason": "VALIDATION"
+}

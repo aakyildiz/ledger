@@ -1,0 +1,30 @@
+{
+  "name": "01-pq-already-exists",
+  "setup": [
+    {
+      "createLedger": {
+        "defaultEnforcementMode": "CHART_ENFORCEMENT_AUDIT",
+        "name": "o-rej-l1"
+      }
+    },
+    {
+      "createPreparedQuery": {
+        "ledger": "o-rej-l1",
+        "query": {
+          "name": "q"
+        }
+      }
+    }
+  ],
+  "requests": [
+    {
+      "createPreparedQuery": {
+        "ledger": "o-rej-l1",
+        "query": {
+          "name": "q"
+        }
+      }
+    }
+  ],
+  "expectReason": "PREPARED_QUERY_ALREADY_EXISTS"
+}

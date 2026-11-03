@@ -7,6 +7,7 @@ import (
 
 	"github.com/formancehq/ledger/v3/internal/proto/commonpb"
 	"github.com/formancehq/ledger/v3/internal/proto/servicepb"
+	"github.com/formancehq/ledger/v3/tests/antithesis/workload/oraclecheck/match"
 	"github.com/formancehq/ledger/v3/tests/oracle"
 )
 
@@ -351,3 +352,66 @@ func LogSequences(logs []*commonpb.Log) []uint64 { return logSequences(logs) }
 
 // SequencesEqual reports whether two sequence slices are identical.
 func SequencesEqual(a, b []uint64) bool { return sequencesEqual(a, b) }
+
+// ---- Conversions to the match package's side-table types (00d) ----
+
+// MatchLog converts a committed log to match's identical shape.
+func (l CommittedLog) MatchLog() match.CommittedLog {
+	return match.CommittedLog{Ledger: l.Ledger, ID: l.ID, Kind: l.Kind}
+}
+
+// MatchBulk converts a committed bulk to match's identical shape.
+func (b CommittedBulk) MatchBulk() match.CommittedBulk {
+	return match.CommittedBulk{MinSeq: b.MinSeq, MaxSeq: b.MaxSeq, Orders: b.Orders, Wid: b.Wid}
+}
+
+// MatchIdentity converts a ledger identity to match's identical shape.
+func (i LedgerIdentity) MatchIdentity() match.LedgerIdentity {
+	return match.LedgerIdentity{ID: i.ID, CreatedAt: i.CreatedAt}
+}
+
+// MatchLogs converts a committed log table (keyed by sequence) for the match
+// package's audit and log matchers.
+func MatchLogs(in map[uint64]CommittedLog) map[uint64]match.CommittedLog {
+	out := make(map[uint64]match.CommittedLog, len(in))
+	for seq, l := range in {
+		out[seq] = l.MatchLog()
+	}
+
+	return out
+}
+
+// MatchBulks converts a committed bulk table (keyed by min sequence).
+func MatchBulks(in map[uint64]CommittedBulk) map[uint64]match.CommittedBulk {
+	out := make(map[uint64]match.CommittedBulk, len(in))
+	for seq, b := range in {
+		out[seq] = b.MatchBulk()
+	}
+
+	return out
+}
+
+// MatchIdentities converts a ledger identity table (keyed by ledger name).
+func MatchIdentities(in map[string]LedgerIdentity) map[string]match.LedgerIdentity {
+	out := make(map[string]match.LedgerIdentity, len(in))
+	for name, i := range in {
+		out[name] = i.MatchIdentity()
+	}
+
+	return out
+}
+
+// MatchCommittedLogs is t.CommittedLogs() in match's shape.
+func (t *Tracker) MatchCommittedLogs() map[uint64]match.CommittedLog {
+	return MatchLogs(t.committedLogs)
+}
+
+// MatchCommittedBulks is t.CommittedBulks() in match's shape.
+func (t *Tracker) MatchCommittedBulks() map[uint64]match.CommittedBulk {
+	return MatchBulks(t.committedBulks)
+}
+
+// MatchLedgerIdentities is t.LedgerIdentities() in match's shape.
+func (t *Tracker) MatchLedgerIdentities() map[string]match.LedgerIdentity {
+	return MatchIdentities(t.ledgerIdentities)
+}

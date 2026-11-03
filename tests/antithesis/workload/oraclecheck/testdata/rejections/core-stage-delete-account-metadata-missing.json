@@ -1,0 +1,29 @@
+{
+  "name": "01-delete-account-metadata-missing",
+  "setup": [
+    {
+      "createLedger": {
+        "defaultEnforcementMode": "CHART_ENFORCEMENT_AUDIT",
+        "name": "o-rej-l1"
+      }
+    }
+  ],
+  "requests": [
+    {
+      "apply": {
+        "action": {
+          "deleteMetadata": {
+            "key": "k",
+            "target": {
+              "account": {
+                "addr": "users:1"
+              }
+            }
+          }
+        },
+        "ledger": "o-rej-l1"
+      }
+    }
+  ],
+  "expectReason": "METADATA_NOT_FOUND"
+}

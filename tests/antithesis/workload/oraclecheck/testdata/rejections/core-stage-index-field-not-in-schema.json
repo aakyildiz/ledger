@@ -1,0 +1,24 @@
+{
+  "name": "01-index-field-not-in-schema",
+  "setup": [
+    {
+      "createLedger": {
+        "defaultEnforcementMode": "CHART_ENFORCEMENT_AUDIT",
+        "name": "o-rej-l1"
+      }
+    }
+  ],
+  "requests": [
+    {
+      "createIndex": {
+        "id": {
+          "metadata": {
+            "key": "k"
+          }
+        },
+        "ledger": "o-rej-l1"
+      }
+    }
+  ],
+  "expectReason": "METADATA_FIELD_NOT_IN_SCHEMA"
+}

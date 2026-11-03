@@ -1,0 +1,19 @@
+{
+  "name": "01-pq-create-query-required",
+  "setup": [
+    {
+      "createLedger": {
+        "defaultEnforcementMode": "CHART_ENFORCEMENT_AUDIT",
+        "name": "o-rej-l1"
+      }
+    }
+  ],
+  "requests": [
+    {
+      "createPreparedQuery": {
+        "ledger": "o-rej-l1"
+      }
+    }
+  ],
+  "expectReason": "VALIDATION"
+}

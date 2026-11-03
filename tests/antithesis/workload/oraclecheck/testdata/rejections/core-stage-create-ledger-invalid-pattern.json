@@ -1,0 +1,17 @@
+{
+  "name": "01-create-ledger-invalid-pattern",
+  "setup": [],
+  "requests": [
+    {
+      "createLedger": {
+        "accountTypes": {
+          "t": {
+            "pattern": "{"
+          }
+        },
+        "name": "o-rej-l1"
+      }
+    }
+  ],
+  "expectReason": "INVALID_PATTERN"
+}

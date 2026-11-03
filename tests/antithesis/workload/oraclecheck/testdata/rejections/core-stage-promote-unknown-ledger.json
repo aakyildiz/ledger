@@ -1,0 +1,12 @@
+{
+  "name": "01-promote-unknown-ledger",
+  "setup": [],
+  "requests": [
+    {
+      "promoteLedger": {
+        "ledger": "o-rej-l1"
+      }
+    }
+  ],
+  "expectReason": "LEDGER_NOT_FOUND"
+}

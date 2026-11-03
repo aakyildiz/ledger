@@ -1,0 +1,38 @@
+{
+  "name": "01-apply-on-deleted-ledger",
+  "setup": [
+    {
+      "createLedger": {
+        "defaultEnforcementMode": "CHART_ENFORCEMENT_AUDIT",
+        "name": "o-rej-l1"
+      }
+    },
+    {
+      "deleteLedger": {
+        "name": "o-rej-l1"
+      }
+    }
+  ],
+  "requests": [
+    {
+      "apply": {
+        "action": {
+          "createTransaction": {
+            "postings": [
+              {
+                "amount": {
+                  "v0": "1"
+                },
+                "asset": "USD",
+                "destination": "users:1",
+                "source": "world"
+              }
+            ]
+          }
+        },
+        "ledger": "o-rej-l1"
+      }
+    }
+  ],
+  "expectReason": "LEDGER_DELETED"
+}

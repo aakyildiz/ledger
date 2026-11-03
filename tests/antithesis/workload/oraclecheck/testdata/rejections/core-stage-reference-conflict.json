@@ -1,0 +1,54 @@
+{
+  "name": "01-reference-conflict",
+  "setup": [
+    {
+      "createLedger": {
+        "defaultEnforcementMode": "CHART_ENFORCEMENT_AUDIT",
+        "name": "o-rej-l1"
+      }
+    },
+    {
+      "apply": {
+        "action": {
+          "createTransaction": {
+            "postings": [
+              {
+                "amount": {
+                  "v0": "1"
+                },
+                "asset": "USD",
+                "destination": "users:1",
+                "source": "world"
+              }
+            ],
+            "reference": "r"
+          }
+        },
+        "ledger": "o-rej-l1"
+      }
+    }
+  ],
+  "requests": [
+    {
+      "apply": {
+        "action": {
+          "createTransaction": {
+            "postings": [
+              {
+                "amount": {
+                  "v0": "1"
+                },
+                "asset": "USD",
+                "destination": "users:1",
+                "source": "world"
+              }
+            ],
+            "reference": "r"
+          }
+        },
+        "ledger": "o-rej-l1"
+      }
+    }
+  ],
+  "expectReason": "TRANSACTION_REFERENCE_CONFLICT"
+}

@@ -1,0 +1,17 @@
+{
+  "name": "01-create-ledger-nameless-account-type",
+  "setup": [],
+  "requests": [
+    {
+      "createLedger": {
+        "accountTypes": {
+          "": {
+            "pattern": "x:{id}"
+          }
+        },
+        "name": "o-rej-l1"
+      }
+    }
+  ],
+  "expectReason": "INVALID_PATTERN"
+}

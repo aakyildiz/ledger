@@ -77,7 +77,7 @@ pub fn rules() -> Vec<ConcurrentRule<Driver>> {
     // ==== end 17-scenario-blocks rules ====
     // ==== 18-restore rules ====
     // ==== end 18-restore rules ====
-    v
+    keep_named(v, std::env::var("RULES").ok().as_deref())
 }
 
 #[allow(dead_code)] // family-facing: task 02's tx_bulk composes over it
@@ -281,6 +281,23 @@ pub fn log_hooks() -> Vec<crate::logs::LogHook> {
     v
 }
 
+/// The `RULES` filter (00d, for `run_native.sh`): with a comma-separated
+/// allow-list, keep only the named rules; unset or empty keeps them all.
+fn keep_named(v: Vec<ConcurrentRule<Driver>>, allow: Option<&str>) -> Vec<ConcurrentRule<Driver>> {
+    let Some(list) = allow.map(str::trim).filter(|l| !l.is_empty()) else {
+        return v;
+    };
+    let names: Vec<&str> = list.split(',').map(str::trim).filter(|n| !n.is_empty()).collect();
+    for n in &names {
+        if !v.iter().any(|r| r.name == *n) {
+            println!("driver: RULES names unknown rule {n:?}");
+        }
+    }
+    let kept: Vec<_> = v.into_iter().filter(|r| names.contains(&r.name.as_str())).collect();
+    println!("driver: RULES keeps {} rule(s): {:?}", kept.len(), kept.iter().map(|r| r.name.as_str()).collect::<Vec<_>>());
+    kept
+}
+
 #[cfg(test)]
 mod tests {
     /// The 17 family marker pairs of each of the seven sections exist, in
@@ -329,5 +346,15 @@ mod tests {
         let names: Vec<String> = super::rules().into_iter().map(|r| r.name).collect();
         assert!(names.contains(&"smoke_tx".to_string()));
         assert!(names.contains(&"smoke_get_account".to_string()));
+    }
+
+    #[test]
+    fn rules_filter_keeps_only_named_rules() {
+        let all = || super::smoke::rules();
+        let n = all().len();
+        assert_eq!(super::keep_named(all(), None).len(), n);
+        assert_eq!(super::keep_named(all(), Some("  ")).len(), n);
+        let kept = super::keep_named(all(), Some("smoke_tx, nope"));
+        assert_eq!(kept.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(), vec!["smoke_tx"]);
     }
 }

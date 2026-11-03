@@ -1,0 +1,36 @@
+{
+  "name": "01-invalid-skippable-reason",
+  "setup": [
+    {
+      "createLedger": {
+        "defaultEnforcementMode": "CHART_ENFORCEMENT_AUDIT",
+        "name": "o-rej-l1"
+      }
+    }
+  ],
+  "requests": [
+    {
+      "apply": {
+        "action": {
+          "createTransaction": {
+            "postings": [
+              {
+                "amount": {
+                  "v0": "1"
+                },
+                "asset": "USD",
+                "destination": "users:1",
+                "source": "world"
+              }
+            ]
+          }
+        },
+        "ledger": "o-rej-l1",
+        "skippableReasons": [
+          "ERROR_REASON_INSUFFICIENT_FUNDS"
+        ]
+      }
+    }
+  ],
+  "expectReason": "VALIDATION"
+}

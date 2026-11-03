@@ -1,0 +1,25 @@
+{
+  "name": "01-revert-unknown-transaction",
+  "setup": [
+    {
+      "createLedger": {
+        "defaultEnforcementMode": "CHART_ENFORCEMENT_AUDIT",
+        "name": "o-rej-l1"
+      }
+    }
+  ],
+  "requests": [
+    {
+      "apply": {
+        "action": {
+          "revertTransaction": {
+            "force": true,
+            "transactionId": "7"
+          }
+        },
+        "ledger": "o-rej-l1"
+      }
+    }
+  ],
+  "expectReason": "TRANSACTION_NOT_FOUND"
+}

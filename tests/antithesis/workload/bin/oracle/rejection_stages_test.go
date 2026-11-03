@@ -34,10 +34,19 @@ type rejectionFixture struct {
 
 const rejectionKey = "k1"
 
-// differentBodyTail is appended to the fixture's requests to build a
-// different body under the same key.
-func differentBodyTail(ledger string) *servicepb.Request {
-	return actions.SaveAccountMetadataAction(ledger, "users:own-x", map[string]string{"own-probe": "1"})
+// differentBody builds a different body under the same key: the fixture's
+// requests plus a trailing addMetadata on the last ledger. A cluster-scoped
+// fixture names no ledger (an addMetadata on "" is an admission VALIDATION
+// that never reaches the idempotency check), so it gets a leading
+// createLedger instead (00d).
+func differentBody(reqs []*servicepb.Request) []*servicepb.Request {
+	ledger := lastLedger(reqs)
+	if ledger == "" {
+		return append([]*servicepb.Request{actions.CreateLedgerAction("o-rej-tail", nil)}, reqs...)
+	}
+
+	return append(append([]*servicepb.Request(nil), reqs...),
+		actions.SaveAccountMetadataAction(ledger, "users:own-x", map[string]string{"own-probe": "1"}))
 }
 
 func lastLedger(reqs []*servicepb.Request) string {
@@ -132,7 +141,7 @@ func TestRejectionStages(t *testing.T) {
 
 			// Replay of the same body, then a different body under the key.
 			replay := outcomeOf(client.Apply(ctx, servicepb.UnsignedApplyRequest(rejectionKey, reqs...)))
-			diff := append(append([]*servicepb.Request(nil), reqs...), differentBodyTail(lastLedger(reqs)))
+			diff := differentBody(reqs)
 			conflict := outcomeOf(client.Apply(ctx, servicepb.UnsignedApplyRequest(rejectionKey, diff...)))
 
 			marker := "marker"

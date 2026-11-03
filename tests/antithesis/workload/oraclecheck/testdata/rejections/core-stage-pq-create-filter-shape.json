@@ -1,0 +1,26 @@
+{
+  "name": "01-pq-create-filter-shape",
+  "setup": [
+    {
+      "createLedger": {
+        "defaultEnforcementMode": "CHART_ENFORCEMENT_AUDIT",
+        "name": "o-rej-l1"
+      }
+    }
+  ],
+  "requests": [
+    {
+      "createPreparedQuery": {
+        "ledger": "o-rej-l1",
+        "query": {
+          "filter": {
+            "logId": {}
+          },
+          "name": "q",
+          "target": "QUERY_TARGET_LOGS"
+        }
+      }
+    }
+  ],
+  "expectReason": "FILTER_COMPILATION_ERROR"
+}

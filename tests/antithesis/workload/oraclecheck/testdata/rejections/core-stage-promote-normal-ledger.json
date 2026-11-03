@@ -1,0 +1,19 @@
+{
+  "name": "01-promote-normal-ledger",
+  "setup": [
+    {
+      "createLedger": {
+        "defaultEnforcementMode": "CHART_ENFORCEMENT_AUDIT",
+        "name": "o-rej-l1"
+      }
+    }
+  ],
+  "requests": [
+    {
+      "promoteLedger": {
+        "ledger": "o-rej-l1"
+      }
+    }
+  ],
+  "expectReason": "LEDGER_NOT_IN_MIRROR_MODE"
+}

@@ -1,0 +1,12 @@
+{
+  "name": "01-invalid-cron-expression",
+  "setup": [],
+  "requests": [
+    {
+      "setQueryCheckpointSchedule": {
+        "cron": "not a cron"
+      }
+    }
+  ],
+  "expectReason": "INVALID_CRON_EXPRESSION"
+}

@@ -1,0 +1,43 @@
+{
+  "name": "01-transient-account-non-zero",
+  "setup": [
+    {
+      "createLedger": {
+        "defaultEnforcementMode": "CHART_ENFORCEMENT_AUDIT",
+        "name": "o-rej-l1"
+      }
+    },
+    {
+      "addAccountType": {
+        "accountType": {
+          "name": "users",
+          "pattern": "users:{id}",
+          "persistence": "ACCOUNT_TYPE_TRANSIENT"
+        },
+        "ledger": "o-rej-l1"
+      }
+    }
+  ],
+  "requests": [
+    {
+      "apply": {
+        "action": {
+          "createTransaction": {
+            "postings": [
+              {
+                "amount": {
+                  "v0": "1"
+                },
+                "asset": "USD",
+                "destination": "users:1",
+                "source": "world"
+              }
+            ]
+          }
+        },
+        "ledger": "o-rej-l1"
+      }
+    }
+  ],
+  "expectReason": "TRANSIENT_ACCOUNT_NON_ZERO"
+}

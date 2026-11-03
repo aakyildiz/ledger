@@ -1,0 +1,23 @@
+{
+  "name": "01-pq-create-target-unsupported",
+  "setup": [
+    {
+      "createLedger": {
+        "defaultEnforcementMode": "CHART_ENFORCEMENT_AUDIT",
+        "name": "o-rej-l1"
+      }
+    }
+  ],
+  "requests": [
+    {
+      "createPreparedQuery": {
+        "ledger": "o-rej-l1",
+        "query": {
+          "name": "q",
+          "target": "QUERY_TARGET_AUDIT"
+        }
+      }
+    }
+  ],
+  "expectReason": "VALIDATION"
+}

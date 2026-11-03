@@ -1,0 +1,19 @@
+{
+  "name": "01-pq-delete-name-required",
+  "setup": [
+    {
+      "createLedger": {
+        "defaultEnforcementMode": "CHART_ENFORCEMENT_AUDIT",
+        "name": "o-rej-l1"
+      }
+    }
+  ],
+  "requests": [
+    {
+      "deletePreparedQuery": {
+        "ledger": "o-rej-l1"
+      }
+    }
+  ],
+  "expectReason": "VALIDATION"
+}

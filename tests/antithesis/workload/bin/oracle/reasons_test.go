@@ -58,10 +58,7 @@ func TestDefinitiveReasons(t *testing.T) {
 		"regenerate the fixture: go run ./tests/antithesis/hegel/protocol-fixtures/core/gen")
 	require.Equal(t, want, oc.DefinitiveReasons(), "run go generate in tests/antithesis/workload/oraclecheck")
 
-	driverCopy := "../../../hegel/driver/src/definitive_reasons.txt"
-	if _, err := os.Stat(driverCopy); err == nil {
-		require.Equal(t, want, readReasonList(t, driverCopy))
-	} else {
-		t.Logf("%s does not exist yet (00c); 00d makes this check mandatory", driverCopy)
-	}
+	// The driver's include_str! copy must agree (mandatory since 00d).
+	require.Equal(t, want, readReasonList(t, "../../../hegel/driver/src/definitive_reasons.txt"),
+		"copy the fixture to tests/antithesis/hegel/driver/src/definitive_reasons.txt")
 }

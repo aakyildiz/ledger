@@ -1,0 +1,12 @@
+{
+  "name": "01-checkpoint-not-found",
+  "setup": [],
+  "requests": [
+    {
+      "deleteQueryCheckpoint": {
+        "checkpointId": "999"
+      }
+    }
+  ],
+  "expectReason": "CHECKPOINT_NOT_FOUND"
+}

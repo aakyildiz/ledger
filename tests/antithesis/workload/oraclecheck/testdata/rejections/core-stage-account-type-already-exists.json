@@ -1,0 +1,32 @@
+{
+  "name": "01-account-type-already-exists",
+  "setup": [
+    {
+      "createLedger": {
+        "defaultEnforcementMode": "CHART_ENFORCEMENT_AUDIT",
+        "name": "o-rej-l1"
+      }
+    },
+    {
+      "addAccountType": {
+        "accountType": {
+          "name": "users",
+          "pattern": "users:{id}"
+        },
+        "ledger": "o-rej-l1"
+      }
+    }
+  ],
+  "requests": [
+    {
+      "addAccountType": {
+        "accountType": {
+          "name": "users",
+          "pattern": "users:{id}"
+        },
+        "ledger": "o-rej-l1"
+      }
+    }
+  ],
+  "expectReason": "ACCOUNT_TYPE_ALREADY_EXISTS"
+}

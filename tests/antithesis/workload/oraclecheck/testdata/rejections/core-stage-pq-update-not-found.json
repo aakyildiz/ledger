@@ -1,0 +1,20 @@
+{
+  "name": "01-pq-update-not-found",
+  "setup": [
+    {
+      "createLedger": {
+        "defaultEnforcementMode": "CHART_ENFORCEMENT_AUDIT",
+        "name": "o-rej-l1"
+      }
+    }
+  ],
+  "requests": [
+    {
+      "updatePreparedQuery": {
+        "ledger": "o-rej-l1",
+        "name": "q"
+      }
+    }
+  ],
+  "expectReason": "PREPARED_QUERY_NOT_FOUND"
+}

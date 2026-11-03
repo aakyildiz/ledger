@@ -1,0 +1,27 @@
+{
+  "name": "01-delete-tx-metadata-without-target",
+  "setup": [
+    {
+      "createLedger": {
+        "defaultEnforcementMode": "CHART_ENFORCEMENT_AUDIT",
+        "name": "o-rej-l1"
+      }
+    }
+  ],
+  "requests": [
+    {
+      "apply": {
+        "action": {
+          "deleteMetadata": {
+            "key": "k",
+            "target": {
+              "transactionId": "0"
+            }
+          }
+        },
+        "ledger": "o-rej-l1"
+      }
+    }
+  ],
+  "expectReason": "VALIDATION"
+}

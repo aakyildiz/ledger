@@ -1,0 +1,20 @@
+{
+  "name": "01-account-type-not-found",
+  "setup": [
+    {
+      "createLedger": {
+        "defaultEnforcementMode": "CHART_ENFORCEMENT_AUDIT",
+        "name": "o-rej-l1"
+      }
+    }
+  ],
+  "requests": [
+    {
+      "removeAccountType": {
+        "ledger": "o-rej-l1",
+        "name": "users"
+      }
+    }
+  ],
+  "expectReason": "ACCOUNT_TYPE_NOT_FOUND"
+}

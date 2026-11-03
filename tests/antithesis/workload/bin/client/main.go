@@ -145,7 +145,12 @@ func main() {
 	}
 	s := &server{conns: cs, udp: dialOutcome(os.Getenv("OUTCOME_ADDR"))}
 
-	httpServer := &http.Server{Addr: ":8080", Handler: s.mux(), ReadHeaderTimeout: 5 * time.Second}
+	// CLIENT_ADDR lets run_native.sh pick a free port (00d); compose keeps :8080.
+	addr := os.Getenv("CLIENT_ADDR")
+	if addr == "" {
+		addr = ":8080"
+	}
+	httpServer := &http.Server{Addr: addr, Handler: s.mux(), ReadHeaderTimeout: 5 * time.Second}
 	go func() {
 		sigs := make(chan os.Signal, 1)
 		signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)

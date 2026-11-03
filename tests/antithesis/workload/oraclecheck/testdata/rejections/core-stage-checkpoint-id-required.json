@@ -1,0 +1,10 @@
+{
+  "name": "01-checkpoint-id-required",
+  "setup": [],
+  "requests": [
+    {
+      "deleteQueryCheckpoint": {}
+    }
+  ],
+  "expectReason": "CHECKPOINT_ID_REQUIRED"
+}
