@@ -28,17 +28,50 @@ on:
         required: false
         type: string
         default: ''
+  # Build-only check of the hegel images (no publish, no launch).
+  pull_request:
+    paths:
+      - tests/antithesis/hegel/**
+      - tests/antithesis/workload/oraclecheck/**
+      - tests/antithesis/workload/bin/oracle/**
+      - tests/antithesis/workload/bin/client/**
+      - tests/antithesis/workload/bin/restore-agent/**
+      - tests/oracle/**
+      - .github/workflows/antithesis.yml
 
 permissions:
   contents: read
 
 concurrency:
-  group: antithesis-${{ inputs.source_ref }}
+  group: antithesis-${{ inputs.source_ref || github.ref }}
   cancel-in-progress: false
 
 jobs:
+  hegel-images:
+    # Builds the five hegel images (driver, client, oracle, ledger, restore)
+    # from the compose file. Build only: nothing is pushed or launched.
+    name: Build hegel images
+    runs-on: namespace-profile-linux-amd64-4vcpu
+    timeout-minutes: 90
+    steps:
+      - name: Checkout hegel source
+        uses: namespacelabs/nscloud-checkout-action@66f2dc6f6c42a8ac6c4e53473c4840006822831e # v9
+        with:
+          ref: ${{ inputs.source_ref || github.sha }}
+
+      - name: Set up Docker Buildx for hegel
+        uses: namespacelabs/nscloud-setup-buildx-action@d059ed7184f0bc7c8b27e8810cea153d02bcc6dd # v0.0.23
+
+      - name: Build hegel images
+        working-directory: tests/antithesis/hegel
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker compose -f docker-compose.yaml build driver client1 oracle ledger-0 restore-0
+
   build-publish-launch:
     name: Build, publish, and launch
+    if: github.event_name == 'workflow_dispatch'
     runs-on: namespace-profile-linux-amd64-4vcpu
     timeout-minutes: 180
     environment: antithesis
