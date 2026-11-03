@@ -20,6 +20,7 @@ pub mod smoke;
 // ==== 08-prepared-queries mods ====
 // ==== end 08-prepared-queries mods ====
 // ==== 09-query-checkpoints mods ====
+pub mod checkpoints;
 // ==== end 09-query-checkpoints mods ====
 // ==== 10-audit mods ====
 // ==== end 10-audit mods ====
@@ -58,6 +59,7 @@ pub fn rules() -> Vec<ConcurrentRule<Driver>> {
     // ==== 08-prepared-queries rules ====
     // ==== end 08-prepared-queries rules ====
     // ==== 09-query-checkpoints rules ====
+    v.extend(checkpoints::rules());
     // ==== end 09-query-checkpoints rules ====
     // ==== 10-audit rules ====
     // ==== end 10-audit rules ====
@@ -219,6 +221,7 @@ pub fn setup_hooks() -> Vec<crate::setup::SetupHook> {
     // ==== 08-prepared-queries setup_hooks ====
     // ==== end 08-prepared-queries setup_hooks ====
     // ==== 09-query-checkpoints setup_hooks ====
+    v.extend(checkpoints::setup_hooks());
     // ==== end 09-query-checkpoints setup_hooks ====
     // ==== 10-audit setup_hooks ====
     // ==== end 10-audit setup_hooks ====
