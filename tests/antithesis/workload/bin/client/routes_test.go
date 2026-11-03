@@ -125,8 +125,11 @@ func TestRouteNodePinsOneNode(t *testing.T) {
 		require.Equal(t, "b", ledgerName(t, out), "node overrides the route")
 		require.Equal(t, addrB, out.Peer, "peer is the dialed node address")
 	}
+	// round_robin picks among READY subchannels only, so under load the
+	// second one can still be connecting for the first few calls: keep
+	// sending (bounded) until both nodes have answered.
 	seen := map[string]bool{}
-	for range 6 {
+	for deadline := time.Now().Add(10 * time.Second); len(seen) < 2 && time.Now().Before(deadline); {
 		out := getLedger(t, s, "plain", "")
 		seen[ledgerName(t, out)] = true
 		require.Contains(t, []string{addrA, addrB}, out.Peer)
