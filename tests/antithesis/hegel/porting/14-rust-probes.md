@@ -30,15 +30,18 @@ rules run in degraded mode and both hooks ignore `QuietCtx.begin`.
 | MD/eventually_correct/main.go:154 | Always(false): double-entry: account volume balance field is absent | verbatim, as `check_always!(present, …)` | rules/probes.rs `sum_balances` |
 | MD/eventually_correct/main.go:160 | Always(false): double-entry: account volume balance is invalid | verbatim, as `check_always!(valid, …)` | rules/probes.rs `sum_balances` |
 | MD/eventually_correct/main.go:175 | Always: double-entry: sum of balances should be 0 | verbatim (per (asset, color), exact arbitrary-width signed sum; only under a quiescent fence) | rules/probes.rs `evaluate_ledger` |
-| MD/eventually_correct/main.go:191-222 (`checkAccountBalances`, W/internal/checks.go:15-56) | Reachable: should be able to get account; Unreachable: GetAccount returned unexpected error; Always: reported balance and volumes should be consistent, account volume entry has missing required fields, account volume input/output/balance is invalid | `GetAccount returned unexpected error` verbatim (sampled cross-check reads); the per-user volume checks are oracle (tracked ledgers, task 05 point reads); dropped for foreign ledgers | rules/probes.rs `observe_ledger` |
-| MD/eventually_correct/main.go:258,266 | Always(false): cross-check: account volume has missing required fields / has invalid typed amount | dropped: listed balance presence/validity is covered by the two double-entry literals; input/output of tracked accounts are oracle-checked | – |
-| MD/eventually_correct/main.go:292 | Unreachable: should get requested volumes | dropped (subsumed): a bucket missing on one side counts as balance 0 there and a difference fires `list/get balance divergence persisted past quiescence` | – |
+| MD/eventually_correct/main.go:191-222 (`checkAccountBalances`, W/internal/checks.go:15-56) | Reachable: should be able to get account; Unreachable: GetAccount returned unexpected error; Always: reported balance and volumes should be consistent, account volume entry has missing required fields, account volume input/output/balance is invalid | `GetAccount returned unexpected error` verbatim (sampled cross-check reads); the per-user GetAccount volume checks are oracle on tracked ledgers (task 05 point reads); on every ledger the same properties are checked on the listed volumes (rows for main.go:258,266,272 below) | rules/probes.rs `observe_ledger`, `check_listed_volumes` |
+| MD/eventually_correct/main.go:245 | Unreachable: listAccounts returned unexpected error in checkVolumesConsistent | merged into `listAccounts returned unexpected error` (one listing serves both checks) | rules/probes.rs `observe_ledger` |
+| MD/eventually_correct/main.go:258,266 | Always(false): cross-check: account volume has missing required fields / has invalid typed amount | verbatim, every listed volume of every ledger, unfenced (a property of one response), as `check_always!(…)` | rules/probes.rs `check_listed_volumes` |
+| MD/eventually_correct/main.go:272 (`internal.CheckVolume`) | Always: reported balance and volumes should be consistent | new literal `listed account volume balance equals input minus output` (same property, every listed volume of every ledger, exact at any width, unfenced). The old literal is shared by every `CheckVolume` caller (post-commit volumes, point reads) that other families map to the oracle, so it is not reused here | rules/probes.rs `check_listed_volumes` |
+| MD/eventually_correct/main.go:280 | Unreachable: GetAccount returned unexpected error in cross-check | merged into `GetAccount returned unexpected error` (the sampled reads serve both checks) | rules/probes.rs `observe_ledger` |
+| MD/eventually_correct/main.go:292 | Unreachable: should get requested volumes | new literal `list/get volume bucket missing on one side past quiescence` (Unreachable): under the fence, both directions, only for a bucket with non-zero input or output (an unused bucket may be absent). Not the old literal: the fence and the non-zero condition change the check | rules/probes.rs `evaluate_ledger` |
 | MD/eventually_correct/main.go:302,308 | Always(false): cross-check: GetAccount volume balance is absent / invalid | verbatim, as `check_always!(…)` on every sampled GetAccount bucket | rules/probes.rs `evaluate_ledger` |
 | MD/eventually_correct/main.go:331 | Unreachable: list/get balance divergence persisted past quiescence | verbatim (only under a quiescent fence; otherwise re-read up to 2 times, then no verdict) | rules/probes.rs `evaluate_ledger` |
 | MD/eventually_correct/main.go:343 | Reachable: list/get balance pair verified matching | verbatim | rules/probes.rs `evaluate_ledger` |
 | MD/eventually_correct/main.go:367 | Reachable: eventually_correct found no list/get balance pairs to compare | dropped: coverage note only; `can check all volumes for consistency` details carry `pairs` | – |
 | MD/eventually_correct/main.go:372 | Reachable: can check all volumes for consistency | verbatim (per checked ledger) | rules/probes.rs `evaluate_ledger` |
-| MD/eventually_correct/main.go:383-404 | AlwaysOrUnreachable: list metadata key should exist in getaccount; list metadata value should match getaccount; metadata key count should match between list and get | verbatim, under the fence, for up to 20 sampled accounts; values compared as whole typed `MetadataValue`s (old: `stringValue` only, per the task spec's "whole metadata map") | rules/probes.rs `evaluate_ledger` |
+| MD/eventually_correct/main.go:383-404 | AlwaysOrUnreachable: list metadata key should exist in getaccount; list metadata value should match getaccount; metadata key count should match between list and get | verbatim, under the fence, for up to 20 sampled accounts; the value literal compares `GetStringValue()` as the old `metadataToMap` did ("" for non-string values); typed equality is the new `list metadata typed value should match getaccount` | rules/probes.rs `evaluate_ledger` |
 | MD/parallel_driver_stats_consistency/main.go:57 | Always: log count must be >= transaction count (logs include metadata, reverts, etc.) | verbatim, every listed ledger, in `eventually_correct` | rules/probes.rs `check_stats` |
 | MD/parallel_driver_stats_consistency/main.go:80 | Always: aggregate balance must be zero (double-entry) | merged into `aggregate double-entry: input must equal output` (the same check) | rules/probes.rs `check_aggregates` |
 | MD/parallel_driver_stats_consistency/main.go:91 | Reachable: stats consistency check passed | dropped: coverage only, `can check all volumes for consistency` | – |
@@ -54,6 +57,12 @@ rules run in degraded mode and both hooks ignore `QuietCtx.begin`.
   transaction found in `r-bad-<run>` by the quiet absence listing.
 - `quiesce_and_absence completes within its quiet budget` (Sometimes).
 - `eventually_correct completes within its quiet budget` (Sometimes).
+- `listed account volume balance equals input minus output` (Always): every listed volume of every
+  ledger (replaces the old shared `CheckVolume` literal here, see the table).
+- `list/get volume bucket missing on one side past quiescence` (Unreachable): a sampled account's
+  used bucket (non-zero input or output) is listed but not returned by GetAccount, or the reverse.
+- `list metadata typed value should match getaccount` (AlwaysOrUnreachable): the whole typed
+  `MetadataValue` agrees between ListAccounts and GetAccount.
 
 ## Reachability
 
@@ -72,6 +81,8 @@ rules run in degraded mode and both hooks ignore `QuietCtx.begin`.
 | double-entry: sum of balances should be 0 | eventually_correct | no faults |
 | double-entry: account volume balance field is absent / is invalid | eventually_correct | no faults (any listed volume) |
 | cross-check: GetAccount volume balance is absent / is invalid | eventually_correct | no faults (any sampled account with volumes) |
+| cross-check: account volume has missing required fields / has invalid typed amount | eventually_correct | no faults (any listed volume) |
+| listed account volume balance equals input minus output | eventually_correct | no faults (any listed volume) |
 | list/get balance pair verified matching | eventually_correct | no faults (any ledger with accounts: `r-probe-<run>` always has some) |
 | can check all volumes for consistency | eventually_correct | no faults |
 | log count must be >= transaction count (…) | eventually_correct | no faults |
@@ -91,6 +102,26 @@ rules run in degraded mode and both hooks ignore `QuietCtx.begin`.
 - `quiesce_and_absence` runs (b) the absence listing before (a) the write/idle/read, so a hanging
   probe read cannot starve the absence check; nothing is sent between the acked write and the
   probe read.
+- Stale-read epochs: the spec fixes the probe account to `probe:main` with counters for the whole
+  timeline. Every unknown outcome widens `attempted - commits` for good, so over a long run
+  `balance <= attempted` would stop catching a duplicated increment. Increments go to the current
+  epoch's account (`probe:main`, then `probe:main-<n>`), and the epoch moves on once 5 of its
+  increments are lost (unknown or refused); each epoch keeps its own counters, and a read is judged
+  against the counters of the account it read. The slack stays as small as with the old per-run
+  ledger (5 or 15 increments), and accounts grow only with lost increments.
+- Account samples: instead of 20 independent `u32`s modulo the listed count, `plan` draws a base
+  and one jitter per sample; the sample takes one index in each of 20 disjoint stride windows
+  (every account when 20 or fewer). hegel pushes wide integers toward 0, so independent draws
+  collapsed onto the first account; the windows keep 20 distinct accounts spread over the listing.
+- Ledger walk order: rotated by a drawn offset plus a cursor of ledgers walked by earlier runs
+  (driver state, not a draw), so a walk cut short by the deadline resumes where the last one
+  stopped, and the tail of `ListLedgers` (`r-*`, `treasury`) is reached.
+- Quiesce write tries: 3 tries of 8 s cannot fit next to the idle window and the 30 s read in 45 s.
+  The room left (deadline minus idle, read and margin) is shared among the remaining tries: each try
+  gets `room / tries_left - 1.5 s`, within 2..8 s and never past the room. With an 8 s idle the room
+  is about 5 s, so usually one 2 s try plus fast retries; with a 2 s idle, up to 3 tries of about 2 s.
+  A slow absence listing (its 8 s maximum) with an 8 s idle leaves no room: no probe read that
+  period, logged and reported through `quiesce_and_absence completes within its quiet budget`.
 - Fences are per ledger (Barrier, read the ledger, Barrier), not one fence around the whole sweep,
   so a background proposal costs one ledger's re-read rather than the whole check.
 

@@ -33,6 +33,16 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 pub const PROBE_ACCOUNT: &str = "probe:main";
+
+/// The probe account of a stale-read epoch: `probe:main`, then
+/// `probe:main-<epoch>` (see [`StaleBook`]).
+pub fn probe_account(epoch: u64) -> String {
+    if epoch == 0 {
+        PROBE_ACCOUNT.to_string()
+    } else {
+        format!("{PROBE_ACCOUNT}-{epoch}")
+    }
+}
 pub const PROBE_ASSET: &str = "USD/2";
 
 /// `r-probe-<run>`: the stale-read probe account and the quiesce writes.
@@ -50,12 +60,14 @@ pub fn bad_ledger(s: &Shared) -> String {
 pub struct ProbeState {
     pub probe_ready: AtomicBool,
     pub bad_ready: AtomicBool,
-    pub counters: Mutex<StaleCounters>,
+    pub stale: Mutex<StaleBook>,
     /// Counter for unique references (identities, never draws).
     next_ref: AtomicU64,
     /// References of malformed writes that were definitively rejected.
     rejected: Mutex<BTreeSet<String>>,
     rejected_total: AtomicU64,
+    /// Where the next `eventually_correct` walk resumes (ledgers walked so far).
+    ec_cursor: AtomicU64,
 }
 
 /// Cap on remembered rejected references (the count keeps growing).
@@ -313,13 +325,56 @@ impl SignedSum {
 
 // ---------------------------------------------------------------- stale_probe
 
-/// Attempted/acked unit increments of `probe:main` (DESIGN §6.8 "unit
+/// Attempted/acked unit increments of one probe account (DESIGN §6.8 "unit
 /// increment"). `attempted` counts before the send, so every increment that
-/// can be visible to a read is counted; `acked` counts proven commits.
+/// can be visible to a read is counted; `acked` counts proven commits;
+/// `lost` counts finished increments not proven committed (unknown
+/// outcomes and refusals), the slack between the two bounds.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct StaleCounters {
     pub attempted: u64,
     pub acked: u64,
+    pub lost: u64,
+}
+
+/// Lost increments after which new increments move to a fresh account.
+pub const STALE_EPOCH_MAX_LOST: u64 = 5;
+
+/// The stale-read bookkeeping. Every unknown outcome widens the gap between
+/// `attempted` and the real commit count for good, so a single account over
+/// the whole timeline would let `balance <= attempted` miss a duplicated
+/// increment once enough unknowns pile up. Increments therefore go to the
+/// epoch's account, and the epoch moves on (a fresh account,
+/// `probe:main-<epoch>`) once [`STALE_EPOCH_MAX_LOST`] of its increments are
+/// lost, keeping the slack as small as the old per-run ledger did.
+#[derive(Debug, Default)]
+pub struct StaleBook {
+    pub epoch: u64,
+    pub counters: BTreeMap<u64, StaleCounters>,
+}
+
+impl StaleBook {
+    /// Starts one increment: rotates the epoch if its account has lost too
+    /// many increments, counts the increment as attempted, returns its epoch.
+    pub fn begin(&mut self) -> u64 {
+        if self.counters.get(&self.epoch).is_some_and(|c| c.lost >= STALE_EPOCH_MAX_LOST) {
+            self.epoch += 1;
+        }
+        self.counters.entry(self.epoch).or_default().attempted += 1;
+        self.epoch
+    }
+    /// Records the outcome of an increment started by [`StaleBook::begin`].
+    pub fn finish(&mut self, epoch: u64, committed: bool) {
+        let c = self.counters.entry(epoch).or_default();
+        if committed {
+            c.acked += 1;
+        } else {
+            c.lost += 1;
+        }
+    }
+    pub fn get(&self, epoch: u64) -> StaleCounters {
+        self.counters.get(&epoch).copied().unwrap_or_default()
+    }
 }
 
 /// Whether an increment's outcome proves it committed: a success, or a
@@ -402,8 +457,9 @@ pub fn run_stale_round(d: &Driver, plan: &StalePlan, t: &StaleTiming) -> StaleRo
         round.iterations += 1;
         // 1. One keyed, forced unit increment with a unique reference, single attempt.
         let reference = st.next_ref(&d.s, "probe");
-        let req = forced_tx(&ledger, "world", PROBE_ACCOUNT, U256::from(1), PROBE_ASSET, Some(&reference));
-        st.counters.lock().unwrap_or_else(|e| e.into_inner()).attempted += 1;
+        let epoch = st.stale.lock().unwrap_or_else(|e| e.into_inner()).begin();
+        let account = probe_account(epoch);
+        let req = forced_tx(&ledger, "world", &account, U256::from(1), PROBE_ASSET, Some(&reference));
         let send = UntrackedSend {
             requests: vec![req],
             key: Some(d.s.next_untracked_key()),
@@ -416,23 +472,24 @@ pub fn run_stale_round(d: &Driver, plan: &StalePlan, t: &StaleTiming) -> StaleRo
             sign: None,
         };
         let res = d.send_untracked(send);
-        if increment_committed(&res.outcome) {
-            st.counters.lock().unwrap_or_else(|e| e.into_inner()).acked += 1;
-        }
-        // 2. A stale GetAccount of the probe.
-        let acked_before = st.counters.lock().unwrap_or_else(|e| e.into_inner()).acked;
-        let req = json!({"ledger": ledger, "address": PROBE_ACCOUNT});
+        st.stale.lock().unwrap_or_else(|e| e.into_inner()).finish(epoch, increment_committed(&res.outcome));
+        // 2. A stale GetAccount of the epoch's probe account.
+        let acked_before = st.stale.lock().unwrap_or_else(|e| e.into_inner()).get(epoch).acked;
+        let req = json!({"ledger": ledger, "address": account});
         let (_, out) = d.call(read_route, "bucket", "GetAccount", req, &CallOpts::stale().timeout(t.read));
-        let attempted_after = st.counters.lock().unwrap_or_else(|e| e.into_inner()).attempted;
-        let details = json!({"ledger": ledger, "round": i, "attempted": attempted_after, "acked": acked_before, "route": read_route.via(), "peer": out.peer});
+        let attempted_after = st.stale.lock().unwrap_or_else(|e| e.into_inner()).get(epoch).attempted;
+        let details = json!({"ledger": ledger, "account": account, "epoch": epoch, "round": i, "attempted": attempted_after, "acked": acked_before, "route": read_route.via(), "peer": out.peer});
         let (ok, lag) = check_stale_read(&out, acked_before, attempted_after, &details);
         if ok {
             round.reads_ok += 1;
         }
         round.lag |= lag;
     }
-    let c = *st.counters.lock().unwrap_or_else(|e| e.into_inner());
-    let summary = json!({"ledger": ledger, "attempted": c.attempted, "acked": c.acked, "iterations": round.iterations});
+    let (epoch, c) = {
+        let book = st.stale.lock().unwrap_or_else(|e| e.into_inner());
+        (book.epoch, book.get(book.epoch))
+    };
+    let summary = json!({"ledger": ledger, "epoch": epoch, "attempted": c.attempted, "acked": c.acked, "lost": c.lost, "iterations": round.iterations});
     check_sometimes!(round.reads_ok > 0, "stale read of probe account succeeded", summary);
     check_sometimes!(round.lag, "stale read observed lag behind acked writes", summary);
     round
@@ -657,6 +714,8 @@ pub fn page_all(d: &Driver, route: &Route, method: &str, ledger: Option<&str>, p
 pub const QUIESCE_IDLE_SECS: [u64; 3] = [2, 5, 8];
 pub const QUIESCE_WRITE_TRIES: usize = 3;
 pub const QUIESCE_WRITE_TIMEOUT: Duration = Duration::from_secs(8);
+/// The shortest write try worth sending (the room is shared among the tries).
+pub const QUIESCE_MIN_WRITE_ATTEMPT: Duration = Duration::from_secs(2);
 pub const QUIESCE_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const HTTP_MARGIN: Duration = Duration::from_millis(1500);
 /// The absence listing's share of the quiesce budget.
@@ -705,8 +764,11 @@ pub fn run_quiesce(d: &Driver, client: usize, deadline: Instant, plan: &QuiesceP
     let st = d.s.ext::<ProbeState>();
     let mut rep = QuiesceReport { absence_checked: absence_check(d, &st, client, deadline.min(Instant::now() + ABSENCE_BUDGET)), ..Default::default() };
 
-    // (a) the write: at most 3 tries of 8 s each, same key and bytes,
-    // leaving room for the idle window and the read.
+    // (a) the write: at most 3 tries, same key and bytes, leaving room for
+    // the idle window and the read. The spec's 3 x 8 s cannot fit next to
+    // the 30 s read in 45 s, so the room left is shared among the remaining
+    // tries (at most 8 s, at least 2 s each, never past the room): one slow
+    // first try does not use up the room a retry on another route needs.
     let ledger = probe_ledger(&d.s);
     let tail = plan.idle + QUIESCE_READ_TIMEOUT + HTTP_MARGIN;
     let key = d.s.next_untracked_key();
@@ -716,7 +778,7 @@ pub fn run_quiesce(d: &Driver, client: usize, deadline: Instant, plan: &QuiesceP
         if room < Duration::from_millis(500) {
             break;
         }
-        let attempt = QUIESCE_WRITE_TIMEOUT.min(room.saturating_sub(HTTP_MARGIN).max(Duration::from_millis(200)));
+        let attempt = quiesce_write_attempt(room, QUIESCE_WRITE_TRIES - k);
         let route = plan.write_routes.get(k).cloned().unwrap_or_else(|| Route::plain(client));
         let send = UntrackedSend {
             requests: vec![req.clone()],
@@ -759,8 +821,20 @@ pub fn run_quiesce(d: &Driver, client: usize, deadline: Instant, plan: &QuiesceP
             check_reachable!("quiescent linearizable read returned data", details);
         }
     }
-    check_sometimes!(rep.absence_checked && rep.read_done, "quiesce_and_absence completes within its quiet budget", json!({"report": format!("{rep:?}")}));
+    if !rep.read_done {
+        println!("driver: quiesce_and_absence: probe read skipped (write acked: {}, idle {}s)", rep.write_acked, plan.idle.as_secs());
+    }
+    check_sometimes!(rep.absence_checked && rep.read_done, "quiesce_and_absence completes within its quiet budget", json!({"report": format!("{rep:?}"), "idleSeconds": plan.idle.as_secs()}));
     rep
+}
+
+/// One write try's RPC deadline: an even share of `room` among the
+/// `tries_left`, within `[QUIESCE_MIN_WRITE_ATTEMPT, QUIESCE_WRITE_TIMEOUT]`,
+/// and never longer than the room (minus the HTTP margin) allows.
+pub fn quiesce_write_attempt(room: Duration, tries_left: usize) -> Duration {
+    let share = room / tries_left.max(1) as u32;
+    let fit = room.saturating_sub(HTTP_MARGIN).max(Duration::from_millis(200));
+    share.saturating_sub(HTTP_MARGIN).clamp(QUIESCE_MIN_WRITE_ATTEMPT, QUIESCE_WRITE_TIMEOUT).min(fit)
 }
 
 /// The probe read completed: success, or an error the 30 s deadline did not
@@ -813,15 +887,44 @@ pub const EC_PAGE_SIZE: u64 = 100;
 /// Fence attempts per ledger: the first read and up to 2 re-reads.
 pub const EC_FENCE_TRIES: usize = 3;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct EcPlan {
-    /// Indices into the listed accounts (modulo the count), drawn here.
-    pub samples: Vec<u32>,
+    /// Where the account sample starts (modulo the listed count).
+    pub base: u32,
+    /// One offset per sample inside its stride window (modulo the stride).
+    pub jitter: Vec<u32>,
+    /// Where the ledger walk starts (added to the resume cursor, modulo the
+    /// ledger count).
+    pub offset: u32,
 }
 
 fn plan_eventually_correct(_: &Driver, tc: &TestCase) -> HookPlan {
-    let samples = (0..EC_SAMPLES).map(|_| draw::ledger_pick(tc)).collect();
-    Box::new(EcPlan { samples })
+    let base = draw::ledger_pick(tc);
+    let jitter = (0..EC_SAMPLES).map(|_| draw::ledger_pick(tc)).collect();
+    let offset = draw::ledger_pick(tc);
+    Box::new(EcPlan { base, jitter, offset })
+}
+
+/// The sampled account indices among `n` listed accounts: every account when
+/// `n <= EC_SAMPLES`, else one index in each of `EC_SAMPLES` disjoint stride
+/// windows, rotated by `base`. The indices are distinct and spread over the
+/// whole listing however the draws are biased (hegel pushes wide integers
+/// toward 0, which would make `draw % n` pick the same account every time).
+pub fn sample_indices(plan: &EcPlan, n: usize) -> Vec<usize> {
+    if n <= EC_SAMPLES {
+        return (0..n).collect();
+    }
+    let stride = n / EC_SAMPLES;
+    (0..EC_SAMPLES).map(|i| (plan.base as usize % n + i * stride + plan.jitter.get(i).copied().unwrap_or(0) as usize % stride) % n).collect()
+}
+
+/// The ledger walk order: rotated to start at `start` (modulo the count).
+pub fn walk_order(names: &[String], start: u64) -> Vec<String> {
+    if names.is_empty() {
+        return Vec::new();
+    }
+    let k = (start % names.len() as u64) as usize;
+    names[k..].iter().chain(names[..k].iter()).cloned().collect()
 }
 
 fn run_eventually_correct_hook(d: &Driver, ctx: &mut QuietCtx, plan: &HookPlan) {
@@ -918,19 +1021,27 @@ pub fn run_eventually_correct(d: &Driver, client: usize, deadline: Instant, plan
         .filter_map(|l| l.get("name").and_then(Value::as_str).map(str::to_string))
         .collect();
     rep.ledgers = names.len();
+    // Rotate the walk (drawn offset + where the last walk stopped) so the
+    // tail of the listing is not skipped every time the deadline arrives.
+    let st = d.s.ext::<ProbeState>();
+    let cursor = st.ec_cursor.load(Ordering::SeqCst);
+    let order = walk_order(&names, plan.offset as u64 + cursor);
     let mut reached_all = true;
-    for name in &names {
+    let mut walked = 0u64;
+    for name in &order {
         if remaining(deadline) < Duration::from_secs(1) {
             // Ledgers not reached before the deadline get no verdict.
             reached_all = false;
             break;
         }
+        walked += 1;
         match check_ledger(d, client, deadline, name, plan) {
             LedgerCheck::Checked => rep.checked += 1,
             LedgerCheck::NotQuiescent => rep.not_quiescent += 1,
             LedgerCheck::Skipped => rep.skipped += 1,
         }
     }
+    st.ec_cursor.fetch_add(walked, Ordering::SeqCst);
     rep.completed = reached_all && Instant::now() <= deadline;
     check_sometimes!(rep.completed, "eventually_correct completes within its quiet budget", json!({"ledgers": rep.ledgers, "checked": rep.checked, "notQuiescent": rep.not_quiescent, "skipped": rep.skipped}));
     rep
@@ -979,8 +1090,7 @@ fn observe_ledger(d: &Driver, route: &Route, deadline: Instant, ledger: &str, pl
     if accounts.is_empty() {
         return Some(obs);
     }
-    let picked: BTreeSet<usize> = plan.samples.iter().map(|s| *s as usize % accounts.len()).collect();
-    for i in picked {
+    for i in sample_indices(plan, accounts.len()) {
         let listed = &accounts[i];
         let address = listed.get("address").and_then(Value::as_str).unwrap_or("").to_string();
         let timeout = call_timeout(deadline, Duration::from_secs(5))?;
@@ -1013,7 +1123,49 @@ pub fn sum_balances(ledger: &str, accounts: &[Value], sums: &mut BTreeMap<(Strin
                 sum.add(&b);
             }
         }
+        check_listed_volumes(ledger, account);
     }
+}
+
+/// Per listed volume (`MD/eventually_correct` `checkVolumesConsistentAttempt`,
+/// unfenced: each is a property of one response): the three fields are
+/// present, decode, and `balance == input - output`.
+pub fn check_listed_volumes(ledger: &str, account: &Value) {
+    let address = account.get("address").and_then(Value::as_str).unwrap_or("");
+    for entry in volume_entries(account) {
+        let (asset, color) = entry_key(entry);
+        let d = json!({"ledger": ledger, "account": address, "asset": asset, "color": color, "volume": entry});
+        let parsed = parse_volume_strict(entry);
+        let absent = matches!(parsed, Err(VolumeError::Absent { .. }));
+        check_always!(!absent, "cross-check: account volume has missing required fields", d);
+        if absent {
+            continue;
+        }
+        check_always!(parsed.is_ok(), "cross-check: account volume has invalid typed amount", d);
+        if let Ok((input, output, balance)) = parsed {
+            check_always!(volume_consistent(&input, &output, &balance), "listed account volume balance equals input minus output", d);
+        }
+    }
+}
+
+/// `balance == input - output`, exact at any width.
+pub fn volume_consistent(input: &BigUint, output: &BigUint, balance: &SignedBigInt) -> bool {
+    // input - output - balance == 0
+    let mut s = SignedSum::default();
+    s.add(&SignedBigInt { negative: false, magnitude: input.clone() });
+    s.add(&SignedBigInt { negative: true, magnitude: output.clone() });
+    s.add(&SignedBigInt { negative: !balance.negative, magnitude: balance.magnitude.clone() });
+    s.is_zero()
+}
+
+/// Whether a volume entry decodes with a non-zero input or output.
+fn volume_used(entry: &Value) -> bool {
+    parse_volume_strict(entry).is_ok_and(|(i, o, _)| !i.is_zero() || !o.is_zero())
+}
+
+/// `MetadataValue.GetStringValue()`: "" for any other type.
+fn metadata_string(v: &Value) -> &str {
+    v.get("stringValue").and_then(Value::as_str).unwrap_or("")
 }
 
 /// The per-(asset, color) balances of an account; entries whose balance
@@ -1044,6 +1196,18 @@ pub fn evaluate_ledger(ledger: &str, obs: &LedgerObs) {
         // on one side reads as a zero balance there (drained volumes may be
         // evicted).
         let (lb, gb) = (balances_of(listed), balances_of(got));
+        // A bucket that moved funds (non-zero input or output) must be on
+        // both sides (old `should get requested volumes`, now under the
+        // fence, both directions, and only for used buckets).
+        let entries = |a: &Value| volume_entries(a).into_iter().map(|e| (entry_key(e), e.clone())).collect::<BTreeMap<_, _>>();
+        let (le, ge) = (entries(listed), entries(got));
+        for (side, present, other) in [("getAccount", &le, &ge), ("listAccounts", &ge, &le)] {
+            for (k, e) in present {
+                if !other.contains_key(k) && volume_used(e) {
+                    check_unreachable!("list/get volume bucket missing on one side past quiescence", json!({"ledger": ledger, "account": address, "asset": k.0, "color": k.1, "missingFrom": side, "volume": e}));
+                }
+            }
+        }
         let keys: BTreeSet<&(String, String)> = lb.keys().chain(gb.keys()).collect();
         let zero = SignedBigInt::default();
         for k in keys {
@@ -1055,7 +1219,8 @@ pub fn evaluate_ledger(ledger: &str, obs: &LedgerObs) {
                 check_unreachable!("list/get balance divergence persisted past quiescence", details);
             }
         }
-        // Metadata: the whole map, typed values compared exactly.
+        // Metadata: the whole map. The old literal compares string values
+        // (`metadataToMap` used `GetStringValue()`); typed equality is new.
         let empty = serde_json::Map::new();
         let lm = listed.get("metadata").and_then(Value::as_object).unwrap_or(&empty);
         let gm = got.get("metadata").and_then(Value::as_object).unwrap_or(&empty);
@@ -1063,7 +1228,8 @@ pub fn evaluate_ledger(ledger: &str, obs: &LedgerObs) {
             let gv = gm.get(key);
             check_always_or_unreachable!(gv.is_some(), "list metadata key should exist in getaccount", json!({"ledger": ledger, "account": address, "key": key}));
             if let Some(gv) = gv {
-                check_always_or_unreachable!(lv == gv, "list metadata value should match getaccount", json!({"ledger": ledger, "account": address, "key": key, "listVal": lv, "getVal": gv}));
+                check_always_or_unreachable!(metadata_string(lv) == metadata_string(gv), "list metadata value should match getaccount", json!({"ledger": ledger, "account": address, "key": key, "listVal": lv, "getVal": gv}));
+                check_always_or_unreachable!(lv == gv, "list metadata typed value should match getaccount", json!({"ledger": ledger, "account": address, "key": key, "listVal": lv, "getVal": gv}));
             }
         }
         check_always_or_unreachable!(lm.len() == gm.len(), "metadata key count should match between list and get", json!({"ledger": ledger, "account": address, "listKeys": lm.len(), "getKeys": gm.len()}));
@@ -1211,10 +1377,10 @@ mod tests {
         let plan = StalePlan { iterations: vec![(r.clone(), r.clone()); 5] };
         let round = run_stale_round(&d, &plan, &fast());
         assert_eq!(round.iterations, 5);
-        let c = *d.s.ext::<ProbeState>().counters.lock().unwrap();
+        let c = d.s.ext::<ProbeState>().stale.lock().unwrap().get(0);
         // ok and our own reference conflict prove a commit; unknown,
         // non-definitive and a definitive refusal only count as attempted.
-        assert_eq!(c, StaleCounters { attempted: 5, acked: 2 });
+        assert_eq!(c, StaleCounters { attempted: 5, acked: 2, lost: 3 });
         // Exactly one attempt per increment, keyed, forced, unit, unique reference.
         let applies = ft.calls_of("bucket", "Apply");
         assert_eq!(applies.len(), 5);
@@ -1233,6 +1399,60 @@ mod tests {
             assert_eq!(g["request"]["address"], PROBE_ACCOUNT);
         }
         assert!(hits(&testkit::assertions(), "stale read of probe account succeeded").iter().any(|r| r.cond));
+    }
+
+    #[test]
+    fn attempted_is_counted_while_the_send_is_in_flight() {
+        let (d, ft, _) = testkit::driver();
+        ft.script("bucket", "Apply", vec![FakeReply::Delayed(Duration::from_millis(400), o(json!({"ok": true, "response": {}})))]);
+        let st = d.s.ext::<ProbeState>();
+        let seen = std::thread::scope(|sc| {
+            let watcher = sc.spawn(|| {
+                std::thread::sleep(Duration::from_millis(200));
+                st.stale.lock().unwrap().get(0)
+            });
+            let r = Route::plain(0);
+            let t = StaleTiming { attempt: Duration::from_millis(1000), read: Duration::from_millis(200), ..fast() };
+            run_stale_round(&d, &StalePlan { iterations: vec![(r.clone(), r)] }, &t);
+            watcher.join().unwrap()
+        });
+        // Mid-send: attempted already counted, nothing acked yet.
+        assert_eq!(seen, StaleCounters { attempted: 1, acked: 0, lost: 0 });
+        assert_eq!(st.stale.lock().unwrap().get(0), StaleCounters { attempted: 1, acked: 1, lost: 0 });
+    }
+
+    #[test]
+    fn stale_epochs_rotate_after_lost_increments() {
+        let mut b = StaleBook::default();
+        for _ in 0..STALE_EPOCH_MAX_LOST {
+            let e = b.begin();
+            assert_eq!(e, 0);
+            b.finish(e, false);
+        }
+        // An in-flight increment of epoch 0 still finishes on epoch 0.
+        b.finish(0, true);
+        assert_eq!(b.begin(), 1, "a fresh account once epoch 0 lost too many");
+        assert_eq!(b.get(0), StaleCounters { attempted: STALE_EPOCH_MAX_LOST, acked: 1, lost: STALE_EPOCH_MAX_LOST });
+        assert_eq!(b.get(1), StaleCounters { attempted: 1, acked: 0, lost: 0 });
+        assert_eq!(probe_account(0), "probe:main");
+        assert_eq!(probe_account(3), "probe:main-3");
+
+        // Over the driver: the reads follow the epoch's account, and the bound uses its counters.
+        let (d, ft, _) = testkit::driver();
+        testkit::reset();
+        ft.set_default("bucket", "Apply", FakeReply::Outcome(Outcome::unknown("timeout")));
+        let r = Route::plain(0);
+        let plan = StalePlan { iterations: vec![(r.clone(), r.clone()); 5] };
+        run_stale_round(&d, &plan, &fast());
+        ft.set_default("bucket", "Apply", FakeReply::Outcome(o(json!({"ok": true, "response": {}}))));
+        ft.set_default("bucket", "GetAccount", FakeReply::Outcome(o(json!({"ok": true, "response": account("probe:main-1", vec![vol(PROBE_ASSET, "", 2, 0)], json!({}))}))));
+        run_stale_round(&d, &StalePlan { iterations: vec![(r.clone(), r.clone()); 1] }, &fast());
+        let dests: Vec<Value> = ft.calls_of("bucket", "Apply").iter().map(|a| a["request"]["unsigned"]["requests"][0]["apply"]["action"]["createTransaction"]["postings"][0]["destination"].clone()).collect();
+        assert_eq!(dests[..5], vec![json!("probe:main"); 5][..]);
+        assert_eq!(dests[5], "probe:main-1");
+        assert_eq!(ft.calls_of("bucket", "GetAccount").last().unwrap()["request"]["address"], "probe:main-1");
+        // Balance 2 against epoch 1's single attempt: over the bound (epoch 0's 5 attempts do not count).
+        assert!(hits(&testkit::assertions(), "stale read balance stays within attempted write bounds").iter().any(|r| !r.cond));
     }
 
     #[test]
@@ -1513,7 +1733,7 @@ mod tests {
         ft.script("bucket", "Barrier", b);
         ft.set_default("bucket", "GetLedgerStats", FakeReply::Outcome(o(json!({"ok": true, "response": {"transactionCount": "1", "logCount": "2"}}))));
         ft.set_default("bucket", "AggregateVolumes", FakeReply::Outcome(o(json!({"ok": true, "response": {"volumes": [{"asset": "USD/2", "input": {"v0": "10"}, "output": {"v0": "10"}}]}}))));
-        let rep = run_eventually_correct(&d, 0, Instant::now() + Duration::from_secs(20), &EcPlan { samples: vec![0, 1, 2, 3] });
+        let rep = run_eventually_correct(&d, 0, Instant::now() + Duration::from_secs(20), &EcPlan::default());
         assert_eq!((rep.ledgers, rep.checked), (2, 2), "{rep:?}");
         assert!(rep.completed);
         let a = testkit::assertions();
@@ -1538,7 +1758,7 @@ mod tests {
         ft.set_default("bucket", "GetAccount", FakeReply::Outcome(o(json!({"ok": true, "response": got}))));
         // Never quiescent: no verdict on the observation.
         ft.script("bucket", "Barrier", barrier_replies(1, &[2, 0, 2, 0, 2]));
-        let plan = EcPlan { samples: vec![7] };
+        let plan = EcPlan { base: 7, ..Default::default() };
         let rep = run_eventually_correct(&d, 0, Instant::now() + Duration::from_secs(20), &plan);
         assert_eq!(rep.not_quiescent, 1);
         let a = testkit::assertions();
@@ -1565,7 +1785,7 @@ mod tests {
         ft.script("bucket", "ListLedgers", vec![ok_items(vec![json!({"name": "l"})])]);
         ft.set_default("bucket", "ListAccounts", FakeReply::Outcome(o(json!({"ok": false, "code": "Internal", "message": "x"}))));
         ft.set_default("bucket", "AggregateVolumes", FakeReply::Outcome(o(json!({"ok": false, "code": "Internal", "message": "x"}))));
-        run_eventually_correct(&d, 0, Instant::now() + Duration::from_secs(20), &EcPlan { samples: vec![0] });
+        run_eventually_correct(&d, 0, Instant::now() + Duration::from_secs(20), &EcPlan::default());
         let a = testkit::assertions();
         assert_eq!(hits(&a, "listAccounts returned unexpected error").len(), 1);
         assert_eq!(hits(&a, "AggregateVolumes returned unexpected error").len(), 1);
@@ -1573,13 +1793,109 @@ mod tests {
         testkit::reset();
         ft.script("bucket", "ListLedgers", vec![ok_items(vec![json!({"name": "l"})])]);
         ft.script("bucket", "GetLedgerStats", vec![FakeReply::Outcome(o(json!({"ok": false, "code": "NotFound", "reason": "LEDGER_NOT_FOUND"})))]);
-        let rep = run_eventually_correct(&d, 0, Instant::now() + Duration::from_secs(20), &EcPlan { samples: vec![0] });
+        let rep = run_eventually_correct(&d, 0, Instant::now() + Duration::from_secs(20), &EcPlan::default());
         assert_eq!(rep.skipped, 1);
         // A deadline already passed: no verdict, incompletion is reported.
         testkit::reset();
-        let rep = run_eventually_correct(&d, 0, Instant::now(), &EcPlan { samples: vec![0] });
+        let rep = run_eventually_correct(&d, 0, Instant::now(), &EcPlan::default());
         assert!(!rep.completed);
         assert!(hits(&testkit::assertions(), "eventually_correct completes within its quiet budget").iter().all(|r| !r.cond));
+    }
+
+    #[test]
+    fn listed_volumes_are_self_consistent() {
+        testkit::reset();
+        let ok = account("a", vec![vol("USD/2", "", 10, 3), vol("COIN", "RED", 0, 0)], json!({}));
+        check_listed_volumes("l", &ok);
+        let a = testkit::assertions();
+        assert_eq!(hits(&a, "listed account volume balance equals input minus output").len(), 2);
+        assert!(a.iter().all(|r| r.cond));
+        testkit::reset();
+        let bad = json!({"address": "a", "volumes": [
+            {"asset": "USD/2", "volumes": {"input": mag(10), "output": mag(3), "balance": signed(8)}},
+            {"asset": "EUR/2", "volumes": {"input": mag(1), "balance": signed(1)}},
+            {"asset": "COIN", "volumes": {"input": {"magnitude": "%%"}, "output": {}, "balance": {}}},
+        ]});
+        // The check runs on every listed account, unfenced, from sum_balances.
+        sum_balances("l", &[bad], &mut BTreeMap::new());
+        let a = testkit::assertions();
+        assert_eq!(hits(&a, "listed account volume balance equals input minus output").iter().filter(|r| !r.cond).count(), 1);
+        assert_eq!(hits(&a, "cross-check: account volume has missing required fields").iter().filter(|r| !r.cond).count(), 1);
+        assert_eq!(hits(&a, "cross-check: account volume has invalid typed amount").iter().filter(|r| !r.cond).count(), 1);
+        // Exact beyond 128 bits.
+        let mut b = vec![0u8; 33];
+        b[0] = 1;
+        let big = BigUint::from_be(&b);
+        assert!(volume_consistent(&big, &BigUint::default(), &SignedBigInt { negative: false, magnitude: big.clone() }));
+        assert!(volume_consistent(&BigUint::default(), &big, &SignedBigInt { negative: true, magnitude: big.clone() }));
+        assert!(!volume_consistent(&big, &BigUint::default(), &SignedBigInt { negative: true, magnitude: big.clone() }));
+    }
+
+    #[test]
+    fn samples_are_distinct_and_spread_and_the_walk_rotates() {
+        let p = EcPlan::default();
+        assert_eq!(sample_indices(&p, 0), Vec::<usize>::new());
+        assert_eq!(sample_indices(&p, 7), (0..7).collect::<Vec<_>>());
+        // All-zero draws (hegel's bias) still spread over the listing.
+        let s = sample_indices(&p, 1000);
+        assert_eq!(s, (0..20).map(|i| i * 50).collect::<Vec<_>>());
+        for (n, base, j) in [(21usize, 5u32, u32::MAX), (1000, u32::MAX, 7), (4099, 123_456, 999), (40, 39, 1)] {
+            let p = EcPlan { base, jitter: (0..EC_SAMPLES as u32).map(|i| j.wrapping_mul(i + 1)).collect(), offset: 0 };
+            let s = sample_indices(&p, n);
+            assert_eq!(s.len(), EC_SAMPLES);
+            assert!(s.iter().all(|i| *i < n));
+            assert_eq!(s.iter().collect::<BTreeSet<_>>().len(), EC_SAMPLES, "{n} {base}: {s:?}");
+        }
+        let names: Vec<String> = ["a", "b", "c"].iter().map(|x| x.to_string()).collect();
+        assert_eq!(walk_order(&names, 0), names);
+        assert_eq!(walk_order(&names, 4), vec!["b", "c", "a"]);
+        assert!(walk_order(&[], 3).is_empty());
+    }
+
+    #[test]
+    fn eventually_correct_resumes_where_the_last_walk_stopped() {
+        let (d, ft, _) = testkit::driver();
+        let ledgers = ok_items(vec![json!({"name": "l0"}), json!({"name": "l1"}), json!({"name": "l2"})]);
+        ft.set_default("bucket", "ListLedgers", ledgers);
+        ft.set_default("bucket", "ListAccounts", ok_items(vec![]));
+        // Every Barrier answers 1: never quiescent, each ledger costs its fence tries.
+        ft.set_default("bucket", "Barrier", FakeReply::Outcome(o(json!({"ok": true, "response": {"commitIndex": "1"}}))));
+        let first_stats = |ft: &testkit::FakeTransport| ft.calls_of("bucket", "GetLedgerStats").first().map(|c| c["request"]["ledger"].clone());
+        run_eventually_correct(&d, 0, Instant::now() + Duration::from_secs(20), &EcPlan { offset: 1, ..Default::default() });
+        assert_eq!(first_stats(&ft), Some(json!("l1")), "the drawn offset rotates the walk");
+        // A walk resumes at the cursor left by earlier walks.
+        let (d2, ft2, _) = testkit::driver();
+        ft2.set_default("bucket", "ListLedgers", ok_items(vec![json!({"name": "l0"}), json!({"name": "l1"}), json!({"name": "l2"})]));
+        d2.s.ext::<ProbeState>().ec_cursor.store(2, Ordering::SeqCst);
+        run_eventually_correct(&d2, 0, Instant::now() + Duration::from_secs(20), &EcPlan::default());
+        assert_eq!(first_stats(&ft2), Some(json!("l2")), "resumes at the cursor");
+        assert_eq!(d2.s.ext::<ProbeState>().ec_cursor.load(Ordering::SeqCst), 5);
+    }
+
+    #[test]
+    fn metadata_and_missing_buckets_under_quiescence() {
+        testkit::reset();
+        // Typed values differ, string values (both "") agree: only the new literal fails.
+        let listed = account("users:1", vec![vol("USD/2", "", 10, 0), vol("EUR/2", "", 0, 0), vol("COIN", "", 4, 4)], json!({"n": {"int64Value": "1"}}));
+        let got = account("users:1", vec![vol("USD/2", "", 10, 0)], json!({"n": {"uint64Value": "1"}}));
+        let obs = LedgerObs { accounts: 1, pairs: vec![(listed, got)], ..Default::default() };
+        evaluate_ledger("l", &obs);
+        let a = testkit::assertions();
+        assert!(hits(&a, "list metadata value should match getaccount").iter().all(|r| r.cond));
+        assert!(hits(&a, "list metadata typed value should match getaccount").iter().any(|r| !r.cond));
+        // COIN moved funds (4 in, 4 out, balance 0) and is missing from GetAccount; the unused EUR/2 bucket is not flagged.
+        let m = hits(&a, "list/get volume bucket missing on one side past quiescence");
+        assert_eq!(m.len(), 1, "{m:?}");
+        assert_eq!(m[0].details["asset"], "COIN");
+        assert_eq!(m[0].details["missingFrom"], "getAccount");
+        assert!(hits(&a, "list/get balance divergence persisted past quiescence").is_empty());
+        // The other direction.
+        testkit::reset();
+        let listed = account("users:1", vec![], json!({}));
+        let got = account("users:1", vec![vol("COIN", "", 1, 1)], json!({}));
+        evaluate_ledger("l", &LedgerObs { accounts: 1, pairs: vec![(listed, got)], ..Default::default() });
+        let m = hits(&testkit::assertions(), "list/get volume bucket missing on one side past quiescence").into_iter().map(|r| r.details["missingFrom"].clone()).collect::<Vec<_>>();
+        assert_eq!(m, vec![json!("listAccounts")]);
     }
 
     #[test]
@@ -1596,7 +1912,9 @@ mod tests {
         let applies = ft.calls_of("bucket", "Apply");
         assert_eq!(applies.len(), 2);
         assert_eq!(applies[0]["request"], applies[1]["request"], "same key and bytes on every try");
-        assert_eq!(applies[0]["timeoutMs"], 8000);
+        // The room (45 s - idle - 31.5 s) is shared among the 3 tries.
+        let t0 = applies[0]["timeoutMs"].as_u64().unwrap();
+        assert!((2000..=3000).contains(&t0), "{t0}");
         let ct = &applies[0]["request"]["unsigned"]["requests"][0]["apply"]["action"]["createTransaction"];
         assert_eq!(ct["force"], true);
         assert_eq!(ct["postings"][0]["destination"], "users:3");
@@ -1659,7 +1977,7 @@ mod tests {
         ft.set_default("bucket", "ListTransactions", ok_items(vec![]));
         let hooks = quiet_hooks();
         let ec = hooks.iter().find(|h| h.name == "eventually_correct").unwrap();
-        crate::quiet::run_quiet(&d, Some(ec), Some(Box::new(EcPlan { samples: vec![1] })));
+        crate::quiet::run_quiet(&d, Some(ec), Some(Box::new(EcPlan::default())));
         let qa = hooks.iter().find(|h| h.name == "quiesce_and_absence").unwrap();
         let plan = QuiescePlan { dest: "users:0".into(), amount: 1, idle: Duration::ZERO, write_routes: vec![Route::plain(0)], backoffs_ms: vec![1] };
         crate::quiet::run_quiet(&d, Some(qa), Some(Box::new(plan)));
@@ -1682,8 +2000,19 @@ mod tests {
         assert_eq!((qa.budget, ec.budget), (Duration::from_secs(45), Duration::from_secs(90)));
         assert!(!qa.needs_oracle && !ec.needs_oracle);
         assert!(crate::rules::setup_hooks().iter().any(|h| h.name == "probes_setup"));
-        // Absence listing + one 8 s write try + the longest idle + the read fit the budget.
-        assert!(ABSENCE_BUDGET + QUIESCE_WRITE_TIMEOUT + HTTP_MARGIN + Duration::from_secs(8) + QUIESCE_READ_TIMEOUT + HTTP_MARGIN <= qa.budget + Duration::from_secs(15));
+        // The hook's deadline is its budget. A fast absence listing (1 s) +
+        // one minimal write try + the longest idle + the read fit it; a
+        // slower listing or longer tries shrink the write tries instead (a
+        // full 8 s listing with an 8 s idle leaves no room for a write).
+        let tail = Duration::from_secs(*QUIESCE_IDLE_SECS.iter().max().unwrap()) + QUIESCE_READ_TIMEOUT + HTTP_MARGIN;
+        assert!(Duration::from_secs(1) + QUIESCE_MIN_WRITE_ATTEMPT + HTTP_MARGIN + tail <= qa.budget);
+        assert!(ABSENCE_BUDGET + QUIESCE_MIN_WRITE_ATTEMPT + HTTP_MARGIN + tail > qa.budget, "documented: the worst case does not fit");
+        // Write tries share the room.
+        assert_eq!(quiesce_write_attempt(Duration::from_secs(30), 3), QUIESCE_WRITE_TIMEOUT);
+        assert_eq!(quiesce_write_attempt(Duration::from_millis(13_500), 3), Duration::from_millis(3000));
+        assert_eq!(quiesce_write_attempt(Duration::from_secs(5), 3), QUIESCE_MIN_WRITE_ATTEMPT);
+        assert_eq!(quiesce_write_attempt(Duration::from_secs(3), 1), Duration::from_millis(1500));
+        assert_eq!(quiesce_write_attempt(Duration::from_millis(600), 2), Duration::from_millis(200));
     }
 
     #[test]
@@ -1697,7 +2026,7 @@ mod tests {
             assert!(p.dest.starts_with("users:") && !p.dest.contains("own-"));
             assert_eq!(p.write_routes.len(), QUIESCE_WRITE_TRIES);
             let e = plan_eventually_correct(&d, tc);
-            assert_eq!(e.downcast_ref::<EcPlan>().unwrap().samples.len(), EC_SAMPLES);
+            assert_eq!(e.downcast_ref::<EcPlan>().unwrap().jitter.len(), EC_SAMPLES);
         });
         for n in [probe_ledger(&d.s), bad_ledger(&d.s)] {
             assert!(n.starts_with("r-"), "{n}: foreign to the oracle");
