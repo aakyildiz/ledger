@@ -1,0 +1,41 @@
+{
+  "name": "99-checkpoint-limit-reached (09's shape; needs the model at the server's limit 10)",
+  "setup": [
+    {
+      "createQueryCheckpoint": {}
+    },
+    {
+      "createQueryCheckpoint": {}
+    },
+    {
+      "createQueryCheckpoint": {}
+    },
+    {
+      "createQueryCheckpoint": {}
+    },
+    {
+      "createQueryCheckpoint": {}
+    },
+    {
+      "createQueryCheckpoint": {}
+    },
+    {
+      "createQueryCheckpoint": {}
+    },
+    {
+      "createQueryCheckpoint": {}
+    },
+    {
+      "createQueryCheckpoint": {}
+    },
+    {
+      "createQueryCheckpoint": {}
+    }
+  ],
+  "requests": [
+    {
+      "createQueryCheckpoint": {}
+    }
+  ],
+  "expectReason": "CHECKPOINT_LIMIT_REACHED"
+}

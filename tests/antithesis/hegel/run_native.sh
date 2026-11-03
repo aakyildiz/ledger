@@ -115,6 +115,7 @@ DRIVER_ENV=(
   LEDGER_NODES="${LEDGER_NODES:-localhost:$GRPC_PORT}"
   ORACLE_URL="http://127.0.0.1:$ORACLE_PORT"
   QUERY_CHECKPOINT_LIMIT=10
+  HEGEL_HAVE_CHECKPOINTS=1
   QUIET_PROBABILITY="${QUIET_PROBABILITY:-0.02}"
   ANTITHESIS_SDK_LOCAL_OUTPUT="$TMP/sdk.jsonl"
   WORKLOAD_ACTIVE_FILE="$TMP/workload-active"
@@ -185,6 +186,20 @@ for m in re.finditer(r'check_sometimes!\(\s*[^"]*?"([^"]+)"', src):
     if "leader" in m.group(1):
         whitelist.add(m.group(1))
 
+# Every porting file's reachability table: literal -> its "Needs" cell, so a
+# never-hit must-hit is printed with its classification (faults, knobs, ≥ 2
+# nodes, …). Only the foundation's fault-only rows are whitelisted above.
+needs_of = {}
+for path in sorted(glob.glob(os.path.join(porting, "*.md"))):
+    for line in open(path, encoding="utf-8"):
+        if not line.lstrip().startswith("|"):
+            continue
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        if len(cells) < 2 or set(cells[0]) <= set("-: "):
+            continue
+        for lit in re.findall(r"`([^`]+)`", cells[0]) or [re.sub(r"\s*\((Sometimes|Always|Reachable|AlwaysOrUnreachable)\)$", "", cells[0])]:
+            needs_of.setdefault(lit.strip(), f"{cells[-1]} ({os.path.basename(path)})")
+
 asserts = {}  # message -> dict
 failures = []
 for path in sorted(glob.glob(os.path.join(tmp, "sdk*.jsonl"))):
@@ -254,7 +269,7 @@ print(f"  journal: {jpath}")
 for m in whitelisted:
     print(f"  never hit (whitelisted): {m}")
 for m in never:
-    print(f"  NEVER HIT: {m} [{asserts[m]['display']}, {asserts[m]['src']}]")
+    print(f"  NEVER HIT: {m} [{asserts[m]['display']}, {asserts[m]['src']}] needs: {needs_of.get(m, '?')[:160]}")
 for f in failures[:50]:
     print(f"  FAILING [{f[0]}] {f[1]}: {f[2]} {f[3]}")
 status = 0

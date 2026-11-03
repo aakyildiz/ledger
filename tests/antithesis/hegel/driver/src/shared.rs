@@ -227,6 +227,9 @@ pub struct Shared {
 
     // quiet / exclusive timing
     pub last_quiet_end: Mutex<Instant>,
+    /// A quiet period is running (Q0 to its end, however it ends; set by
+    /// `quiet::run_quiet`). For job threads (task 12's request to 99).
+    pub quiet_open: AtomicBool,
     pub last_exclusive_end: Mutex<Instant>,
     pub quiets_since_exact: AtomicU64,
 
@@ -269,6 +272,7 @@ impl Shared {
             maint: Mutex::new(MaintState::Closed),
             backlog_until: Mutex::new(None),
             last_quiet_end: Mutex::new(Instant::now()),
+            quiet_open: AtomicBool::new(false),
             last_exclusive_end: Mutex::new(Instant::now()),
             quiets_since_exact: AtomicU64::new(0),
             acked_seq_high_water: acked,
@@ -306,6 +310,10 @@ impl Shared {
 
     pub fn maint_closed(&self) -> bool {
         *self.maint.lock().unwrap_or_else(|e| e.into_inner()) == MaintState::Closed
+    }
+
+    pub fn quiet_open(&self) -> bool {
+        self.quiet_open.load(Ordering::SeqCst)
     }
 
     pub fn signatures_required(&self) -> bool {

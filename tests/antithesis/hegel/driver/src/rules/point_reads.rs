@@ -9,6 +9,7 @@
 //! views (the aggregate's metadata key, the GetLog sequence).
 use crate::clients::{CallOpts, Outcome};
 use crate::draw;
+use crate::rules::filters;
 use crate::machine::{rule, Driver};
 use crate::read::{LedgerSel, ViewReq};
 use crate::shared::Shared;
@@ -191,93 +192,13 @@ pub fn get_transaction(d: &Driver, tc: TestCase) {
 
 // ---------------------------------------------------------------- AggregateVolumes
 
-/// A pre-drawn accounts filter. `MetaExists` resolves its key after
-/// `/read/begin` from the ledger view's declared account field types (an
-/// index draw), falling back to its pre-drawn model key `k0..k3`.
-///
-/// Local minimal builder (address prefix/exact, metadata exists); task 06
-/// owns the full filter generator and task 99 may dedupe.
-#[derive(Clone, Debug, PartialEq)]
-pub enum Shape {
-    Prefix(String, &'static str),
-    Exact(String, &'static str),
-    MetaExists(String),
-    And(Vec<Shape>),
-    Or(Vec<Shape>),
-    Not(Box<Shape>),
-}
-
-const MAX_FILTER_DEPTH: usize = 2;
-const ROLES: [&str; 3] = ["ADDRESS_ROLE_ANY", "ADDRESS_ROLE_SOURCE", "ADDRESS_ROLE_DESTINATION"];
-
 fn pool_prefix(tc: &TestCase) -> String {
     format!("t-{}:", draw::int_in(tc, 0, 24))
-}
-
-fn free_leaf(tc: &TestCase) -> Shape {
-    let role = *draw::one_of(tc, &ROLES);
-    if draw::chance(tc, 0.5) {
-        Shape::Prefix(pool_prefix(tc), role)
-    } else {
-        Shape::Exact(draw::pool_address(tc), role)
-    }
-}
-
-fn boolean(tc: &TestCase, depth: usize, child: fn(&TestCase, usize) -> Shape) -> Shape {
-    match draw::int_in(tc, 0, 2) {
-        0 => Shape::And((0..draw::int_in(tc, 2, 3)).map(|_| child(tc, depth + 1)).collect()),
-        1 => Shape::Or((0..draw::int_in(tc, 2, 3)).map(|_| child(tc, depth + 1)).collect()),
-        _ => Shape::Not(Box::new(child(tc, depth + 1))),
-    }
-}
-
-/// An index-free accounts filter (address leaves and their compositions).
-pub fn gen_free(tc: &TestCase, depth: usize) -> Shape {
-    if depth >= MAX_FILTER_DEPTH || draw::chance(tc, 0.5) {
-        free_leaf(tc)
-    } else {
-        boolean(tc, depth, gen_free)
-    }
-}
-
-/// An accounts filter that usually reads a metadata index.
-pub fn gen_indexed(tc: &TestCase, depth: usize) -> Shape {
-    if depth >= MAX_FILTER_DEPTH || draw::chance(tc, 0.5) {
-        if draw::chance(tc, 2.0 / 3.0) {
-            Shape::MetaExists(draw::meta_key_model(tc))
-        } else {
-            free_leaf(tc)
-        }
-    } else {
-        boolean(tc, depth, gen_indexed)
-    }
-}
-
-/// Renders a shape as `common.QueryFilter` protojson; `keys` are the ledger
-/// view's declared account field keys (reserved keys already hidden).
-pub fn resolve(shape: &Shape, keys: &[String], tc: &TestCase) -> Value {
-    match shape {
-        Shape::Prefix(p, role) => json!({"address": {"hardcodedPrefix": p, "role": role}}),
-        Shape::Exact(a, role) => json!({"address": {"hardcodedExact": a, "role": role}}),
-        Shape::MetaExists(fallback) => {
-            let key = if keys.is_empty() { fallback.clone() } else { keys[draw::pick(tc, keys.len())].clone() };
-            json!({"field": {"field": {"metadata": key}, "existsCond": {}}})
-        }
-        Shape::And(cs) => json!({"and": {"filters": cs.iter().map(|c| resolve(c, keys, tc)).collect::<Vec<_>>()}}),
-        Shape::Or(cs) => json!({"or": {"filters": cs.iter().map(|c| resolve(c, keys, tc)).collect::<Vec<_>>()}}),
-        Shape::Not(c) => json!({"not": {"filter": resolve(c, keys, tc)}}),
-    }
 }
 
 /// 1–3 grouping prefixes from the pool, sometimes `no-such-prefix:`.
 pub fn gen_group_prefixes(tc: &TestCase) -> Vec<String> {
     (0..draw::int_in(tc, 1, 3)).map(|_| if draw::chance(tc, 0.25) { "no-such-prefix:".to_string() } else { pool_prefix(tc) }).collect()
-}
-
-fn account_field_keys(ledger_view: &Value) -> Vec<String> {
-    let mut keys: Vec<String> = ledger_view.pointer("/fieldTypes/account").and_then(Value::as_object).map(|m| m.keys().cloned().collect()).unwrap_or_default();
-    keys.sort();
-    keys
 }
 
 pub fn aggregate(d: &Driver, tc: TestCase) {
@@ -289,9 +210,12 @@ pub fn aggregate(d: &Driver, tc: TestCase) {
         let route = draw::route(tc, &d.s);
         let (absent, sel) = draw_target(d, tc, pick);
         // Filter class: nil 1/6, free 1/2, indexed 1/3.
+        // Task 06's generators (M/queries.go genAccountFilterIndexed /
+        // genAccountFilterFree): typed Field leaves on declared keys, has-asset
+        // leaves and address leaves; the local minimal builder was deduped by 99.
         let shape = match draw::weighted(tc, &[1.0 / 6.0, 0.5, 1.0 / 3.0]) {
-            Some(1) => Some(gen_free(tc, 0)),
-            Some(2) => Some(gen_indexed(tc, 0)),
+            Some(1) => Some(filters::gen_account_filter_free(tc)),
+            Some(2) => Some(filters::gen_account_filter_indexed(tc)),
             _ => None,
         };
         let collapse = draw::chance(tc, 1.0 / 3.0);
@@ -304,10 +228,10 @@ pub fn aggregate(d: &Driver, tc: TestCase) {
         let rt = d.read_begin("AggregateVolumes", &[including_deleted(ViewReq::ledger(sel.clone()), &sel)], json!({}))?;
         let view = rt.views().first()?.clone();
         let ledger = resolved_ledger(&view)?;
-        let keys = account_field_keys(&view);
+        let ctx = filters::FilterCtx::from_views(&view, None, None);
         let mut req = json!({"ledger": ledger, "collapseColors": collapse, "useMaxPrecision": max_precision, "groupByPrefixes": prefixes});
-        if let Some(s) = &shape {
-            req["filter"] = resolve(s, &keys, tc);
+        if let Some(f) = shape.as_ref().and_then(|s| s.resolve(&ctx)) {
+            req["filter"] = f;
         }
         let opts = CallOpts::linearizable();
         let (_, out) = d.call(&route, "bucket", "AggregateVolumes", req.clone(), &opts);
@@ -449,7 +373,6 @@ mod tests {
     fn walk(f: &Value, visit: &mut impl FnMut(&Value)) {
         visit(f);
         if let Some(cs) = f.pointer("/and/filters").or_else(|| f.pointer("/or/filters")).and_then(Value::as_array) {
-            assert!(!cs.is_empty());
             cs.iter().for_each(|c| walk(c, visit));
         }
         if let Some(c) = f.pointer("/not/filter") {
@@ -459,17 +382,22 @@ mod tests {
 
     #[test]
     fn filters_never_name_reserved_entities_and_render_valid_shapes() {
-        let keys = vec!["k1".to_string(), "status".to_string()];
+        // Task 06's account generators (deduped by 99): never a reserved name,
+        // never a transactions-only leaf, and Field leaves aim at declared keys.
+        let view = json!({"name": "o-test-l1", "fieldTypes": {"account": {"k1": "METADATA_TYPE_STRING", "status": "METADATA_TYPE_INT64"}}});
+        let ctx = filters::FilterCtx::from_views(&view, None, None);
+        let declared = std::sync::Mutex::new(0usize);
         testkit::with_tc_n(300, |tc| {
-            for shape in [gen_free(tc, 0), gen_indexed(tc, 0)] {
-                let f = resolve(&shape, &keys, tc);
+            for plan in [filters::gen_account_filter_free(tc), filters::gen_account_filter_indexed(tc)] {
+                let Some(f) = plan.resolve(&ctx) else { continue };
                 let text = f.to_string();
                 assert!(!text.contains("own-") && !text.contains("o-test-own"), "{text}");
                 walk(&f, &mut |n| {
-                    let arms = ["address", "field", "and", "or", "not"].iter().filter(|a| n.get(**a).is_some()).count();
-                    assert_eq!(arms, 1, "{n}");
+                    assert!(n.get("reverted").is_none() && n.get("builtinUint").is_none(), "no transactions-only leaf: {n}");
                     if let Some(k) = n.pointer("/field/field/metadata").and_then(Value::as_str) {
-                        assert!(keys.contains(&k.to_string()), "{k}");
+                        if k == "k1" || k == "status" {
+                            *declared.lock().unwrap() += 1;
+                        }
                     }
                 });
             }
@@ -477,11 +405,7 @@ mod tests {
                 assert!(p == "no-such-prefix:" || (p.starts_with("t-") && p.ends_with(':')), "{p}");
             }
         });
-        // Without declared keys, the pre-drawn model key is used.
-        testkit::with_tc_n(1, |tc| {
-            let f = resolve(&Shape::MetaExists("k2".into()), &[], tc);
-            assert_eq!(f, json!({"field": {"field": {"metadata": "k2"}, "existsCond": {}}}));
-        });
+        assert!(*declared.lock().unwrap() > 0, "typed leaves reach the declared keys");
     }
 
     fn ok(v: Value) -> FakeReply {

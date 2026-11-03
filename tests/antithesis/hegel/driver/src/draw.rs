@@ -39,22 +39,29 @@ pub fn chance(tc: &TestCase, p: f64) -> bool {
 
 /// A weighted choice: an index whose weight is > 0, or `None` when no
 /// weight is positive. A weight of 0 is never chosen.
+///
+/// Weights are rounded to integer units of 1/20 (a positive weight gets at
+/// least one unit) and the unit is drawn with `pick` over the small total.
+/// A draw over a 32-bit range (the first version) is biased by hegel towards
+/// 0, so the first positive weight won almost every draw (porting reports of
+/// tasks 03, 04 and 14); a small-range `pick` is uniform in practice.
 pub fn weighted(tc: &TestCase, weights: &[f64]) -> Option<usize> {
-    let pos: Vec<usize> = (0..weights.len()).filter(|&i| weights[i] > 0.0 && weights[i].is_finite()).collect();
+    const UNITS: f64 = 20.0;
+    let units: Vec<usize> =
+        weights.iter().map(|&w| if w > 0.0 && w.is_finite() { ((w * UNITS).round() as usize).max(1) } else { 0 }).collect();
+    let pos: Vec<usize> = (0..units.len()).filter(|&i| units[i] > 0).collect();
     match pos.len() {
         0 => return None,
         1 => return Some(pos[0]),
         _ => {}
     }
-    let total: f64 = pos.iter().map(|&i| weights[i]).sum();
-    const SCALE: u64 = 1 << 32;
-    let r = int_in(tc, 0, SCALE - 1) as f64 / SCALE as f64 * total;
-    let mut acc = 0.0;
+    let total: usize = units.iter().sum();
+    let mut r = pick(tc, total);
     for &i in &pos {
-        acc += weights[i];
-        if r < acc {
+        if r < units[i] {
             return Some(i);
         }
+        r -= units[i];
     }
     pos.last().copied()
 }
@@ -304,5 +311,21 @@ mod tests {
             assert_eq!(weighted(tc, &[]), None);
             assert_eq!(weighted(tc, &[0.0, 2.0]), Some(1));
         });
+    }
+
+    #[test]
+    fn weighted_follows_the_weights() {
+        // The quiet-hook table (exact 4, the Rust flavours 1/1/0.5/1/1/0.5):
+        // the first weight must not win almost every draw.
+        let counts = std::sync::Mutex::new([0usize; 7]);
+        testkit::with_tc_n(3000, |tc| {
+            counts.lock().unwrap()[weighted(tc, &[4.0, 1.0, 1.0, 0.5, 1.0, 1.0, 0.5]).unwrap()] += 1;
+        });
+        let c = *counts.lock().unwrap();
+        // Expected 1333 / 333 / 333 / 167 / 333 / 333 / 167 of 3000.
+        assert!(c[0] < 2000 && c[0] > 800, "{c:?}");
+        assert!(c.iter().all(|n| *n > 60), "{c:?}");
+        // A tiny positive weight still gets a unit.
+        testkit::with_tc_n(50, |tc| assert!(weighted(tc, &[0.001, 0.0]) == Some(0)));
     }
 }

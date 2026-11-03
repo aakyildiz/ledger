@@ -121,7 +121,10 @@ func TestRejectionStages(t *testing.T) {
 			require.NotEmpty(t, reqs)
 
 			ctx, client := singleNodeServer(t, "oracle-rejections")
-			model := oracle.NewGlobalState()
+			// The in-process server runs with the default query-checkpoint
+			// limit (10, cmd/server/server.go); the model must agree for
+			// CHECKPOINT_LIMIT_REACHED (task 09's request to 99).
+			model := oracle.NewGlobalState().WithQueryCheckpointLimit(10)
 			for i, r := range setup {
 				_, err := client.Apply(ctx, servicepb.UnsignedApplyRequest("", r))
 				require.NoError(t, err, "setup %d", i)

@@ -144,6 +144,7 @@ struct EndGuard<'a>(&'a Shared);
 impl Drop for EndGuard<'_> {
     fn drop(&mut self) {
         *self.0.last_quiet_end.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
+        self.0.quiet_open.store(false, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -229,6 +230,7 @@ pub fn run_quiet(d: &Driver, hook: Option<&QuietHook>, plan: Option<HookPlan>) {
     let epoch = s.next_epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let name = hook.map(|h| h.name).unwrap_or("none");
     s.quiets_since_exact.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    s.quiet_open.store(true, std::sync::atomic::Ordering::SeqCst);
     let _end = EndGuard(s);
     pause_faults(t.q0_pause_secs);
     check_reachable!("a quiet period starts", json!({"hook": name, "epoch": epoch}));

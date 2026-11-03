@@ -161,6 +161,9 @@ services:
       MINIO_URL: http://minio:9000
       ORACLE_URL: http://oracle:8090
       QUERY_CHECKPOINT_LIMIT: *qcl
+      # Task 09's `checkpoints` view exists: task 07's inspect_index may read
+      # an index from a query checkpoint.
+      HEGEL_HAVE_CHECKPOINTS: "1"
       RUST_BACKTRACE: "1"
 
   # ==== 18-restore (services appended by tasks/18) ====

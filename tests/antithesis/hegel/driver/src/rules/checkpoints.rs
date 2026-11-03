@@ -956,7 +956,15 @@ mod tests {
     fn registry_rule_ends_the_ticket_with_fence_record() {
         let (d, ft, fo) = testkit::driver();
         ft.set_default("cluster", "GetClusterState", ok(cs(1, "Follower", 0, json!([]))));
-        testkit::run_rule(&d, checkpoint_registry);
+        // The rule draws registry, schedule or info evenly; info abandons its
+        // read here (no `checkpoints` view), so run until one read ended.
+        // (Before 99's draw::weighted fix the first arm won almost always.)
+        for _ in 0..40 {
+            testkit::run_rule(&d, checkpoint_registry);
+            if !fo.calls("/read/end").is_empty() {
+                break;
+            }
+        }
         let ends = fo.calls("/read/end");
         assert_eq!(ends.len(), 1);
         assert!(ends[0]["kind"] == "CheckpointRegistry" || ends[0]["kind"] == "CheckpointSchedule");

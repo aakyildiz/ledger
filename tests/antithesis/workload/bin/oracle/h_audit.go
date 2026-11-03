@@ -131,8 +131,14 @@ func init() {
 	registerAsserter(ac.EvAuditFailureMatchedRejection, func(_ bool, d map[string]any) {
 		assert.Reachable("oracle: audit failure entry matched a model rejection", d)
 	})
+	// Not must-hit (task 99): on the current server every named retryable FSM
+	// reason implements UncommittedFailure and is never audited, so the guard
+	// can fire only for an unclassified (UNSPECIFIED) or future reason. It
+	// guards against a false alarm; a cataloged Reachable that cannot be hit
+	// would be a failing property. AlwaysOrUnreachable(true) records it when it
+	// does happen and never fails.
 	registerAsserter(ac.EvAuditRetryableFailureUnjudged, func(_ bool, d map[string]any) {
-		assert.Reachable("oracle: audit failure entry with a retryable reason left unjudged", d)
+		assert.AlwaysOrUnreachable(true, "oracle: audit failure entry with a retryable reason left unjudged", d)
 	})
 	registerAsserter(ac.EvAuditFailureOwedChecked, func(_ bool, d map[string]any) {
 		assert.Reachable("oracle: rejected keyed bulk checked for its failure audit entry", d)

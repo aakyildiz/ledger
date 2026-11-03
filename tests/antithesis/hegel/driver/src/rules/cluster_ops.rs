@@ -89,6 +89,11 @@ fn note_outside_quiet(s: &Shared) {
 }
 
 pub fn quiet_maybe_open(s: &Shared) -> bool {
+    // The real flag (added by 99), plus the inference for the window between
+    // the epoch bump and the flag store.
+    if s.quiet_open() {
+        return true;
+    }
     let Some((e_seen, at)) = *s.ext::<QuietWatch>().seen.lock().unwrap_or_else(|e| e.into_inner()) else { return false };
     let e_now = s.next_epoch.load(Ordering::SeqCst);
     let last_end = *s.last_quiet_end.lock().unwrap_or_else(|e| e.into_inner());
@@ -1307,6 +1312,9 @@ mod tests {
         let (d, ft, _) = testkit::driver();
         testkit::reset();
         assert!(!quiet_maybe_open(&d.s), "no observation yet");
+        d.s.quiet_open.store(true, Ordering::SeqCst);
+        assert!(quiet_maybe_open(&d.s), "the flag alone");
+        d.s.quiet_open.store(false, Ordering::SeqCst);
         note_outside_quiet(&d.s);
         assert!(!quiet_maybe_open(&d.s));
         // A quiet period starts (run_quiet bumps the epoch) and has not ended.

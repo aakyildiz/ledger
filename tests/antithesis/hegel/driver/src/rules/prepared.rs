@@ -120,9 +120,8 @@ fn common_leaf(tc: &TestCase, pz: &mut Paramizer) -> Value {
     }
 }
 
-pub fn has_asset(base: &str, precision: u64) -> Value {
-    json!({"accountHasAsset": {"assetBase": base, "precision": precision}})
-}
+/// The has-asset leaf is task 06's builder (deduped by 99).
+pub use crate::rules::filters::has_asset;
 
 /// A malformed filter: a shape no target accepts, or a leaf invalid on
 /// `target`. FILTER_COMPILATION_ERROR at save (admission for a create; for an

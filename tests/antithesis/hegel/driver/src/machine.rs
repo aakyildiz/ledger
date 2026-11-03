@@ -76,6 +76,15 @@ impl Driver {
         if !self.s.is_active() {
             return;
         }
+        // While task 16's signature window could not be closed in time
+        // (`signatures_required`, a quiet-blocking job is restoring it), every
+        // unsigned write is refused with Unauthenticated. Tracked writes are
+        // held back by the slots (DESIGN §4.8 (c)); Rust-checked families would
+        // burn their budgets or misjudge their own probes, so every rule waits
+        // for the job (task 16's request to 99). Reads lose a few rounds only.
+        if self.s.signatures_required() {
+            return;
+        }
         install_location_hook();
         let started = Instant::now();
         let r = catch_unwind(AssertUnwindSafe(|| body(self, tc)));
@@ -135,6 +144,18 @@ mod tests {
         assert_eq!(hit[0].details["rule"], "panicking_rule");
         assert_eq!(hit[0].details["panic"], "boom 42");
         assert!(hit[0].details["location"].as_str().unwrap().contains("machine.rs"));
+    }
+
+    #[test]
+    fn guarded_skips_every_rule_while_signatures_are_required() {
+        let (d, _, _) = testkit::driver();
+        testkit::reset();
+        d.s.signatures_required.store(true, std::sync::atomic::Ordering::SeqCst);
+        testkit::run_rule(&d, panicking_rule);
+        d.s.signatures_required.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(testkit::assertions().iter().all(|r| r.message != "a driver rule panics"), "the body did not run");
+        testkit::run_rule(&d, panicking_rule);
+        assert!(testkit::assertions().iter().any(|r| r.message == "a driver rule panics"));
     }
 
     #[test]

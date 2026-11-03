@@ -615,6 +615,18 @@ pub fn gen_account_filter(tc: &TestCase) -> Plan {
     }
 }
 
+/// `genAccountFilterIndexed` at the top level: metadata Field leaves on the
+/// declared keys, has-asset leaves and address leaves, composed. Task 05's
+/// AggregateVolumes draws it (M/aggregates.go runAggregateQuery).
+pub fn gen_account_filter_indexed(tc: &TestCase) -> Plan {
+    gen_account_indexed(tc, 0)
+}
+
+/// `genAccountFilterFree` at the top level (index-free address filters).
+pub fn gen_account_filter_free(tc: &TestCase) -> Plan {
+    gen_account_free(tc, 0)
+}
+
 fn gen_account_indexed(tc: &TestCase, depth: usize) -> Plan {
     if depth >= MAX_GEN_DEPTH || one_in(tc, 2) {
         if one_in(tc, 4) {
