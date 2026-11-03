@@ -121,7 +121,7 @@ Fixtures: `W/oraclecheck/testdata/rejections/07-*.json`.
 | oracle: index inspection summary counted unconvertible values | `typed_metadata_cycle` writes `own-bad = "not-a-number-<v>"` (declared INT64, indexed while the model lacks the index); `inspect_index` inspects l1 with the owned view 1/4 | no faults |
 | oracle: index inspection served from a checkpoint | `inspect_index` with `HEGEL_HAVE_CHECKPOINTS=1` | needs task 09 |
 | oracle: metadata field not in schema rejection exercised | `index_op` 1/16 probe | no faults |
-| a write attempt is refused while an index builds | a `createQueryCheckpoint` attempt (task 09) answered `INDEX_BUILDING` inside the audit-projection rebuild after a restart | faults (rare) |
+| a write attempt is refused while an index builds | a `createQueryCheckpoint` attempt (task 09) answered `INDEX_BUILDING` inside the audit-projection rebuild after a restart | faults (rare by design, see Deviations) |
 | changing metadata type should not crash (+ the two declaring literals) | `typed_metadata_cycle` | no faults (AlwaysOrUnreachable) |
 
 ## Deviations from the spec
@@ -197,6 +197,16 @@ Fixtures: `W/oraclecheck/testdata/rejections/07-*.json`.
   `checkpointId`; re-check if 09's view shape changes before merge.
 - `a write attempt is refused while an index builds` needs faults and a checkpoint create
   inside the audit rebuild window; it is now asserted on every `Apply` answer
-  (`write::explore_attempt`), not only on this family's (which never get it).
+  (`write::explore_attempt`), not only on this family's (which never get it). It is rare
+  by design. It was never evaluated in run 076d255c…-67-0. Admission runs on the leader,
+  and the leader's audit projection reports rebuilding only from process start
+  (`auditindexer.New`) until its asynchronous boot pass ends (`Indexer.boot`: one
+  `ProcessOnce`, or `Rebuild` over a few thousand audit entries, which takes milliseconds),
+  or after a failed indexing pass (`SetAuditProjectionFailed`, a Pebble read error). A
+  restarted node must therefore win an election before its own boot pass ends. That needs
+  a pause or throttle on that node, and a checkpoint create must land in the same window.
+  No compose knob widens this window, and the workload has no way to target it (the
+  readiness flag is node-local and not exposed). It stays a Sometimes, because it is the
+  only coverage of that admission branch, and it is listed as rare in 99.
 - Task 06's indexed-query validators depend on `index promoted to active` happening; with
   `index_op` at weight 1.0 roughly half of the pool is present at any time.

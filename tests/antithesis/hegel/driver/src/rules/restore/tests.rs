@@ -666,3 +666,50 @@ fn seed_and_base_take_the_backup_into_the_cycle_namespace() {
     testkit::run_rule(&d, restore_step);
     assert_eq!(state(&d.s).cycle().seed.as_ref().unwrap().t3, Some(4));
 }
+
+#[test]
+fn a_held_cycle_serves_until_after_the_fault_pause() {
+    let t0 = Instant::now();
+    let budget = Duration::from_secs(600);
+    let s = |n: u64| Duration::from_secs(n);
+    // No hold drawn, or no cut yet: never held.
+    assert!(!holding(0, Some(t0), Some(t0 + s(100)), budget, t0 + s(1)));
+    assert!(!holding(30, None, Some(t0 + s(100)), budget, t0 + s(1)));
+    // Held until 30 s after the pause runs out.
+    assert!(holding(30, Some(t0), Some(t0 + s(100)), budget, t0 + s(50)));
+    assert!(holding(30, Some(t0), Some(t0 + s(100)), budget, t0 + s(129)));
+    assert!(!holding(30, Some(t0), Some(t0 + s(100)), budget, t0 + s(130)));
+    // No pause (or one that ended before the cut): counted from the cut.
+    assert!(holding(30, Some(t0 + s(10)), None, budget, t0 + s(39)));
+    assert!(!holding(30, Some(t0 + s(10)), Some(t0), budget, t0 + s(40)));
+    // Never past half the cycle budget.
+    assert!(!holding(60, Some(t0), Some(t0 + s(280)), budget, t0 + s(300)));
+}
+
+#[test]
+fn restore_step_defers_verification_while_held() {
+    let (d, _ft, env) = setup();
+    env.set_digest(RESTORE_NODE, sections("aa"));
+    let serving = |hold_secs: u64| {
+        put_cycle(&d, |c| {
+            c.gen = 1;
+            c.phase = Phase::Serving;
+            c.base = Some(Base { f: 1, audit: 1, applied: 5 });
+            c.cut = Some(Cut { s: 4, a: 2 });
+            c.digest = Some(digest_of(&sections("aa")));
+            c.plan = Some(Plan { online: true, poll_ms: 1, backoffs: vec![1], hold_secs, ..Default::default() });
+            c.started = Some(Instant::now());
+        });
+    };
+    *d.s.fault_pause_until.lock().unwrap() = Some(Instant::now() + Duration::from_secs(100));
+    serving(30);
+    testkit::run_rule(&d, restore_step);
+    assert!(!state(&d.s).cycle().job_running, "held: no verify job");
+    assert!(env.digest_calls.lock().unwrap().is_empty());
+    assert_eq!(state(&d.s).cycle().phase, Phase::Serving);
+    // No hold drawn: the verify job runs and takes the restored digest.
+    serving(0);
+    testkit::run_rule(&d, restore_step);
+    testkit::wait_until(Duration::from_secs(10), || !state(&d.s).cycle().job_running);
+    assert!(!env.digest_calls.lock().unwrap().is_empty());
+}

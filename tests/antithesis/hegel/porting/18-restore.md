@@ -68,7 +68,7 @@ Sometimes / Reachable: `restore base backup completes`, `a restore cut has a non
 | `a finalize before validate is refused` | `restore_plan` finalize-early perturbation (1/2 of online plans) | no faults |
 | `an offline bootstrap with validation succeeds`, `an offline bootstrap without validation succeeds` | offline plans (1/4, validate 1/2) | no faults |
 | `a chained restore verifies` | chained plans (1/4) | no faults |
-| `a restore cycle survives a restart of restore-0` | any cycle during which restore-0's container restarts | faults |
+| `a restore cycle survives a restart of restore-0` | a held plan (`hold_secs`, 35% of plans) whose restore-0 is killed or stopped while it serves after the quiet period's fault pause | faults |
 | `a restored joiner syncs from the restored genesis` | joiner plans | `RESTORE_JOINER=1` (AlwaysOrUnreachable, not must-hit) |
 
 ## Deviations from the spec
@@ -104,6 +104,17 @@ Sometimes / Reachable: `restore base backup completes`, `a restore cut has a non
 7. Each long step (Cut → Staged, Staged → Serving, Serving → Verified) is one job; the seed
    writes run synchronously in `restore_base`/`restore_step` (rules are parked during quiet
    periods, so the seed never overlaps another family's quiet check).
+8. **Hold past the fault pause** (triage of run 076d255c…-67-0): the cut runs inside a
+   quiet period, and that quiet period pauses faults for `q0_pause_secs` (100 s). A whole
+   cycle fits inside the pause. In that run, all 25 cycles ended Verified 25–75 s after their
+   cut, and no restore-0 kill or stop fell between a cut and its cycle's end, so
+   `a restore cycle survives a restart of restore-0` was 0/25. `restore_plan` now draws
+   `hold_secs` (35% of plans, 10–60 s). `restore_step` does not submit the verify job of a
+   Serving cycle until `hold_secs` after `Shared::fault_pause_until`, or after the cut when
+   there was no pause (`holding`). The hold never goes past half the cycle budget, so faults
+   (restore-0's container kills and stops included) land while the restored server serves.
+   When restore-0 restarts, the agent resumes the child, and `verify_job` retries a failed
+   digest on the next step.
 
 ## Requests to 99
 

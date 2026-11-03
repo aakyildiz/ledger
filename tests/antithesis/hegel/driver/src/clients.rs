@@ -622,6 +622,11 @@ impl Clients {
             self.note_apply(&out);
             crate::write::explore_attempt(&out);
         }
+        if service == "cluster" && method == "GetClusterState" {
+            if let Some(cs) = out.response.as_ref().filter(|_| out.is_ok()) {
+                crate::rules::cluster_ops::explore_cluster_state(cs);
+            }
+        }
         out
     }
 }

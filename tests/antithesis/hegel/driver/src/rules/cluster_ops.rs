@@ -9,9 +9,10 @@
 use crate::clients::{definitive, CallOpts, Outcome, Route};
 use crate::draw;
 use crate::jobs::Job;
-use crate::logs::NodeStates;
+use crate::logs::{LogHook, LogLine, NodeStates};
 use crate::machine::{rule, Driver};
 use crate::nodes::NodeMap;
+use crate::rules::server_signals;
 use crate::setup::SetupHook;
 use crate::shared::Shared;
 use crate::wire::{create_tx_request, str_field, u64_field, Posting};
@@ -839,10 +840,11 @@ pub fn node_map_complete(m: &NodeMap, configured: usize) -> bool {
 }
 
 /// What one node's own `GetClusterState{nodeId}` says (None when the answer
-/// is not that node's).
+/// is not that node's). The leader's view is asserted on by
+/// `explore_cluster_state`, on every answer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NodeView {
-    Leader { snapshot_progress: bool },
+    Leader,
     Follower { out_of_sync: bool },
 }
 
@@ -852,13 +854,95 @@ pub fn node_view(cs: &Value, id: u64) -> Option<NodeView> {
     }
     let leader = u64_field(cs, "leader");
     if leader == id {
-        // The server maps etcd's `StateSnapshot` to "Snapshot" (node.go `progress` map).
-        let snap = cs.pointer("/raftStatus/progress").and_then(Value::as_object).is_some_and(|p| p.values().any(|pi| str_field(pi, "state") == "Snapshot"));
-        Some(NodeView::Leader { snapshot_progress: snap })
+        Some(NodeView::Leader)
     } else {
         let status = cs.pointer("/syncProgress/status").and_then(Value::as_str).unwrap_or("");
         Some(NodeView::Follower { out_of_sync: matches!(status, "syncing" | "snapshotting" | "out_of_sync") })
     }
+}
+
+/// Whether a `GetClusterState` answer is the leader's own view (`localNode
+/// == leader`; a call without `nodeId` is leader-routed) and, if so, whether
+/// it holds a follower in `Snapshot` progress. The server maps etcd's
+/// `StateSnapshot` to "Snapshot" (node.go `progress` map).
+pub fn leader_snapshot_progress(cs: &Value) -> Option<bool> {
+    let local = u64_field(cs, "localNode");
+    if local == 0 || u64_field(cs, "leader") != local {
+        return None;
+    }
+    Some(cs.pointer("/raftStatus/progress").and_then(Value::as_object).is_some_and(|p| p.values().any(|pi| str_field(pi, "state") == "Snapshot")))
+}
+
+/// Runs on every successful `GetClusterState` answer (`Clients::call_with_op`):
+/// every leader view the driver gets, from any rule, job or quiet check,
+/// counts. The leader holds a follower in `Snapshot` from sending `MsgSnap`
+/// until the follower's `MsgAppResp` after installing it (the leader never
+/// calls `ReportSnapshot`), so the window is the follower's install time:
+/// milliseconds usually, seconds when the install waits for the applier
+/// (run 076d255c…-67-0: 35 installs, 4 of 1–9 s). `cluster_state` alone
+/// polled the leader 174 times at random moments and never saw one.
+pub fn explore_cluster_state(cs: &Value) {
+    if let Some(snap) = leader_snapshot_progress(cs) {
+        check_sometimes!(snap, "the leader reports a follower in snapshot progress", json!({"leader": u64_field(cs, "localNode"), "progress": cs.pointer("/raftStatus/progress")}));
+    }
+}
+
+/// How long the snapshot watch polls the leader after a follower logs
+/// `Applying snapshot sent by leader` (the longest install of run
+/// 076d255c…-67-0 took 9.3 s), and how often.
+pub const SNAPSHOT_WATCH: Duration = Duration::from_secs(12);
+const SNAPSHOT_WATCH_POLL: Duration = Duration::from_millis(100);
+
+/// One snapshot watch at a time.
+#[derive(Default)]
+pub struct SnapshotWatch {
+    running: Arc<AtomicBool>,
+}
+
+pub fn log_hooks() -> Vec<LogHook> {
+    vec![LogHook { name: "snapshot_watch", run: snapshot_watch }]
+}
+
+/// A follower started installing a raft snapshot: poll the leader while it
+/// does (on a helper thread; the log receiver never blocks), so a leader
+/// view lands inside the window `explore_cluster_state` looks for.
+fn snapshot_watch(s: &Shared, l: &LogLine) {
+    if !l.active || server_signals::source_of(l.node) != server_signals::Source::Ledger {
+        return;
+    }
+    let (msg, structured) = server_signals::message(l);
+    if server_signals::signal(msg, structured) != Some(server_signals::Signal::RaftSnapshotReceived) {
+        return;
+    }
+    let running = s.ext::<SnapshotWatch>().running.clone();
+    if running.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let clients = s.clients.clone();
+    let follower = l.node.to_string();
+    crate::assertions::spawn_inheriting("snapshot-watch", move || {
+        let seen = Driver::helper_iteration("snapshot-watch", || watch_leader(&clients, SNAPSHOT_WATCH)).unwrap_or(false);
+        println!("driver: snapshot watch for {follower}: leader {} a follower in Snapshot", if seen { "reported" } else { "never reported" });
+        running.store(false, Ordering::SeqCst);
+    });
+}
+
+/// Polls the leader (`GetClusterState{}`, leader-routed, rotating clients)
+/// until it reports a follower in `Snapshot`, or `budget` runs out.
+pub fn watch_leader(clients: &crate::clients::Clients, budget: Duration) -> bool {
+    let end = Instant::now() + budget;
+    for k in 0.. {
+        let route = Route::lib(k % clients.len().max(1));
+        let (_, out) = clients.call(&route, "cluster", "GetClusterState", json!({}), &CallOpts::default().timeout(STATE_TIMEOUT));
+        if out.response.as_ref().filter(|_| out.is_ok()).and_then(leader_snapshot_progress) == Some(true) {
+            return true;
+        }
+        if Instant::now() + SNAPSHOT_WATCH_POLL >= end {
+            break;
+        }
+        std::thread::sleep(SNAPSHOT_WATCH_POLL);
+    }
+    false
 }
 
 fn cluster_state(d: &Driver, tc: TestCase) {
@@ -891,10 +975,8 @@ fn cluster_state(d: &Driver, tc: TestCase) {
                 Some(NodeView::Follower { out_of_sync }) => {
                     check_sometimes!(out_of_sync, "a follower reports an out-of-sync or snapshotting status", json!({"node": n.addr, "status": cs.pointer("/syncProgress/status")}));
                 }
-                Some(NodeView::Leader { snapshot_progress }) => {
-                    check_sometimes!(snapshot_progress, "the leader reports a follower in snapshot progress", json!({"node": n.addr, "progress": cs.pointer("/raftStatus/progress")}));
-                }
-                None => {}
+                // `Clients::call_with_op` ran `explore_cluster_state` on it.
+                Some(NodeView::Leader) | None => {}
             }
         }
         Some(())
@@ -1423,9 +1505,78 @@ mod tests {
         let n = json!({"localNode": "2", "leader": "1", "syncProgress": {"status": "normal"}});
         assert_eq!(node_view(&n, 2), Some(NodeView::Follower { out_of_sync: false }));
         let l = json!({"localNode": "1", "leader": "1", "raftStatus": {"progress": {"2": {"state": "Replicate"}, "3": {"state": "Snapshot"}}}});
-        assert_eq!(node_view(&l, 1), Some(NodeView::Leader { snapshot_progress: true }));
+        assert_eq!(node_view(&l, 1), Some(NodeView::Leader));
+        assert_eq!(leader_snapshot_progress(&l), Some(true));
         let l2 = json!({"localNode": "1", "leader": "1", "raftStatus": {"progress": {"2": {"state": "Probe"}}}});
-        assert_eq!(node_view(&l2, 1), Some(NodeView::Leader { snapshot_progress: false }));
+        assert_eq!(leader_snapshot_progress(&l2), Some(false));
+        assert_eq!(leader_snapshot_progress(&f), None, "a follower's view");
+        assert_eq!(leader_snapshot_progress(&json!({"leader": "1"})), None, "no localNode");
+        assert_eq!(leader_snapshot_progress(&json!({"localNode": "0", "leader": "0"})), None, "no leader known");
+    }
+
+    #[test]
+    fn every_leader_view_is_explored() {
+        // A leader-routed answer from any caller (here the discovery call of
+        // `NodeMap::discover`) evaluates the snapshot-progress Sometimes.
+        let (d, ft, _) = testkit::driver();
+        testkit::reset();
+        ft.script("cluster", "GetClusterState", vec![
+            ok(json!({"localNode": "2", "leader": "2", "nodes": [{"id": "2", "serviceAddress": "ledger-1:8888"}], "raftStatus": {"progress": {"1": {"state": "Snapshot"}}}})),
+        ]);
+        assert!(NodeMap::discover(&d).is_some());
+        assert!(recs("the leader reports a follower in snapshot progress")[0].cond);
+        testkit::reset();
+        ft.script("cluster", "GetClusterState", vec![err("Unavailable", "", "no leader"), ok(json!({"localNode": "3", "leader": "2"}))]);
+        assert!(NodeMap::discover(&d).is_none());
+        assert!(recs("the leader reports a follower in snapshot progress").is_empty(), "errors and follower views are not evaluated");
+    }
+
+    #[test]
+    fn snapshot_watch_polls_the_leader_until_it_reports_snapshot() {
+        let (d, ft, _) = testkit::driver();
+        testkit::reset();
+        let leader = |state: &str| ok(json!({"localNode": "1", "leader": "1", "raftStatus": {"progress": {"2": {"state": state}}}}));
+        ft.script("cluster", "GetClusterState", vec![leader("Probe"), err("Unavailable", "", ""), leader("Snapshot"), leader("Replicate")]);
+        assert!(watch_leader(&d.s.clients, Duration::from_secs(5)));
+        let calls = ft.calls_of("cluster", "GetClusterState");
+        assert_eq!(calls.len(), 3, "stops at the first Snapshot view");
+        assert!(calls.iter().all(|c| c["request"] == json!({})), "leader-routed");
+        let r = recs("the leader reports a follower in snapshot progress");
+        assert_eq!(r.iter().map(|r| r.cond).collect::<Vec<_>>(), vec![false, true]);
+
+        testkit::reset();
+        ft.set_default("cluster", "GetClusterState", leader("Replicate"));
+        assert!(!watch_leader(&d.s.clients, Duration::from_millis(250)), "budget runs out");
+    }
+
+    #[test]
+    fn snapshot_watch_starts_on_a_follower_install_line_while_active() {
+        let (d, ft, _) = testkit::driver();
+        testkit::reset();
+        ft.set_default("cluster", "GetClusterState", ok(json!({"localNode": "1", "leader": "1", "raftStatus": {"progress": {"2": {"state": "Snapshot"}}}})));
+        let line = r#"{"level":"info","msg":"Applying snapshot sent by leader","node-id":2,"index":634}"#;
+        let feed = |node: &str, active: bool, raw: &str| {
+            let json: Value = serde_json::from_str(raw).unwrap();
+            snapshot_watch(&d.s, &LogLine { node, boot: 1, active, raw, json: Some(&json) });
+        };
+        let running = || d.s.ext::<SnapshotWatch>().running.load(Ordering::SeqCst);
+        feed("ledger-1", false, line);
+        assert!(!running(), "setup-time lines are ignored");
+        feed("restore-0", true, line);
+        assert!(!running(), "restore targets are not the main cluster");
+        feed("ledger-1", true, r#"{"msg":"Snapshot created"}"#);
+        assert!(!running());
+        assert!(ft.calls_of("cluster", "GetClusterState").is_empty());
+        // A watch already running: a second install line starts none.
+        d.s.ext::<SnapshotWatch>().running.store(true, Ordering::SeqCst);
+        feed("ledger-1", true, line);
+        assert!(ft.calls_of("cluster", "GetClusterState").is_empty());
+        d.s.ext::<SnapshotWatch>().running.store(false, Ordering::SeqCst);
+        // A follower's install line while active: one watch, on a helper thread.
+        feed("ledger-1", true, line);
+        testkit::wait_until(Duration::from_secs(5), || !running());
+        assert_eq!(ft.calls_of("cluster", "GetClusterState").len(), 1);
+        assert!(recs("the leader reports a follower in snapshot progress")[0].cond);
     }
 
     #[test]
