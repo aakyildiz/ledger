@@ -26,7 +26,20 @@ const (
 	EvListUnexpectedError      oc.EventID = "oracle: checkpoint list returned unexpected error"
 	EvScheduleOutsideModel     oc.EventID = "oracle: checkpoint schedule outside model"
 	EvScheduleUnexpectedError  oc.EventID = "oracle: checkpoint schedule returned unexpected error"
+	// New (MD/parallel_driver_query_checkpoints/main.go:127-137 checked
+	// GetQueryCheckpointInfo once per invocation; read kind CheckpointInfo
+	// checks it against the model on a fenced node).
+	EvInfoOutsideModel    oc.EventID = "oracle: checkpoint info outside model"
+	EvInfoUnexpectedError oc.EventID = "oracle: checkpoint info returned unexpected error"
 )
+
+// Driver protocol misuse (a request the driver never builds: an unknown arm,
+// an undecodable body, no checkpoint id). Not a ledger finding.
+const EvProtocolMalformedRead oc.EventID = "oracle protocol: checkpoint read request is malformed"
+
+// Reachable coverage of read kind CheckpointInfo, reached by
+// checkpoint_registry's info arm once a checkpoint exists.
+const EvInfoMatched oc.EventID = "oracle: coverage checkpoint info matched the oracle"
 
 // Reachable coverage (M/checkpoint_reads.go:241), reached by checkpoint_read's
 // ListLedgers arm.

@@ -356,6 +356,61 @@ func TestPredictedRead_BeforeAndAfterTheCreate(t *testing.T) {
 	// A ledger absent from the frozen state explains NotFound.
 	gone := &servicepb.GetLedgerRequest{Ledger: s.Ledger(7), Read: &commonpb.ReadOptions{CheckpointId: 1}}
 	require.Empty(t, testutil.Findings(validate(t, s, cc.KindPredictedCheckpointRead, gone, notFound, nil)))
+
+	// A DeleteLedger committed after the create: no frozen checkpoint keeps
+	// serving the deleted ledger, so NotFound is legal (M/ reported it).
+	write(t, s, testutil.DeleteLedgerReq(l1))
+	require.Empty(t, testutil.Findings(validate(t, s, cc.KindPredictedCheckpointRead, req, notFound, nil)))
+	// …but other errors are still findings.
+	evs = validate(t, s, cc.KindPredictedCheckpointRead, req, oc.Outcome{Code: "Internal"}, nil)
+	require.Equal(t, []oc.EventID{cc.EvPredictedUnexpectedError}, testutil.IDs(testutil.Findings(evs)))
+}
+
+func TestMalformedRequestsAreDriverProtocolErrors(t *testing.T) {
+	t.Parallel()
+	s, _ := fixture(t)
+	// An unknown arm, and a request naming no checkpoint, are driver bugs.
+	evs := validate(t, s, cc.KindCheckpointRead, &servicepb.GetAccountRequest{Ledger: s.Ledger(1), Address: "t-0:1", CheckpointId: 1}, notFound, map[string]any{"arm": "Bogus"})
+	require.Equal(t, []oc.EventID{cc.EvProtocolMalformedRead}, testutil.IDs(testutil.Findings(evs)))
+	evs = validate(t, s, cc.KindCheckpointRead, &servicepb.GetAccountRequest{Ledger: s.Ledger(1), Address: "t-0:1"}, notFound, map[string]any{"arm": cc.ArmGetAccount})
+	require.Equal(t, []oc.EventID{cc.EvProtocolMalformedRead}, testutil.IDs(testutil.Findings(evs)))
+	evs = validate(t, s, cc.KindPredictedCheckpointRead, &servicepb.GetLedgerRequest{Ledger: s.Ledger(1)}, notFound, nil)
+	require.Equal(t, []oc.EventID{cc.EvProtocolMalformedRead}, testutil.IDs(testutil.Findings(evs)))
+	evs = validate(t, s, cc.KindCheckpointInfo, &clusterpb.GetQueryCheckpointInfoRequest{}, notFound, nil)
+	require.Equal(t, []oc.EventID{cc.EvProtocolMalformedRead}, testutil.IDs(testutil.Findings(evs)))
+}
+
+func TestCheckpointInfo(t *testing.T) {
+	t.Parallel()
+	s, _ := fixture(t)
+	maxSeq, ok := s.T.FrozenCheckpointMaxSequence(1)
+	require.True(t, ok)
+	req := &clusterpb.GetQueryCheckpointInfoRequest{CheckpointId: 1}
+	info := func(id, seq uint64) oc.Outcome {
+		return okOut(t, &clusterpb.QueryCheckpointInfo{CheckpointId: id, MaxSequence: seq})
+	}
+
+	evs := validate(t, s, cc.KindCheckpointInfo, req, info(1, maxSeq), nil)
+	require.Empty(t, testutil.Findings(evs))
+	require.True(t, reached(evs, cc.EvInfoMatched))
+	// Wrong id, wrong max sequence, NotFound on a live id: outside the model.
+	for _, out := range []oc.Outcome{info(2, maxSeq), info(1, maxSeq+1), notFound} {
+		evs = validate(t, s, cc.KindCheckpointInfo, req, out, nil)
+		require.Equal(t, []oc.EventID{cc.EvInfoOutsideModel}, testutil.IDs(testutil.Findings(evs)), "%+v", out)
+	}
+	evs = validate(t, s, cc.KindCheckpointInfo, req, oc.Outcome{Code: "Internal"}, nil)
+	require.Equal(t, []oc.EventID{cc.EvInfoUnexpectedError}, testutil.IDs(testutil.Findings(evs)))
+
+	// An in-flight delete: both answers are legal.
+	del := s.Begin(false, deleteCheckpoint(1))
+	require.Empty(t, testutil.Findings(validate(t, s, cc.KindCheckpointInfo, req, notFound, nil)))
+	require.Empty(t, testutil.Findings(validate(t, s, cc.KindCheckpointInfo, req, info(1, maxSeq), nil)))
+	_, evs = s.End(del)
+	require.Empty(t, testutil.Findings(evs))
+	// Deleted: NotFound only.
+	require.Empty(t, testutil.Findings(validate(t, s, cc.KindCheckpointInfo, req, notFound, nil)))
+	evs = validate(t, s, cc.KindCheckpointInfo, req, info(1, maxSeq), nil)
+	require.Equal(t, []oc.EventID{cc.EvInfoOutsideModel}, testutil.IDs(testutil.Findings(evs)))
 }
 
 func TestRegistryAndSchedule(t *testing.T) {
@@ -417,7 +472,7 @@ func TestLimitCoverageAndView(t *testing.T) {
 
 	write(t, s, deleteCheckpoint(3))
 	pick := uint64(19) // 9 live + 1 deleted: 19 mod 10 = 9, the deleted one
-	req, _ := json.Marshal(map[string]any{"name": cc.ViewCheckpoints, "pick": pick, "cpLedgerPick": 0, "table": "volumes", "probe": "t-0:0"})
+	req, _ := json.Marshal(map[string]any{"name": cc.ViewCheckpoints, "pick": pick, "cpLedgerPick": 0, "table": "volumes", "probe": "t-0:0", "seenPick": 0})
 	views, err := s.T.ComputeViews(s.T.Model(), []json.RawMessage{req})
 	require.NoError(t, err)
 	var v struct {
@@ -428,6 +483,7 @@ func TestLimitCoverageAndView(t *testing.T) {
 			ID      string
 			Deleted bool
 			Ledger  *string
+			Seen    string `json:"seenLedger"`
 		}
 	}
 	require.NoError(t, json.Unmarshal(views[0], &v))
@@ -439,4 +495,5 @@ func TestLimitCoverageAndView(t *testing.T) {
 	require.True(t, v.Target.Deleted)
 	require.NotNil(t, v.Target.Ledger)
 	require.Equal(t, s.Ledger(1), *v.Target.Ledger)
+	require.Equal(t, s.Ledger(1), v.Target.Seen, "the ListLedgers cursor pool: every tracked name seen")
 }

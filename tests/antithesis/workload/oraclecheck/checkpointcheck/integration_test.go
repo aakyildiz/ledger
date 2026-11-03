@@ -130,6 +130,14 @@ func TestIntegration_CheckpointsAgainstRealServer(t *testing.T) {
 	const prefix = "o-it-"
 	tr := oc.NewTracker(oc.Config{RunID: "it", TrackedPrefix: prefix, QueryCheckpointLimit: 10})
 	keys := 0
+	hits := map[oc.EventID]int{}
+	count := func(evs []oc.Event) {
+		for _, e := range evs {
+			if e.Kind != oc.EvRaw || e.Cond {
+				hits[e.ID]++
+			}
+		}
+	}
 	write := func(reqs ...*servicepb.Request) (oc.Outcome, map[string]any) {
 		t.Helper()
 		keys++
@@ -145,6 +153,7 @@ func TestIntegration_CheckpointsAgainstRealServer(t *testing.T) {
 		_, evs, ref := tr.EndWrite(tk, out)
 		require.Nil(t, ref)
 		require.Empty(t, testutil.Findings(evs), "%+v", out)
+		count(evs)
 
 		return out, predicted
 	}
@@ -153,7 +162,6 @@ func TestIntegration_CheckpointsAgainstRealServer(t *testing.T) {
 		_, err := client.Apply(ctx, servicepb.UnsignedApplyRequest("", r))
 		require.NoError(t, err)
 	}
-	hits := map[oc.EventID]int{}
 	read := func(kind, arm string, req proto.Message, out oc.Outcome) []oc.Event {
 		t.Helper()
 		k, ok := oc.LookupReadKind(kind)
@@ -165,11 +173,7 @@ func TestIntegration_CheckpointsAgainstRealServer(t *testing.T) {
 		require.False(t, out.Transient(false), "%s %s: transient %+v", kind, arm, out)
 		evs := k.Validate(&oc.ReadCtx{T: tr, Ticket: tk, MaxTicket: tr.ReadFrontier(), Snapshot: snap, Kind: kind, Request: reqJSON, Outcome: out, Params: []byte(`{"arm":"` + arm + `"}`)})
 		require.Empty(t, testutil.Findings(evs), "%s %s %s: outcome %+v", kind, arm, reqJSON, out)
-		for _, e := range evs {
-			if e.Kind != oc.EvRaw || e.Cond {
-				hits[e.ID]++
-			}
-		}
+		count(evs)
 
 		return evs
 	}
@@ -235,12 +239,19 @@ func TestIntegration_CheckpointsAgainstRealServer(t *testing.T) {
 				r := &servicepb.ListTransactionsRequest{Ledger: l1, Options: &commonpb.ListOptions{Read: ro(), PageSize: size, Reverse: reverse, Cursor: match.PageToken(cursor)}}
 				read(cc.KindCheckpointRead, cc.ArmListTransactions, r, stream(client.ListTransactions(ctx, r)))
 			}
-			for _, cursor := range []string{"", prefix, l1} {
+			for _, cursor := range []string{"", prefix, l1, l2} {
 				r := &servicepb.ListLedgersRequest{Options: &commonpb.ListOptions{Read: ro(), PageSize: size, Reverse: reverse, Cursor: match.PageToken(cursor)}}
 				read(cc.KindCheckpointRead, cc.ArmListLedgers, r, stream(client.ListLedgers(ctx, r)))
 			}
 		}
 	}
+
+	info := func(cpID uint64) {
+		t.Helper()
+		r := &clusterpb.GetQueryCheckpointInfoRequest{CheckpointId: cpID}
+		read(cc.KindCheckpointInfo, "", r, unary(cluster.GetQueryCheckpointInfo(ctx, r)))
+	}
+	info(id)
 
 	// Registry and schedule lifecycle.
 	read(cc.KindCheckpointRegistry, "", &clusterpb.ListQueryCheckpointsRequest{}, unary(cluster.ListQueryCheckpoints(ctx, &clusterpb.ListQueryCheckpointsRequest{})))
@@ -259,6 +270,7 @@ func TestIntegration_CheckpointsAgainstRealServer(t *testing.T) {
 	r := &servicepb.GetAccountRequest{Ledger: l1, Address: "t-0:1", CheckpointId: id}
 	read(cc.KindCheckpointRead, cc.ArmGetAccount, r, unary(client.GetAccount(ctx, r)))
 	read(cc.KindCheckpointRegistry, "", &clusterpb.ListQueryCheckpointsRequest{}, unary(cluster.ListQueryCheckpoints(ctx, &clusterpb.ListQueryCheckpointsRequest{})))
+	info(id)
 
 	// Fill the registry: the 11th live create hits the limit.
 	for range 10 {
@@ -285,7 +297,8 @@ func TestIntegration_CheckpointsAgainstRealServer(t *testing.T) {
 	read(cc.KindCheckpointRegistry, "", &clusterpb.ListQueryCheckpointsRequest{}, unary(cluster.ListQueryCheckpoints(ctx, &clusterpb.ListQueryCheckpointsRequest{})))
 
 	t.Logf("read coverage: %v", hits)
-	for _, id := range []oc.EventID{cc.CovFrozenRead, cc.CovListing, cc.CovScheduleRead, cc.EvFrozenFleetListing} {
+	for _, id := range []oc.EventID{cc.CovCreate, cc.CovDelete, cc.CovFrozenRead, cc.CovDeletedRead, cc.CovListing, cc.CovLimit,
+		cc.CovScheduleSet, cc.CovScheduleDelete, cc.CovScheduleRead, cc.EvFrozenFleetListing, cc.EvInfoMatched} {
 		require.Positive(t, hits[id], "%s", id)
 	}
 }

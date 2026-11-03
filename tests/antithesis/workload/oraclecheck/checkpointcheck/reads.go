@@ -116,7 +116,7 @@ func ValidateCheckpointRead(c *oc.ReadCtx) []oc.Event {
 	p := paramsOf(c)
 	res, id, ok := checkpointArm(c, p.Arm)
 	if !ok {
-		return []oc.Event{oc.Violation(EvReadOutsideFrozen, map[string]any{"error": "undecodable request", "arm": p.Arm, "request": rawOrNull(c.Request)})}
+		return []oc.Event{oc.Violation(EvProtocolMalformedRead, map[string]any{"kind": KindCheckpointRead, "arm": p.Arm, "request": rawOrNull(c.Request)})}
 	}
 	if res.skip {
 		return nil

@@ -17,6 +17,7 @@ const (
 	KindPredictedCheckpointRead = "PredictedCheckpointRead"
 	KindCheckpointRegistry      = "CheckpointRegistry"
 	KindCheckpointSchedule      = "CheckpointSchedule"
+	KindCheckpointInfo          = "CheckpointInfo"
 	ViewCheckpoints             = "checkpoints"
 	BeginHookSerialize          = "checkpoint-serialize"
 	DrainHookCoverage           = "checkpoint-coverage"
@@ -29,6 +30,7 @@ func init() {
 	oc.RegisterReadKind(oc.ReadKind{Name: KindPredictedCheckpointRead, Validate: ValidatePredictedCheckpointRead})
 	oc.RegisterReadKind(oc.ReadKind{Name: KindCheckpointRegistry, Validate: ValidateCheckpointRegistry})
 	oc.RegisterReadKind(oc.ReadKind{Name: KindCheckpointSchedule, Validate: ValidateCheckpointSchedule})
+	oc.RegisterReadKind(oc.ReadKind{Name: KindCheckpointInfo, Validate: ValidateCheckpointInfo})
 	oc.RegisterView(ViewCheckpoints, viewCheckpoints)
 	oc.RegisterBeginHook(BeginHookSerialize, SerializeCreates)
 	oc.RegisterDrainHook(DrainHookCoverage, drainCoverage)
@@ -138,6 +140,7 @@ type viewParams struct {
 	Table        string  `json:"table,omitempty"`
 	Probe        string  `json:"probe,omitempty"`
 	LogPick      uint64  `json:"logPick,omitempty"`
+	SeenPick     uint64  `json:"seenPick,omitempty"`
 }
 
 func idStrings(ids []uint64) []string {
@@ -154,7 +157,10 @@ func idStrings(ids []uint64) []string {
 // (live ++ retained deleted)[pick mod n], whether it is deleted, a ledger
 // live in its frozen state ([cpLedgerPick mod n], null if none), a seek on
 // that frozen ledger when "table" is set, a frozen log sequence
-// ([logPick mod n] of the frozen global stream) and its max sequence.
+// ([logPick mod n] of the frozen global stream), its max sequence, and a
+// "seenLedger": [seenPick mod n] of every non-reserved tracked ledger name the
+// oracle has seen, created after the checkpoint or deleted included (the
+// ListLedgers cursor pool of M/checkpoint_reads.go:195-197).
 func viewCheckpoints(snap oracle.GlobalState, t *oc.Tracker, params json.RawMessage) (any, error) {
 	var p viewParams
 	if err := json.Unmarshal(params, &p); err != nil {
@@ -196,6 +202,15 @@ func viewCheckpoints(snap oracle.GlobalState, t *oc.Tracker, params json.RawMess
 		"deleted":     !snap.QueryCheckpointExists(id),
 		"maxSequence": strconv.FormatUint(maxSeq, 10),
 		"ledger":      nil,
+	}
+	var seen []string
+	for _, name := range t.LedgerNames() {
+		if !oc.IsReservedLedger(t.Config().TrackedPrefix, name) {
+			seen = append(seen, name)
+		}
+	}
+	if len(seen) > 0 {
+		target["seenLedger"] = seen[p.SeenPick%uint64(len(seen))]
 	}
 	if seqs := frozenLogSequences(frozen); len(seqs) > 0 {
 		target["logSeq"] = strconv.FormatUint(seqs[p.LogPick%uint64(len(seqs))], 10)

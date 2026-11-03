@@ -20,18 +20,20 @@ import (
 //
 // Loosened against M/: a NotFound is also legal when the ledger was not live
 // in the state the create froze (a concurrent DeleteLedger serialized before
-// the create), which M/ would have reported.
+// the create), or when some candidate base has deleted the ledger since (no
+// frozen checkpoint keeps serving a deleted ledger,
+// match.CheckpointLedgerReadOutcomeMatches); M/ reported both.
 func ValidatePredictedCheckpointRead(c *oc.ReadCtx) []oc.Event {
 	var req servicepb.GetLedgerRequest
 	if err := decode(c.Request, &req); err != nil || req.GetRead().GetCheckpointId() == 0 {
-		return []oc.Event{oc.Violation(EvPredictedUnexpectedError, map[string]any{"error": "undecodable request", "request": rawOrNull(c.Request)})}
+		return []oc.Event{oc.Violation(EvProtocolMalformedRead, map[string]any{"kind": KindPredictedCheckpointRead, "request": rawOrNull(c.Request)})}
 	}
 	id, ledger := req.GetRead().GetCheckpointId(), req.GetLedger()
 	d := map[string]any{"checkpoint": id, "ledger": ledger, "maxTicket": c.MaxTicket}
 	if !c.Outcome.OK {
 		err := rpcError(c.Outcome)
 		if match.CheckpointNotFound(err) {
-			if match.CheckpointReadOutcomeMatches(id, false, err, c.Matches) {
+			if match.CheckpointLedgerReadOutcomeMatches(id, ledger, false, err, c.Matches) {
 				return nil
 			}
 			if c.T.CheckpointCreationMatches(c.MaxTicket, id, func(before oracle.GlobalState) bool {
@@ -100,4 +102,50 @@ func ValidateCheckpointSchedule(c *oc.ReadCtx) []oc.Event {
 	}
 
 	return coverage(CovScheduleRead, map[string]any{"cron": resp.GetCron()})
+}
+
+// ValidateCheckpointInfo checks a fenced GetQueryCheckpointInfo on a pinned
+// node (MD/parallel_driver_query_checkpoints/main.go:127-137, now against the
+// model): a success names the requested id, reports the max sequence the
+// oracle captured at its creation, and the id is live in some candidate base;
+// NotFound is legal only when some candidate base lacks the id.
+func ValidateCheckpointInfo(c *oc.ReadCtx) []oc.Event {
+	var req clusterpb.GetQueryCheckpointInfoRequest
+	if err := decode(c.Request, &req); err != nil || req.GetCheckpointId() == 0 {
+		return []oc.Event{oc.Violation(EvProtocolMalformedRead, map[string]any{"kind": KindCheckpointInfo, "request": rawOrNull(c.Request)})}
+	}
+	id := req.GetCheckpointId()
+	d := map[string]any{"checkpoint": id, "node": c.Route.Node, "maxTicket": c.MaxTicket, "modelIds": c.T.Model().QueryCheckpointIDs()}
+	if !c.Outcome.OK {
+		err := rpcError(c.Outcome)
+		if match.CheckpointReadOutcomeMatches(id, false, err, c.Matches) {
+			return nil
+		}
+		d["code"], d["reason"], d["message"] = c.Outcome.Code, c.Outcome.Reason, c.Outcome.Message
+		if match.CheckpointNotFound(err) {
+			return []oc.Event{oc.Violation(EvInfoOutsideModel, d)}
+		}
+
+		return []oc.Event{oc.Violation(EvInfoUnexpectedError, d)}
+	}
+	info := &clusterpb.QueryCheckpointInfo{}
+	if err := decode(c.Outcome.Response, info); err != nil {
+		d["error"], d["returned"] = err.Error(), rawOrNull(c.Outcome.Response)
+
+		return []oc.Event{oc.Violation(EvInfoOutsideModel, d)}
+	}
+	seq, known := c.T.FrozenCheckpointMaxSequence(id)
+	d["returnedId"], d["returnedMaxSequence"], d["expectedMaxSequence"] = info.GetCheckpointId(), info.GetMaxSequence(), seq
+	switch {
+	case info.GetCheckpointId() != id:
+		d["why"] = "info names another checkpoint"
+	case known && info.GetMaxSequence() != seq:
+		d["why"] = "max sequence differs from the captured creation"
+	case !c.Matches(func(base oracle.GlobalState) bool { return base.QueryCheckpointExists(id) }):
+		d["why"] = "no candidate base holds the checkpoint"
+	default:
+		return []oc.Event{oc.Reached(EvInfoMatched, map[string]any{"checkpoint": id, "maxSequence": seq})}
+	}
+
+	return []oc.Event{oc.Violation(EvInfoOutsideModel, d)}
 }
