@@ -61,7 +61,7 @@ var childEnvNames = map[string]bool{
 	"INSECURE": true, "JSON_FORMATTING_LOGGER": true, "LOG_LEVEL": true,
 	"SENTINEL_MODE": true, "IDEMPOTENCY_TTL": true, "QUERY_CHECKPOINT_LIMIT": true,
 	"MAINTENANCE_INTERVAL": true,
-	"AWS_ACCESS_KEY_ID": true, "AWS_SECRET_ACCESS_KEY": true, "AWS_REGION": true,
+	"AWS_ACCESS_KEY_ID":    true, "AWS_SECRET_ACCESS_KEY": true, "AWS_REGION": true,
 	"GORACE": true, "GOMEMLIMIT": true, "GOMAXPROCS": true, "GOCOVERDIR": true, "GOTRACEBACK": true,
 }
 

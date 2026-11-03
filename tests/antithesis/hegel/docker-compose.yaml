@@ -164,6 +164,46 @@ services:
       RUST_BACKTRACE: "1"
 
   # ==== 18-restore (services appended by tasks/18) ====
+  # Restore targets (task 18, restore.md §4.2): restore-agent supervises one
+  # ledger-server child that the driver starts in restore, normal or join
+  # mode, with its own cluster id (restore-g<gen>, never `default`). The
+  # child's environment is built by the agent from an allowlist, so
+  # CLUSTER_ID from x-ledger never reaches it. `nats` resolves to localhost:
+  # a restored cluster keeps the source's event sinks and must never deliver
+  # into the source's subjects (DESIGN §2.3). restore-1 (the joiner) idles
+  # unless the driver runs with RESTORE_JOINER=1.
+  restore-0:
+    <<: &restore
+      platform: linux/amd64
+      build:
+        context: ../../..
+        dockerfile: tests/antithesis/hegel/restore/Dockerfile
+      image: ledger-hegel-restore:latest
+      restart: on-failure
+      init: true
+      extra_hosts: ["nats:127.0.0.1"]
+      environment: &restore-env
+        <<: *ledger-env
+        WAL_DIR: /data/raft
+        DATA_DIR: /data/app
+        AGENT_ADDR: ":8090"
+        AGENT_STATE: /data/agent.json
+        S3_BUCKET: backups
+        S3_ENDPOINT: http://minio:9000
+        S3_REGION: us-east-1
+        # One restored copy plus one staged download at a time; small caches
+        # (DESIGN §2.4: 700 MB RSS, 500 MB volume).
+        PEBBLE_CACHE_SIZE: 32Mi
+        PEBBLE_MEMTABLE_SIZE: 16Mi
+        READ_INDEX_MEMTABLE_SIZE: 8Mi
+    container_name: restore-0
+    hostname: restore-0
+    volumes: [restore-0:/data]
+  restore-1:
+    <<: *restore
+    container_name: restore-1
+    hostname: restore-1
+    volumes: [restore-1:/data]
   # ==== end 18-restore ====
 
 volumes:
@@ -175,4 +215,6 @@ volumes:
   ledger-2-data:
   minio-data:
   # ==== 18-restore (services appended by tasks/18) ====
+  restore-0:
+  restore-1:
   # ==== end 18-restore ====
