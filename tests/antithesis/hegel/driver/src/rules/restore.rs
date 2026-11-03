@@ -330,7 +330,7 @@ fn submit(d: &Driver, st: &Arc<RestoreState>, name: &'static str, f: impl FnOnce
 // ---------------------------------------------------------------- budget
 
 /// Whether the cycle ran out of its wall budget: from the base until the cut
-/// (`cut_wait`: quiet periods come every 3–8 minutes), then `cycle_budget`
+/// (`cut_wait`: quiet periods come every 1.5–4 minutes), then `cycle_budget`
 /// from the cut (deviation from the single 10-minute budget, recorded in the
 /// porting file).
 pub fn expired(c: &RestoreCycle, t: &RTiming) -> bool {

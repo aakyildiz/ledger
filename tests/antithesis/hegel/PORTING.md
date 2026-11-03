@@ -3101,7 +3101,7 @@ Sometimes / Reachable: `restore base backup completes`, `a restore cut has a non
 
 1. **Budget** (review finding 5): the 10-minute wall budget runs from the cut. From the base
    until the cut the cycle waits at most `cut_wait` = 15 minutes (quiet periods come every
-   3–8 minutes, so a single budget from the base would expire most cycles before their cut).
+   1.5–4 minutes, so a single budget from the base would expire most cycles before their cut).
    Expiry resets the agents and returns to Idle with `a restore cycle completes within its wall
    budget` (Sometimes) false; it never evaluates an Always.
 2. **Chained restore** (review finding 4): the chain uses the per-generation namespace
@@ -3234,6 +3234,15 @@ lists no `workload/internal` path, so the service does not link
   after a kill-fault restart hit (same run). Both wrappers remap only when the
   trap fired (a flag), so a process killed by a signal the wrapper never got
   keeps its status (137) instead of a second `wait`'s 127.
+- Quiet-period timing for short Antithesis timelines (run
+  `3d8b6ff117f4ff08f7b9b40db1b5e083-67-0`: 12 compute hours, timelines up to
+  about 8 minutes, `exact` drawn once and never finished, so none of the
+  oracle's quiet checks fired). The trigger gaps are 60 s/240 s instead of
+  150 s/480 s (DESIGN §4.10), the first two quiet periods of a process use
+  30 s/120 s while no `exact` check has completed, and a gap counts from the
+  end of the previous period's fault pause when that is later. `exact` weighs
+  50 until it completes once in the process (and again after 3 quiet periods
+  without a completion), 10 otherwise, instead of 4 (50 after 3).
 
 ## Server findings reported by task 99 (not masked in the checks)
 
