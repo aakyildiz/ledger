@@ -94,7 +94,9 @@ func pj(t *testing.T, m proto.Message) json.RawMessage {
 
 func okOut(t *testing.T, m proto.Message) oc.Outcome { return oc.Outcome{OK: true, Response: pj(t, m)} }
 
-func errOut(code, reason string) oc.Outcome { return oc.Outcome{Code: code, Reason: reason, Message: "x"} }
+func errOut(code, reason string) oc.Outcome {
+	return oc.Outcome{Code: code, Reason: reason, Message: "x"}
+}
 
 type readResult struct {
 	ticket uint64
