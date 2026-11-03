@@ -1,0 +1,9 @@
+{
+  "name": "transaction reference conflict",
+  "setup": [
+    {"createLedger": {"name": "o-rej-l1"}},
+    {"apply": {"ledger": "o-rej-l1", "action": {"createTransaction": {"reference": "o-rej-ref1", "postings": [{"source": "world", "destination": "t-1:1", "asset": "COIN", "amount": {"v0": "5"}}]}}}}
+  ],
+  "requests": [{"apply": {"ledger": "o-rej-l1", "action": {"createTransaction": {"reference": "o-rej-ref1", "postings": [{"source": "world", "destination": "t-1:2", "asset": "COIN", "amount": {"v0": "3"}}]}}}}],
+  "expectReason": "TRANSACTION_REFERENCE_CONFLICT"
+}
