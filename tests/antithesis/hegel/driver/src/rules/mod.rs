@@ -34,6 +34,7 @@ pub mod smoke;
 // ==== 15-convergence mods ====
 // ==== end 15-convergence mods ====
 // ==== 16-signing mods ====
+pub mod signing;
 // ==== end 16-signing mods ====
 // ==== 17-scenario-blocks mods ====
 // ==== end 17-scenario-blocks mods ====
@@ -72,6 +73,7 @@ pub fn rules() -> Vec<ConcurrentRule<Driver>> {
     // ==== 15-convergence rules ====
     // ==== end 15-convergence rules ====
     // ==== 16-signing rules ====
+    v.extend(signing::rules());
     // ==== end 16-signing rules ====
     // ==== 17-scenario-blocks rules ====
     // ==== end 17-scenario-blocks rules ====
@@ -193,6 +195,7 @@ pub fn exclusive_actions() -> Vec<crate::exclusive::ExclusiveAction> {
     // ==== 15-convergence exclusive_actions ====
     // ==== end 15-convergence exclusive_actions ====
     // ==== 16-signing exclusive_actions ====
+    v.extend(signing::exclusive_actions());
     // ==== end 16-signing exclusive_actions ====
     // ==== 17-scenario-blocks exclusive_actions ====
     // ==== end 17-scenario-blocks exclusive_actions ====
@@ -233,6 +236,7 @@ pub fn setup_hooks() -> Vec<crate::setup::SetupHook> {
     // ==== 15-convergence setup_hooks ====
     // ==== end 15-convergence setup_hooks ====
     // ==== 16-signing setup_hooks ====
+    v.extend(signing::setup_hooks());
     // ==== end 16-signing setup_hooks ====
     // ==== 17-scenario-blocks setup_hooks ====
     // ==== end 17-scenario-blocks setup_hooks ====
