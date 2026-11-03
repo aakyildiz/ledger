@@ -410,6 +410,17 @@ Predicate mapping (`W/internal/client.go` → `CL/classify.go` `classified`):
 - C6 `CL/digest.go`: `POST /digest` (format documented in the file header).
 - C7 `CL/ext.go`: `registerExt(pattern, h)`; handlers reach the client through
   `extServer()`.
+- Shutdown `CL/main.go` `serve`: on SIGTERM/SIGINT the client stops accepting requests,
+  waits up to 8 s (`shutdownGrace`, under Docker's 10 s stop timeout) for the open HTTP
+  requests and for every in-flight RPC (including those whose HTTP request already gave
+  up) to finish and report, and only then closes its gRPC connections. An RPC cut off by
+  that close fails with grpc-go's own "grpc: the client connection is closing"
+  (Canceled, or Unavailable carrying it). That outcome is not a server answer: it is
+  never reported (no UDP event, and the HTTP connection is dropped through
+  `http.ErrAbortHandler`), so the driver sees no answer. The check needs both that error
+  shape and the client's own `closing` flag, so a server answering Canceled with the same
+  message is still reported as a remote Canceled. After close, a new node connection is a
+  local `dial:` error (no answer for the driver). `shutdown_test.go`.
 
 ### Deviations
 
@@ -3209,6 +3220,20 @@ lists no `workload/internal` path, so the service does not link
   made the block test fail about one run in six.
 - A frozen `AGGREGATE_OVERFLOW` is explained before task 09's outcome matcher
   (which accepts only success and NotFound).
+- The client shuts down gracefully (00e "Shutdown"). It closed its gRPC
+  connections as soon as `ListenAndServe` returned, with RPCs still in flight,
+  and reported grpc-go's own "grpc: the client connection is closing" as a
+  remote `Canceled`: a stop fault on a client fired task 12's `Backup returned
+  unexpected error` (run 3d8b6ff117f4ff08f7b9b40db1b5e083-67-0). The client now
+  waits (bounded) for in-flight RPCs and never reports an outcome caused by its
+  own close; the driver's backup rule (a remote `Canceled` is not tolerated) is
+  unchanged.
+- `minio` runs under a signal wrapper like `nats` (keeping `restart:
+  on-failure`): as PID 1, minio exits 2 silently on a SIGTERM in its first
+  ~0.3 s, before its handler is installed, which an Antithesis stop fault right
+  after a kill-fault restart hit (same run). Both wrappers remap only when the
+  trap fired (a flag), so a process killed by a signal the wrapper never got
+  keeps its status (137) instead of a second `wait`'s 127.
 
 ## Server findings reported by task 99 (not masked in the checks)
 

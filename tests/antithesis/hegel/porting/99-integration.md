@@ -75,6 +75,20 @@ lists no `workload/internal` path, so the service does not link
   made the block test fail about one run in six.
 - A frozen `AGGREGATE_OVERFLOW` is explained before task 09's outcome matcher
   (which accepts only success and NotFound).
+- The client shuts down gracefully (00e "Shutdown"). It closed its gRPC
+  connections as soon as `ListenAndServe` returned, with RPCs still in flight,
+  and reported grpc-go's own "grpc: the client connection is closing" as a
+  remote `Canceled`: a stop fault on a client fired task 12's `Backup returned
+  unexpected error` (run 3d8b6ff117f4ff08f7b9b40db1b5e083-67-0). The client now
+  waits (bounded) for in-flight RPCs and never reports an outcome caused by its
+  own close; the driver's backup rule (a remote `Canceled` is not tolerated) is
+  unchanged.
+- `minio` runs under a signal wrapper like `nats` (keeping `restart:
+  on-failure`): as PID 1, minio exits 2 silently on a SIGTERM in its first
+  ~0.3 s, before its handler is installed, which an Antithesis stop fault right
+  after a kill-fault restart hit (same run). Both wrappers remap only when the
+  trap fired (a flag), so a process killed by a signal the wrapper never got
+  keeps its status (137) instead of a second `wait`'s 127.
 
 ## Server findings reported by task 99 (not masked in the checks)
 
