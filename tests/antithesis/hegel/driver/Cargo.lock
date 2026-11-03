@@ -82,6 +82,7 @@ dependencies = [
  "antithesis_sdk",
  "base64",
  "hegeltest",
+ "serde",
  "serde_json",
  "ureq",
 ]
