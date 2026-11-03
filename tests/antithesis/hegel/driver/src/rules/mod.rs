@@ -325,6 +325,7 @@ pub fn log_hooks() -> Vec<crate::logs::LogHook> {
     // ==== end 11-quiet-exact log_hooks ====
     // ==== 12-cluster-ops-signals log_hooks ====
     v.extend(server_signals::log_hooks());
+    v.extend(cluster_ops::log_hooks());
     // ==== end 12-cluster-ops-signals log_hooks ====
     // ==== 13-numscript log_hooks ====
     // ==== end 13-numscript log_hooks ====
