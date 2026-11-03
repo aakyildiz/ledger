@@ -171,6 +171,11 @@ services:
       # Task 09's `checkpoints` view exists: task 07's inspect_index may read
       # an index from a query checkpoint.
       HEGEL_HAVE_CHECKPOINTS: "1"
+      # The driver starts threads all the time (hegel workers per test case,
+      # scoped dispatch threads); with glibc's default of 8 arenas per CPU the
+      # freed memory stayed spread over many arenas and the RSS grew to 800 MB
+      # in 20 minutes (task 99). Two arenas keep it near 50 MB.
+      MALLOC_ARENA_MAX: "2"
       RUST_BACKTRACE: "1"
 
   # ==== 18-restore (services appended by tasks/18) ====
