@@ -1,0 +1,11 @@
+{
+  "name": "07 duplicate builtin index (index_op create without a gap)",
+  "setup": [
+    {"createLedger": {"name": "o-rej-l1"}},
+    {"createIndex": {"ledger": "o-rej-l1", "id": {"txBuiltin": "TX_BUILTIN_INDEX_REFERENCE"}}}
+  ],
+  "requests": [
+    {"createIndex": {"ledger": "o-rej-l1", "id": {"txBuiltin": "TX_BUILTIN_INDEX_REFERENCE"}}}
+  ],
+  "expectReason": "INDEX_ALREADY_EXISTS"
+}

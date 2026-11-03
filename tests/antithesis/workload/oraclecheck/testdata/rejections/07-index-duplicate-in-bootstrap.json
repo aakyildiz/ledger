@@ -1,0 +1,16 @@
+{
+  "name": "07 bootstrap bulk over an existing builtin (reused volume / earlier index_op)",
+  "setup": [
+    {"createLedger": {"name": "o-rej-l1"}},
+    {"createIndex": {"ledger": "o-rej-l1", "id": {"accountBuiltin": "ACCT_BUILTIN_INDEX_ASSET"}}}
+  ],
+  "requests": [
+    {"createIndex": {"ledger": "o-rej-l1", "id": {"txBuiltin": "TX_BUILTIN_INDEX_REFERENCE"}}},
+    {"createIndex": {"ledger": "o-rej-l1", "id": {"txBuiltin": "TX_BUILTIN_INDEX_ADDRESS"}}},
+    {"createIndex": {"ledger": "o-rej-l1", "id": {"txBuiltin": "TX_BUILTIN_INDEX_SOURCE_ADDRESS"}}},
+    {"createIndex": {"ledger": "o-rej-l1", "id": {"txBuiltin": "TX_BUILTIN_INDEX_DESTINATION_ADDRESS"}}},
+    {"createIndex": {"ledger": "o-rej-l1", "id": {"txBuiltin": "TX_BUILTIN_INDEX_TIMESTAMP"}}},
+    {"createIndex": {"ledger": "o-rej-l1", "id": {"accountBuiltin": "ACCT_BUILTIN_INDEX_ASSET"}}}
+  ],
+  "expectReason": "INDEX_ALREADY_EXISTS"
+}

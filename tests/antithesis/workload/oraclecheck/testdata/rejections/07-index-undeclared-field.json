@@ -1,0 +1,11 @@
+{
+  "name": "07 index on an undeclared metadata field (index_op 1/16 probe)",
+  "setup": [
+    {"createLedger": {"name": "o-rej-l1"}},
+    {"setMetadataFieldType": {"ledger": "o-rej-l1", "targetType": "TARGET_TYPE_ACCOUNT", "key": "k1", "type": "METADATA_TYPE_STRING"}}
+  ],
+  "requests": [
+    {"createIndex": {"ledger": "o-rej-l1", "id": {"metadata": {"target": "TARGET_TYPE_TRANSACTION", "key": "undeclared-k1"}}}}
+  ],
+  "expectReason": "METADATA_FIELD_NOT_IN_SCHEMA"
+}
