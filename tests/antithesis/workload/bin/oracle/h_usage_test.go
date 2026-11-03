@@ -20,7 +20,7 @@ func TestUsageProvider_ExactCountsAtQuietBegin(t *testing.T) {
 	for _, m := range []map[string]any{
 		c.Write(true, testutil.TxReq(l1, c.Prefix+"ref1", "world", "t-1:1", "COIN", 100)),
 		c.Write(false, testutil.TxReq(l1, "", "world", "t-1:2", "COIN", 7), testutil.TxReq(l1, "", "t-1:1", "t-1:2", "COIN", 3)),
-		c.Write(false, testutil.RevertReq(l1, 1)),
+		c.Write(false, testutil.RevertReq(l1, 3)),
 		c.Write(false, testutil.AccountMetaReq(l1, "t-1:1", "k0", "v")),
 		c.Write(false, testutil.CreateLedgerReq(l2)),
 		c.Write(false, testutil.TxReq(l2, "", "world", "t-1:1", "COIN", 1)),
@@ -28,6 +28,7 @@ func TestUsageProvider_ExactCountsAtQuietBegin(t *testing.T) {
 	} {
 		okv, viol := servicetest.Verdict(m)
 		require.True(t, okv, "%v", viol)
+		require.Equal(t, "pending", m["status"], "every write commits")
 	}
 
 	begin := c.OK("POST", "/quiet/begin", map[string]any{"epoch": 1})

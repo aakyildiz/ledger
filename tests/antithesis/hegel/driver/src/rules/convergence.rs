@@ -472,8 +472,16 @@ pub const CROSS_WINDOWS: Windows = Windows { convergence: Duration::from_secs(60
 pub const STATS_WINDOWS: Windows = Windows { convergence: Duration::from_secs(60), reserve: Duration::from_secs(3) };
 
 impl Windows {
+    /// The end of the shared window. When the budget cannot hold the whole
+    /// window plus the reserve, the window ends at the deadline, so running
+    /// out is a cut (no verdict), never a convergence failure.
     fn end(&self, deadline: Instant) -> Instant {
-        (Instant::now() + self.convergence).min(deadline.checked_sub(self.reserve).unwrap_or(deadline))
+        let e = Instant::now() + self.convergence;
+        if e + self.reserve > deadline {
+            deadline
+        } else {
+            e
+        }
     }
 }
 
