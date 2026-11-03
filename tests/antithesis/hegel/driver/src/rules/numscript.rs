@@ -696,10 +696,12 @@ pub fn unresolved_script(cfg: &str) -> String {
 /// and the FSM, finding no frozen outcome, answers the retryable
 /// `PRELOAD_UNAVAILABLE` without auditing or freezing it
 /// (`admission.go` `classifyResolutionFailure`, `machine.go`); without a key
-/// it fails fast with `DEPENDENCY_DISCOVERY_FAILED`. The other templates of
-/// this family never read state while resolving, so this rule is the only
-/// source of `a write attempt hits a preload miss` (`write::explore_attempt`
-/// sees every attempt). The `cfg` account is fresh per send and nothing ever
+/// it fails fast with the metadata miss itself, `NUMSCRIPT_EXECUTION_ERROR`
+/// (a precondition, returned by the freezable branch; server test
+/// `numscript_failure_provenance_test.go`, "read-then-fail without key").
+/// The other templates of this family never read state while resolving, so
+/// this rule is the only source of `a write attempt hits a preload miss`
+/// (`write::explore_attempt` sees every attempt). The `cfg` account is fresh per send and nothing ever
 /// writes its metadata, so a commit is a finding.
 pub fn ns_unresolved(d: &Driver, tc: TestCase) {
     d.guarded("ns_unresolved", &tc, |d, tc| {
