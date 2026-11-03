@@ -232,6 +232,7 @@ func handleBlockSetup(w http.ResponseWriter, r *http.Request) {
 	}()
 	select {
 	case out := <-done:
+		s.abortIfOwnClose(out)
 		writeJSON(w, blockSetupResponse{
 			Boot: boot, OpID: req.OpID, OK: out.OK,
 			Code: out.Code, Reason: out.Reason, Message: out.Message, Local: out.Local,
@@ -336,6 +337,7 @@ func handleBlock(w http.ResponseWriter, r *http.Request) {
 	}()
 	select {
 	case res := <-done:
+		s.abortIfOwnClose(res.out)
 		writeJSON(w, blockResponse{
 			Boot: boot, OpID: req.OpID, OK: res.out.OK, Skipped: res.skipped, Exhausted: res.exhausted,
 			Code: res.out.Code, Reason: res.out.Reason, Message: res.out.Message, Local: res.out.Local,

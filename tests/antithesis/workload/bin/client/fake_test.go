@@ -32,16 +32,34 @@ type fakeBucket struct {
 	calls int
 	// metadataBytes, when set, pads the GetLedger response to that size.
 	metadataBytes int
+	// hold, when set, makes GetLedger wait until it is closed (or the call
+	// ends).
+	hold chan struct{}
+	// err, when set, is GetLedger's answer.
+	err error
 
 	ledgers  []string
 	accounts map[string][]string
 	stats    map[string]*commonpb.LedgerStats
 }
 
-func (f *fakeBucket) GetLedger(_ context.Context, req *servicepb.GetLedgerRequest) (*commonpb.LedgerInfo, error) {
+func (f *fakeBucket) GetLedger(ctx context.Context, req *servicepb.GetLedgerRequest) (*commonpb.LedgerInfo, error) {
+	f.mu.Lock()
+	f.calls++
+	hold := f.hold
+	f.mu.Unlock()
+	if hold != nil {
+		select {
+		case <-hold:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.calls++
+	if f.err != nil {
+		return nil, f.err
+	}
 	if f.unavailable > 0 {
 		f.unavailable--
 		return nil, status.Error(codes.Unavailable, "scripted unavailable")
