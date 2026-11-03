@@ -32,6 +32,10 @@
 // "peer" (the node that answered) and "elapsedMs". Every completion is also
 // sent to OUTCOME_ADDR over UDP as {"boot", "opId", "outcome"}, even if the
 // HTTP request has already given up, so the driver learns late outcomes.
+//
+// On SIGTERM or SIGINT the client finishes its in-flight RPCs (bounded) before
+// it closes the gRPC connections, and never reports an RPC failed by that
+// close as a server answer (serve, ownClose).
 package main
 
 import (
@@ -120,6 +124,11 @@ type outcome struct {
 	Peer string `json:"peer,omitempty"`
 	// ElapsedMS is the time the RPC took, in milliseconds.
 	ElapsedMS int64 `json:"elapsedMs,omitempty"`
+
+	// connClosing marks the error grpc-go returns when the client's own
+	// connection closes (connClosingError). It is never sent: whether the
+	// client closed the connection is decided by ownClose.
+	connClosing bool
 }
 
 type event struct {
@@ -150,22 +159,93 @@ func main() {
 	if addr == "" {
 		addr = ":8080"
 	}
-	httpServer := &http.Server{Addr: addr, Handler: s.mux(), ReadHeaderTimeout: 5 * time.Second}
+	lis, err := net.Listen("tcp", addr)
+	if err != nil {
+		log.Fatalf("listen: %v", err)
+	}
+	stop := make(chan struct{})
 	go func() {
 		sigs := make(chan os.Signal, 1)
 		signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
 		<-sigs
 		log.Printf("client shutting down")
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := httpServer.Shutdown(ctx); err != nil {
-			log.Printf("shutdown: %v", err)
-		}
+		close(stop)
 	}()
-	if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+	if err := s.serve(lis, stop, shutdownGrace); err != nil {
 		log.Fatalf("listen: %v", err)
 	}
-	cs.close()
+}
+
+// shutdownGrace bounds a graceful shutdown: the time the HTTP server and the
+// in-flight RPCs get to finish before the gRPC connections close. It stays
+// under Docker's 10 s stop timeout.
+const shutdownGrace = 8 * time.Second
+
+// serve serves the client's HTTP protocol on lis until stop is closed, then
+// shuts down: it stops accepting requests, waits (within grace) for the open
+// requests and for every in-flight RPC, including those whose HTTP request
+// has already given up, to finish and report, and only then closes the gRPC
+// connections. An RPC still running when the grace expires fails with the
+// client's own connection-closing error; that is not a server answer, so it
+// is never reported as one (ownClose).
+func (s *server) serve(lis net.Listener, stop <-chan struct{}, grace time.Duration) error {
+	httpServer := &http.Server{Handler: s.mux(), ReadHeaderTimeout: 5 * time.Second}
+	served := make(chan error, 1)
+	go func() { served <- httpServer.Serve(lis) }()
+	select {
+	case err := <-served:
+		s.conns.close()
+		return err
+	case <-stop:
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), grace)
+	defer cancel()
+	shutErr := httpServer.Shutdown(ctx)
+	if err := <-served; err != nil && !errors.Is(err, http.ErrServerClosed) {
+		log.Printf("serve: %v", err)
+	}
+	if shutErr != nil {
+		// The grace ran out with handlers still open. One may not have
+		// called inFlight.Add yet, and an Add from zero concurrent with
+		// Wait is a WaitGroup misuse, so do not wait: the grace is spent.
+		log.Printf("shutdown: %v; closing the gRPC connections", shutErr)
+	} else {
+		// Every handler has returned, so every inFlight.Add happened
+		// before this Wait.
+		rpcsDone := make(chan struct{})
+		go func() {
+			s.inFlight.Wait()
+			close(rpcsDone)
+		}()
+		select {
+		case <-rpcsDone:
+		case <-ctx.Done():
+			log.Printf("shutdown: in-flight RPCs still running after %s; closing their connections", grace)
+		}
+	}
+	s.conns.close()
+
+	return nil
+}
+
+// ownClose reports whether a failed outcome was caused by the client closing
+// its own connections at shutdown (serve). Such an outcome is not a server
+// answer: it is never sent to the driver, over UDP or HTTP, so the driver
+// sees no answer, which it already tolerates. Both conditions are needed: a
+// server answer with the same code and message (a node whose own client
+// connection closed) is still reported, as it is while the client runs.
+func (s *server) ownClose(out outcome) bool {
+	return !out.OK && out.connClosing && s.conns.closing.Load()
+}
+
+// abortIfOwnClose drops the HTTP response of an operation that failed only
+// because the client closed its own connections (ownClose): the driver sees
+// the connection drop (no answer) instead of a server error.
+func (s *server) abortIfOwnClose(out outcome) {
+	if s.ownClose(out) {
+		panic(http.ErrAbortHandler)
+	}
 }
 
 // mux mounts the core endpoints and every registered extension.
@@ -268,6 +348,7 @@ func (s *server) handleOp(w http.ResponseWriter, r *http.Request) {
 
 	select {
 	case out := <-done:
+		s.abortIfOwnClose(out)
 		writeJSON(w, event{Boot: boot, OpID: req.OpID, Outcome: out})
 	case <-r.Context().Done():
 	}
@@ -385,6 +466,11 @@ func withPeer(out outcome, p *peer.Peer) outcome {
 // report logs the completion and sends it to the driver over UDP. Large
 // stream results are summarised on the UDP path; the HTTP response keeps them.
 func (s *server) report(opID uint64, method string, out outcome) {
+	if s.ownClose(out) {
+		log.Printf("op=%d method=%s dropped: the client closed its connection at shutdown (code=%s msg=%q)", opID, method, out.Code, out.Message)
+
+		return
+	}
 	if out.OK {
 		log.Printf("op=%d method=%s ok items=%d peer=%s ms=%d", opID, method, len(out.Items), out.Peer, out.ElapsedMS)
 	} else {
@@ -445,6 +531,7 @@ func errOutcome(err error) outcome {
 			out.Metadata = info.GetMetadata()
 		}
 	}
+	out.connClosing = connClosingError(st)
 	if st.Code() == codes.ResourceExhausted && out.Reason == "" {
 		for _, m := range localSizeMessages {
 			if strings.HasPrefix(st.Message(), m) {
@@ -454,6 +541,26 @@ func errOutcome(err error) outcome {
 	}
 
 	return out
+}
+
+// clientConnClosing is the message of grpc.ErrClientConnClosing.
+var clientConnClosing = status.Convert(grpc.ErrClientConnClosing).Message()
+
+// connClosingError reports whether st is the error grpc-go gives an RPC when
+// the client's own connection closes: grpc.ErrClientConnClosing (Canceled) on
+// the picker and stream paths, or Unavailable carrying it when the transport
+// under an active stream is torn down. A server can send the same status (for
+// one of its own connections), so this alone does not make it local: see
+// ownClose.
+func connClosingError(st *status.Status) bool {
+	switch st.Code() {
+	case codes.Canceled:
+		return st.Message() == clientConnClosing
+	case codes.Unavailable:
+		return strings.Contains(st.Message(), clientConnClosing)
+	}
+
+	return false
 }
 
 func lookupMethod(service, method string) (protoreflect.MethodDescriptor, error) {

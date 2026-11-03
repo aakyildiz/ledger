@@ -136,6 +136,7 @@ func (s *server) handleDigest(w http.ResponseWriter, r *http.Request) {
 		resp.Error = err.Error()
 		var re *rpcError
 		if errors.As(err, &re) {
+			s.abortIfOwnClose(re.out)
 			resp.Outcome = &re.out
 		}
 	} else {

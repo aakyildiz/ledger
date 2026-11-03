@@ -3,10 +3,12 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -106,6 +108,9 @@ type conns struct {
 
 	nodesMu sync.Mutex
 	nodes   map[string]*grpc.ClientConn
+
+	// closing is set when close starts (client shutdown, serve).
+	closing atomic.Bool
 }
 
 func newConns(addrs string) (*conns, error) {
@@ -151,6 +156,11 @@ func (c *conns) pick(route, node string) (*grpc.ClientConn, error) {
 func (c *conns) node(addr string) (*grpc.ClientConn, error) {
 	c.nodesMu.Lock()
 	defer c.nodesMu.Unlock()
+	if c.closing.Load() {
+		// No new connection once close has run; the outcome is a local
+		// "dial:" error, which the driver reads as no answer.
+		return nil, errors.New("client is shutting down")
+	}
 	if conn, ok := c.nodes[addr]; ok {
 		return conn, nil
 	}
@@ -164,6 +174,7 @@ func (c *conns) node(addr string) (*grpc.ClientConn, error) {
 }
 
 func (c *conns) close() {
+	c.closing.Store(true)
 	for _, conn := range []*grpc.ClientConn{c.lib, c.plain} {
 		_ = conn.Close()
 	}

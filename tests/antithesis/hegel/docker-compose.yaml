@@ -101,7 +101,28 @@ services:
     container_name: minio
     hostname: minio
     restart: on-failure
-    command: server /data --console-address ":9001"
+    # minio exits 2, silently, on SIGTERM/SIGINT during its first ~0.3 s,
+    # before its signal handler is installed, when it is PID 1 (the image
+    # entrypoint only runs `exec "$@"`). Seen when a stop fault lands right
+    # after a kill-fault restart. Run it under sh and report a signalled
+    # shutdown as clean so Antithesis stop faults don't count as unexpected
+    # exits. Not PID 1, an early signal kills it (143); later it exits 0.
+    # The remap is keyed on a flag the trap sets, so it applies only when the
+    # wrapper itself caught the signal. The second wait collects minio's
+    # status when the trap interrupted the first; it answers 127 when the
+    # first wait had already reaped minio, and the first status is kept.
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        minio server /data --console-address ":9001" & pid=$$!
+        sig=0
+        trap 'sig=1; kill -TERM $$pid 2>/dev/null' TERM INT
+        wait $$pid; status=$$?
+        if [ $$sig -eq 1 ]; then
+          wait $$pid; s2=$$?; [ $$s2 -ne 127 ] && status=$$s2
+          case $$status in 0|2|143) status=0;; esac
+        fi
+        exit $$status
     environment: { MINIO_ROOT_USER: minioadmin, MINIO_ROOT_PASSWORD: minioadmin }
     volumes: [minio-data:/data]
   minio-init:
@@ -121,14 +142,22 @@ services:
     hostname: nats
     restart: on-failure
     # nats-server exits 1 on SIGTERM; report a signalled shutdown as clean so
-    # Antithesis's stop faults don't count as unexpected exits.
+    # Antithesis's stop faults don't count as unexpected exits. The remap is
+    # keyed on a flag the trap sets, not on the exit status: a nats-server
+    # killed by a signal the wrapper never received (the OOM killer) keeps its
+    # own status (137) instead of a second wait's 127. An early signal, before
+    # nats-server installs its handler, kills it (143), also remapped.
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
         nats-server -js & pid=$$!
-        trap 'kill -TERM $$pid' TERM INT
+        sig=0
+        trap 'sig=1; kill -TERM $$pid 2>/dev/null' TERM INT
         wait $$pid; status=$$?
-        if [ $$status -gt 128 ]; then wait $$pid; status=$$?; [ $$status -eq 1 ] && status=0; fi
+        if [ $$sig -eq 1 ]; then
+          wait $$pid; s2=$$?; [ $$s2 -ne 127 ] && status=$$s2
+          case $$status in 0|1|143) status=0;; esac
+        fi
         exit $$status
 
   client1: { <<: *client, container_name: client1, hostname: client1 }

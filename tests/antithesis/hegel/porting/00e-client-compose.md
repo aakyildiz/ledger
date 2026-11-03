@@ -59,6 +59,17 @@ Predicate mapping (`W/internal/client.go` → `CL/classify.go` `classified`):
 - C6 `CL/digest.go`: `POST /digest` (format documented in the file header).
 - C7 `CL/ext.go`: `registerExt(pattern, h)`; handlers reach the client through
   `extServer()`.
+- Shutdown `CL/main.go` `serve`: on SIGTERM/SIGINT the client stops accepting requests,
+  waits up to 8 s (`shutdownGrace`, under Docker's 10 s stop timeout) for the open HTTP
+  requests and for every in-flight RPC (including those whose HTTP request already gave
+  up) to finish and report, and only then closes its gRPC connections. An RPC cut off by
+  that close fails with grpc-go's own "grpc: the client connection is closing"
+  (Canceled, or Unavailable carrying it). That outcome is not a server answer: it is
+  never reported (no UDP event, and the HTTP connection is dropped through
+  `http.ErrAbortHandler`), so the driver sees no answer. The check needs both that error
+  shape and the client's own `closing` flag, so a server answering Canceled with the same
+  message is still reported as a remote Canceled. After close, a new node connection is a
+  local `dial:` error (no answer for the driver). `shutdown_test.go`.
 
 ### Deviations
 
