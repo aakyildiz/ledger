@@ -174,7 +174,7 @@ pub fn meta_bulk(d: &Driver, tc: TestCase) {
         let len = draw::int_in(tc, 1, 3) as usize;
         let lv = d.view(&[ViewReq::ledger(LedgerSel::Pick(pick))])?.pop()?;
         let ledger = lv.get("ledger").and_then(Value::as_str)?.to_string();
-        let reqs = compose_bulk(d, tc, &family_gens(), &ledger, &lv, len);
+        let reqs = compose_family_bulk(d, tc, &ledger, &lv, len);
         if reqs.is_empty() {
             return None;
         }
@@ -184,6 +184,43 @@ pub fn meta_bulk(d: &Driver, tc: TestCase) {
         let _ = d.dispatch(plan, unit);
         Some(())
     });
+}
+
+/// A weighted index drawn with `draw::pick` over integer units (weights in
+/// quarters), or `None` when no weight is positive. `draw::weighted` (00c)
+/// draws a 32-bit integer that hegel biases strongly towards 0, so it picks
+/// the first positive weight almost always; this keeps the gens' weights.
+pub fn fair_weighted(tc: &TestCase, weights: &[f64]) -> Option<usize> {
+    let units: Vec<usize> = weights.iter().map(|w| if w.is_finite() && *w > 0.0 { ((w * 4.0).round() as usize).max(1) } else { 0 }).collect();
+    let total: usize = units.iter().sum();
+    if total == 0 {
+        return None;
+    }
+    let mut r = draw::pick(tc, total);
+    for (i, u) in units.iter().enumerate() {
+        if r < *u {
+            return Some(i);
+        }
+        r -= u;
+    }
+    None
+}
+
+/// The family's bulk: per slot, one of the four gens by weight among those
+/// whose `applies` holds (`fair_weighted`), then `compose_bulk` over that
+/// single gen (its opt-in draw and call).
+pub fn compose_family_bulk(d: &Driver, tc: &TestCase, ledger: &str, lv: &Value, len: usize) -> Vec<Value> {
+    let gens = family_gens();
+    let mut out = Vec::with_capacity(len);
+    for i in 0..len {
+        let ctx = BulkCtx { run: &d.s.run, ledger, ledger_view: lv, index_in_bulk: i, len };
+        let weights: Vec<f64> = gens.iter().map(|g| if (g.applies)(&ctx) { g.weight } else { 0.0 }).collect();
+        let Some(gi) = fair_weighted(tc, &weights) else { break };
+        let g = &gens[gi];
+        let one = [OrderGen { name: g.name, weight: g.weight, applies: g.applies, has_opt_in: g.has_opt_in, gen: g.gen }];
+        out.extend(compose_bulk(d, tc, &one, ledger, lv, 1));
+    }
+    out
 }
 
 // ---------------------------------------------------------------- meta_read_after_write
@@ -437,5 +474,19 @@ mod tests {
             assert!(s.contains("own-"), "rule-owned entities only: {s}");
         }
         assert!(d.s.registry.snapshot().is_empty());
+    }
+
+    #[test]
+    fn fair_weighted_keeps_the_weights() {
+        let counts = std::sync::Mutex::new([0usize; 4]);
+        testkit::with_tc_n(2000, |tc| {
+            counts.lock().unwrap()[fair_weighted(tc, &[3.0, 3.0, 1.5, 1.0]).unwrap()] += 1;
+            assert_eq!(fair_weighted(tc, &[0.0, 2.0]), Some(1));
+            assert_eq!(fair_weighted(tc, &[0.0, 0.0]), None);
+        });
+        let c = *counts.lock().unwrap();
+        // Expected 706 / 706 / 353 / 235 of 2000.
+        assert!(c.iter().all(|n| *n > 120), "{c:?}");
+        assert!(c[0] > c[3] && c[1] > c[3], "{c:?}");
     }
 }

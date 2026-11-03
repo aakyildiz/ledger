@@ -91,14 +91,14 @@ Order gens (registered in `order_gens()` for task 02's `tx_bulk` too): `revert` 
 |---|---|---|
 | `first revert should succeed` (Sometimes) | revert_twice | no faults |
 | `double revert path exercised` | revert_twice | no faults |
-| `concurrent revert path exercised` | revert_concurrent (k ≥ 2, a free grant of ≥ 2 units) | no faults |
+| `concurrent revert path exercised` | revert_concurrent (k ≥ 2, a free grant of ≥ 2 units) | no faults; needs non-reserved transactions (`smoke_tx` / task 02) |
 | `idempotency conflict path exercised` | idem_conflict on a committed original | no faults |
 | `metadata read-after-write should return saved value` (Always) | meta_read_after_write (account branch) | no faults |
 | `deleted metadata key is absent on a linearizable read` (Always) | meta_read_after_write (account branch) | no faults |
 | `oracle: idempotency replay exercised` | idem_replay | no faults |
 | `oracle: idempotency-conflict rejection exercised` | idem_conflict | no faults |
 | `oracle: a replay returned a frozen failure` | idem_replay over a flagged meta_bulk that failed at the FSM stage (revert of a reverted tx or delete of an absent key, without opt-in) | no faults |
-| `oracle: coverage Apply skipped TRANSACTION_ALREADY_REVERTED and continued` | meta_bulk (revert opt-in on a reverted tx, followed by a committed order) | no faults |
+| `oracle: coverage Apply skipped TRANSACTION_ALREADY_REVERTED and continued` | meta_bulk (revert opt-in on a reverted tx, followed by a committed order) | no faults; needs non-reserved transactions (`smoke_tx` / task 02) |
 | `oracle: coverage Apply skipped METADATA_NOT_FOUND and continued` | meta_bulk (absent-key delete with opt-in, followed by a committed order) | no faults |
 
 ## Rejection fixtures
@@ -128,11 +128,40 @@ service with `role: conflict`, and requires the explained conflict.
   the in-place expectation; reverts are forced, as in the old driver.
 - `revert` gen: no reverts on a ledger with 4000 transactions or more (the hard end of the
   DESIGN §3.2 taper; `applies` takes no draw, so the 1/2 and 1/8 bands are not applied).
+- `meta_bulk` composes slot by slot: it draws the gen with `fair_weighted` (integer units
+  drawn with `draw::pick`) among the gens whose `applies` holds, then calls `compose_bulk`
+  over that single gen (which makes the opt-in draw and the call). `draw::weighted` (00c)
+  picks the first positive weight about 96% of the time (measured: 1914/2000 for weights
+  3/3/1.5/1), so plain `compose_bulk` over the four gens produced reverts only and the
+  skip probes were never reached (see Requests to 99).
 - The `Replay` validator also skips non-transient non-definitive outcomes (Internal,
   Aborted, `STALE_PROPOSAL`, …): the rule sends a single attempt, and only definitive
   outcomes carry a verdict.
 
 ## Requests to 99
 
-- None for dependencies. `order_gens()` now contains this family's four gens, so task 02's
+- No new dependency. `order_gens()` now contains this family's four gens, so task 02's
   `tx_bulk` mixes reverts and metadata orders once both are merged.
+- **`draw::weighted` is biased** (00c, `HG/driver/src/draw.rs`): it draws
+  `int_in(tc, 0, 2^32 - 1)`, which hegel biases towards 0, so the first positive weight
+  wins about 96% of the draws. Every `compose_bulk` caller (task 02's `tx_bulk` over
+  `order_gens()`, other families' `<fam>_bulk`) and every weighted choice (quiet hooks,
+  exclusive actions) is affected. A fix along the lines of this family's `fair_weighted`
+  (`draw::pick` over integer units, uniform in practice) belongs in `draw.rs`; once it
+  lands, `meta_bulk` can go back to a plain `compose_bulk` over `family_gens()`.
+- The revert-side must-hits (`concurrent revert path exercised`, `oracle: coverage Apply
+  skipped TRANSACTION_ALREADY_REVERTED and continued`, the revert gen itself) need
+  non-reserved transactions on tracked ledgers, which this family does not create: run
+  with `smoke_tx` (COMMON's `RULES=<your rules,smoke_tx>`) or task 02's rules. Without
+  them, `seek(txs)` only sees reserved transactions (hidden) and those paths are idle.
+- Local runs on this machine: the disk was above 90%, so the ledger's disk-full guard
+  (`--health-{wal,data}-threshold`, default 0.8) blocked every write; the native runs set
+  `HEALTH_WAL_THRESHOLD=0.995 HEALTH_DATA_THRESHOLD=0.995` in the environment (inherited
+  by `run_native.sh`'s `env`).
+
+## Native run
+
+`RULES=meta_bulk,revert_concurrent,revert_twice,idem_replay,idem_conflict,meta_read_after_write,smoke_tx run_native.sh 180`:
+PASS, 0 findings, every must-hit of the table above hit (≈127 tracked ops/s). Without
+`smoke_tx` the run also passes with the two oracle replay must-hits hit, but the two
+revert-side must-hits stay idle (see Requests to 99).
