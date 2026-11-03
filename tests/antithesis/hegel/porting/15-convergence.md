@@ -76,8 +76,8 @@ every attempt ended `Other`.
   member's `clusterConfig` with the leader's; membership/leader unchanged and closing Barrier
   `== horizon + 1` (added fence: a config proposal between the reads would otherwise be a
   false difference).
-- Go provider `usage`: `{"ledgers": {name: {id, logCount, txCount, postingCount,
-  referenceCount, revertCount}}}` for every live tracked ledger (`match.ModelUsage`, model log
+- Go provider `usage`: `{name: {id, logCount, txCount, postingCount, referenceCount,
+  revertCount}}` (keyed by ledger name, JSON numbers) for every live tracked ledger (`match.ModelUsage`, model log
   and transaction counts, learned ledger id).
 
 ## Reachability

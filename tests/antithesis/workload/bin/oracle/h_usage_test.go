@@ -34,11 +34,11 @@ func TestUsageProvider_ExactCountsAtQuietBegin(t *testing.T) {
 	begin := c.OK("POST", "/quiet/begin", map[string]any{"epoch": 1})
 	raw, err := json.Marshal(begin["providers"].(map[string]any)["usage"])
 	require.NoError(t, err)
-	var got usageProvided
+	var got map[string]usageLedger
 	require.NoError(t, json.Unmarshal(raw, &got))
 
-	require.Equal(t, []string{l1}, keys(got.Ledgers), "the deleted ledger is not listed")
-	u := got.Ledgers[l1]
+	require.Equal(t, []string{l1}, keys(got), "the deleted ledger is not listed")
+	u := got[l1]
 	require.EqualValues(t, 4, u.TxCount, "3 creates + 1 revert")
 	require.EqualValues(t, 1+2+1, u.PostingCount, "postings of creates and of the revert transaction")
 	require.EqualValues(t, 1, u.ReferenceCount)
@@ -48,6 +48,16 @@ func TestUsageProvider_ExactCountsAtQuietBegin(t *testing.T) {
 	ls := c.Server.Ledger(l1)
 	require.EqualValues(t, ls.Txs().Len(), u.TxCount)
 	require.EqualValues(t, len(ls.LogRows()), u.LogCount)
+}
+
+// usageLedger decodes one entry of the usage provider.
+type usageLedger struct {
+	ID             uint32 `json:"id"`
+	LogCount       uint64 `json:"logCount"`
+	TxCount        uint64 `json:"txCount"`
+	PostingCount   uint64 `json:"postingCount"`
+	ReferenceCount uint64 `json:"referenceCount"`
+	RevertCount    uint64 `json:"revertCount"`
 }
 
 func keys[V any](m map[string]V) []string {

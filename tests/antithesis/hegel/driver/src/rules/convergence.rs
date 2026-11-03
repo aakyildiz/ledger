@@ -632,7 +632,7 @@ pub struct Expected {
 
 /// Tracked source counts from `/quiet/begin` `providers.usage`.
 pub fn tracked_expectations(begin: &Value) -> Option<BTreeMap<String, Expected>> {
-    let ledgers = begin.pointer("/providers/usage/ledgers")?.as_object()?;
+    let ledgers = begin.pointer("/providers/usage")?.as_object()?;
     Some(
         ledgers
             .iter()
@@ -1353,7 +1353,7 @@ mod tests {
     }
 
     fn usage_begin() -> Value {
-        json!({"providers": {"usage": {"ledgers": {"o-test-l1": {"id": 5, "logCount": 3, "txCount": 2, "postingCount": 2, "referenceCount": 1, "revertCount": 0}}}}})
+        json!({"providers": {"usage": {"o-test-l1": {"id": 5, "logCount": 3, "txCount": 2, "postingCount": 2, "referenceCount": 1, "revertCount": 0}}}})
     }
     fn stats(refs: u64, logs: u64, postings: u64, reverts: u64) -> FakeReply {
         ok(json!({"referenceCount": refs.to_string(), "logCount": logs.to_string(), "postingCount": postings.to_string(), "revertCount": reverts.to_string()}))
@@ -1469,7 +1469,7 @@ mod tests {
         ft.set_default("bucket", "ListLedgers", items(vec![json!({"name": "r-ns-x", "id": 5})]));
         ft.set_default("bucket", "ListLogs", items(its.clone()));
         ft.set_default("bucket", "GetLedgerStats", stats(1, 3, 3, 1));
-        stats_convergence(&d, 0, &nodes1(), Some(&json!({"providers": {"usage": {"ledgers": {}}}})), soon(), short());
+        stats_convergence(&d, 0, &nodes1(), Some(&json!({"providers": {"usage": {}}})), soon(), short());
         assert!(hit("usage counters converge exactly at a fixed source horizon").is_some_and(|a| a.cond), "{:?}", testkit::assertions());
         assert_eq!(ft.calls_of("bucket", "ListLogs")[0]["request"]["ledger"], "r-ns-x");
     }
