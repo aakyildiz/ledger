@@ -3,6 +3,10 @@
 Rust: `HG/driver/src/rules/{reverts,metadata,idempotency}.rs`. Go:
 `W/oraclecheck/replaycheck/` (package `replaycheck`) and `W/bin/oracle/h_replay.go`.
 
+One file outside the spec's ownership list: `W/bin/oracle/h_replay_test.go` (new; the
+service-level and real-server tests of the Replay kind, which need package `main`'s test
+helpers). It touches no other task's file, so it cannot conflict at merge.
+
 | Rule | Weight | File |
 |---|---|---|
 | `meta_bulk` | 2 | `rules/metadata.rs` (compose_bulk over `revert`, `meta_account`, `meta_tx`, `meta_ledger`) |
@@ -25,6 +29,7 @@ Order gens (registered in `order_gens()` for task 02's `tx_bulk` too): `revert` 
 | MD/parallel_driver_revert_concurrent/main.go:130 | AlwaysOrUnreachable: at most one concurrent revert should succeed | verbatim (definitive outcomes only; distinct keys, so a retried attempt replays instead of reporting already-reverted) | rules/reverts.rs revert_concurrent |
 | MD/parallel_driver_revert_concurrent/main.go:140 | Reachable: concurrent revert path exercised | verbatim (k ≥ 2, at least one definitive outcome) | rules/reverts.rs revert_concurrent |
 | MD/parallel_driver_revert_idempotent/main.go:34 | Sometimes: should be able to create a transaction for double revert | dropped: the rule's own forced create on l2; its outcome is the oracle's | – |
+| MD/parallel_driver_revert_idempotent/main.go:75, MD/parallel_driver_revert_sequential/main.go:66 (`internal.CheckPostCommitVolumes`, `internal/checks.go:66-78`) | Always: post-commit volume entry has missing required fields; Always: post-commit volume input is invalid; Always: post-commit volume output is invalid | oracle: model post-commit volume mismatch (00a `crossCheckCommit` → `pcvMatches`: every model cell must be present on the revert's `postCommitVolumes` with equal, decodable input and output; a missing entry, input or output fails the match) | (00a) |
 | MD/parallel_driver_revert_idempotent/main.go:64 | Sometimes: first revert should succeed | verbatim (when definitive; LEDGER_* reasons inconclusive) | rules/reverts.rs revert_twice |
 | MD/parallel_driver_revert_idempotent/main.go:90 | Unreachable: GetTransaction should not fail after revert | dropped: no GetTransaction in the chain; GetTransaction answers are task 05's read kind | – |
 | MD/parallel_driver_revert_idempotent/main.go:96 | AlwaysOrUnreachable: transaction should be marked as reverted after first revert | oracle (task 05 `GetTransaction` read validation: the model marks the original reverted) | – |
@@ -126,8 +131,18 @@ service with `role: conflict`, and requires the explained conflict.
 - `revert_concurrent` reads the target's original postings with a linearizable
   `GetTransaction` through a client (not posted to the oracle) so the reversal check has
   the in-place expectation; reverts are forced, as in the old driver.
-- `revert` gen: no reverts on a ledger with 4000 transactions or more (the hard end of the
-  DESIGN §3.2 taper; `applies` takes no draw, so the 1/2 and 1/8 bands are not applied).
+- `revert` gen: the DESIGN §3.2 taper is split: `applies` (no draw) cuts off at 4000
+  transactions, and the gen itself draws the 500–2000 (1/2) and 2000–4000 (1/8) bands first
+  and returns `None` when the draw fails.
+- Rule-owned transactions on `o-<run>-l2` (never deleted): `revert_twice` and the transaction
+  branch of `meta_read_after_write` read l2's `ledger` view and apply the same taper bands
+  before creating anything (skip at ≥ 4000), so l2 stays bounded for the quiet full scans.
+- Chain budgets: the 12 s budget of `revert_twice` and `meta_read_after_write` covers the
+  writes and the client reads. A write starts only with at least one attempt plus the
+  transport margin (5.5 s) left and gets the rest minus that reserve as its retry budget, so
+  its last attempt ends by the deadline; a read gets `min(left − 1.5 s, 3 s)` and is not sent
+  below 1 s. A step that does not fit ends the rule without asserting. `revert_concurrent`
+  caps its `GetTransaction` at 3 s; its fan-out keeps the core's 10 s in-rule budget.
 - `meta_bulk` composes slot by slot: it draws the gen with `fair_weighted` (integer units
   drawn with `draw::pick`) among the gens whose `applies` holds, then calls `compose_bulk`
   over that single gen (which makes the opt-in draw and the call). `draw::weighted` (00c)
@@ -136,7 +151,10 @@ service with `role: conflict`, and requires the explained conflict.
   skip probes were never reached (see Requests to 99).
 - The `Replay` validator also skips non-transient non-definitive outcomes (Internal,
   Aborted, `STALE_PROPOSAL`, …): the rule sends a single attempt, and only definitive
-  outcomes carry a verdict.
+  outcomes carry a verdict. The verdict reports such a read as `ok`, not `skipped`: the
+  service sets `skipped` from `Outcome.Transient` alone (`W/bin/oracle/server.go`
+  `handleReadEnd`, 00a) and a read kind's `Validate` has no skip return. No event is
+  emitted, so no coverage is claimed (see Requests to 99).
 
 ## Requests to 99
 
@@ -158,6 +176,11 @@ service with `role: conflict`, and requires the explained conflict.
   (`--health-{wal,data}-threshold`, default 0.8) blocked every write; the native runs set
   `HEALTH_WAL_THRESHOLD=0.995 HEALTH_DATA_THRESHOLD=0.995` in the environment (inherited
   by `run_native.sh`'s `env`).
+
+- **Read-kind skip path** (00a): a `Validate` func cannot mark its read skipped, so the
+  Replay kind's non-definitive, non-transient outcomes show as `ok` verdicts. A
+  `ReadKind.Skip func(Outcome) bool` (or a skip return) consulted by `handleReadEnd` would
+  make the verdict exact.
 
 ## Native run
 

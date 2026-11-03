@@ -91,7 +91,7 @@ func TestReplayIntegration_RealServer(t *testing.T) {
 		t.Skip("in-process server")
 	}
 	ctx, client := singleNodeServer(t, "oracle-replay")
-	_, c := newTestServer(t)
+	srv, c := newTestServer(t)
 	c.Setup("replay")
 	l := c.Ledger(1)
 
@@ -156,8 +156,24 @@ func TestReplayIntegration_RealServer(t *testing.T) {
 			Target: &commonpb.Target{Target: &commonpb.Target_TransactionId{TransactionId: 1}}, Key: "absent-k2",
 		}}},
 	}}}
-	bulk := write(true, "", "", "", skipRevert, testutil.AccountMetaReq(l, "users:1", "k0", "v"), skipMeta, testutil.AccountMetaReq(l, "users:1", "k1", "w"))
+	// /write/end reports only the verdict, so this bulk is ended on the
+	// tracker directly (under the service lock) to see its coverage events.
+	skipReqs := []*servicepb.Request{skipRevert, testutil.AccountMetaReq(l, "users:1", "k0", "v"), skipMeta, testutil.AccountMetaReq(l, "users:1", "k1", "w")}
+	body := c.BeginWriteBody(true, skipReqs...)
+	tk := uint64(c.OK("POST", "/write/begin", body)["ticket"].(float64))
+	bulk := sent{wid: body["wid"].(string), key: body["idempotencyKey"].(string), reqs: skipReqs}
+	var err error
+	bulk.out, err = applyUntilDefinitive(ctx, client, bulk.key, skipReqs)
+	require.NoError(t, err)
 	require.True(t, bulk.out.OK, "%+v", bulk.out)
+	srv.mu.Lock()
+	_, evs, ref := srv.tracker.EndWrite(tk, bulk.out)
+	srv.mu.Unlock()
+	require.Nil(t, ref)
+	require.Empty(t, testutil.Findings(evs))
+	ids := testutil.IDs(evs)
+	require.Contains(t, ids, replaycheck.CovSkipAlreadyReverted, "the real server's skip-and-continue reaches the probe")
+	require.Contains(t, ids, replaycheck.CovSkipMetadataNotFound, "the real server's skip-and-continue reaches the probe")
 	replay(bulk)
 
 	st := c.OK("GET", "/quiet/status", nil)

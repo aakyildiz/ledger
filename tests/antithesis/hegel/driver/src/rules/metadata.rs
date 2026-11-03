@@ -2,10 +2,11 @@
 //! generators, the family's local `meta_bulk` rule (composes this family's
 //! four gens, revert included), and `meta_read_after_write` (rule-owned keys
 //! on `o-<run>-l2`, read back linearizably through a client).
-use crate::clients::{CallOpts, Outcome};
+use crate::clients::Outcome;
 use crate::draw;
 use crate::machine::{rule, Driver};
 use crate::read::{LedgerSel, ViewReq};
+use crate::rules::reverts::{chain_read_opts, l2_taper, step_budget};
 use crate::wire::{self, Posting};
 use crate::write::{compose_bulk, BulkCtx, OrderGen, WritePlan, WriteResult};
 use hegel::stateful::ConcurrentRule;
@@ -228,9 +229,10 @@ pub fn compose_family_bulk(d: &Driver, tc: &TestCase, ledger: &str, lv: &Value, 
 fn chain_step(d: &Driver, mut plan: WritePlan, req: Value, step: &str, deadline: Instant) -> Option<Outcome> {
     plan.requests = vec![req];
     plan.hint = json!({"gen": "meta_read_after_write", "step": step});
+    let budget = step_budget(deadline)?;
     let unit = d.s.slots.try_acquire_up_to(1)?.take_one()?;
     let t = d.begin_write(plan, unit).ok()?;
-    match t.run(deadline.saturating_duration_since(Instant::now())) {
+    match t.run(budget) {
         WriteResult::Definitive { outcome, .. } => Some(outcome),
         _ => None,
     }
@@ -242,10 +244,12 @@ fn served_value(meta: Option<&Value>, key: &str) -> Option<String> {
     Some(v.get("stringValue").and_then(Value::as_str).map(str::to_string).unwrap_or_else(|| v.to_string()))
 }
 
-/// A linearizable GetAccount's metadata map. `Some(None)` when the account
-/// does not exist; `None` when the read gave no usable answer.
-fn read_account_meta(d: &Driver, route: &crate::clients::Route, ledger: &str, addr: &str) -> Option<Option<Value>> {
-    let (_, out) = d.call(route, "bucket", "GetAccount", json!({"ledger": ledger, "address": addr}), &CallOpts::linearizable());
+/// A linearizable GetAccount's metadata map, within the chain budget.
+/// `Some(None)` when the account does not exist; `None` when the read gave
+/// no usable answer or the budget is spent.
+fn read_account_meta(d: &Driver, route: &crate::clients::Route, ledger: &str, addr: &str, deadline: Instant) -> Option<Option<Value>> {
+    let opts = chain_read_opts(deadline)?;
+    let (_, out) = d.call(route, "bucket", "GetAccount", json!({"ledger": ledger, "address": addr}), &opts);
     if out.is_ok() {
         return Some(Some(out.response.as_ref()?.get("metadata").cloned().unwrap_or(json!({}))));
     }
@@ -255,8 +259,9 @@ fn read_account_meta(d: &Driver, route: &crate::clients::Route, ledger: &str, ad
     None
 }
 
-fn read_tx_meta(d: &Driver, route: &crate::clients::Route, ledger: &str, id: u64) -> Option<Value> {
-    let (_, out) = d.call(route, "bucket", "GetTransaction", json!({"ledger": ledger, "transactionId": id.to_string()}), &CallOpts::linearizable());
+fn read_tx_meta(d: &Driver, route: &crate::clients::Route, ledger: &str, id: u64, deadline: Instant) -> Option<Value> {
+    let opts = chain_read_opts(deadline)?;
+    let (_, out) = d.call(route, "bucket", "GetTransaction", json!({"ledger": ledger, "transactionId": id.to_string()}), &opts);
     if !out.is_ok() {
         return None;
     }
@@ -267,7 +272,9 @@ fn read_tx_meta(d: &Driver, route: &crate::clients::Route, ledger: &str, id: u64
 /// reserved account `t-0:own-meta<N>` of `o-<run>-l2` (1/2) or on a
 /// rule-created transaction with reference `o-<run>-own-ref<M>` (1/2):
 /// tracked add, linearizable read back through a client (not posted to the
-/// oracle), tracked delete, read back; 12 s chain budget.
+/// oracle), tracked delete, read back; 12 s chain budget covering the writes
+/// and the reads (a step without enough budget left ends the rule without
+/// asserting). The transaction branch follows the §3.2 taper on l2.
 pub fn meta_read_after_write(d: &Driver, tc: TestCase) {
     d.guarded("meta_read_after_write", &tc, |d, tc| {
         if !d.s.oracle_ok() {
@@ -291,7 +298,7 @@ pub fn meta_read_after_write(d: &Driver, tc: TestCase) {
             if !added.is_ok() {
                 return None;
             }
-            let got = read_account_meta(d, &routes[0], &ledger, &addr)?;
+            let got = read_account_meta(d, &routes[0], &ledger, &addr, deadline)?;
             let actual = served_value(got.as_ref(), &key);
             check_always!(
                 actual.as_deref() == Some(value.as_str()),
@@ -302,12 +309,14 @@ pub fn meta_read_after_write(d: &Driver, tc: TestCase) {
             if !deleted.is_ok() {
                 return None;
             }
-            let got = read_account_meta(d, &routes[1], &ledger, &addr)?;
+            let got = read_account_meta(d, &routes[1], &ledger, &addr, deadline)?;
             let actual = served_value(got.as_ref(), &key);
             check_always!(actual.is_none(), "deleted metadata key is absent on a linearizable read", json!({"ledger": ledger, "account": addr, "key": key, "actual": actual}));
             return Some(());
         }
 
+        // l2 is never deleted: the creating branch follows the §3.2 taper.
+        l2_taper(d, tc, &ledger)?;
         let reference = d.s.next_own_ref("ref");
         let mut create = wire::create_tx_request(&ledger, &[Posting::new("world", &addr, amount, asset)], Some(&reference));
         create["apply"]["action"]["createTransaction"]["force"] = json!(true);
@@ -325,7 +334,7 @@ pub fn meta_read_after_write(d: &Driver, tc: TestCase) {
         if !added.is_ok() {
             return None;
         }
-        let got = read_tx_meta(d, &routes[0], &ledger, id)?;
+        let got = read_tx_meta(d, &routes[0], &ledger, id, deadline)?;
         let actual = served_value(Some(&got), &key);
         check_always_or_unreachable!(
             actual.as_deref() == Some(value.as_str()),
@@ -336,7 +345,7 @@ pub fn meta_read_after_write(d: &Driver, tc: TestCase) {
         if !deleted.is_ok() {
             return None;
         }
-        let got = read_tx_meta(d, &routes[1], &ledger, id)?;
+        let got = read_tx_meta(d, &routes[1], &ledger, id, deadline)?;
         let actual = served_value(Some(&got), &key);
         check_always_or_unreachable!(actual.is_none(), "deleted tx metadata key should be absent", json!({"ledger": ledger, "txId": id, "key": key, "actual": actual}));
         Some(())
@@ -488,5 +497,32 @@ mod tests {
         // Expected 706 / 706 / 353 / 235 of 2000.
         assert!(c.iter().all(|n| *n > 120), "{c:?}");
         assert!(c[0] > c[3] && c[1] > c[3], "{c:?}");
+    }
+
+    #[test]
+    fn meta_read_after_write_tapers_the_tx_branch_and_skips_spent_reads() {
+        let (d, ft, fo) = testkit::driver();
+        fo.set_view("ledger", json!({"txCount": 4000}));
+        ft.set_default("bucket", "GetAccount", FakeReply::Outcome(Outcome::from_json(&json!({"ok": true, "response": {"metadata": {}}}))));
+        for _ in 0..16 {
+            testkit::run_rule(&d, meta_read_after_write);
+        }
+        let begins = fo.calls("/write/begin");
+        assert!(!begins.is_empty(), "the account branch still runs");
+        for b in &begins {
+            let a = &b["requests"][0]["apply"]["action"];
+            assert!(a.get("createTransaction").is_none(), "no transaction on a full l2: {a}");
+            let tgt = a.get("addMetadata").or_else(|| a.get("deleteMetadata")).unwrap();
+            assert!(tgt["target"].get("account").is_some(), "{a}");
+        }
+        // A read with no budget left is not sent.
+        let before = (ft.calls_of("bucket", "GetAccount").len(), ft.calls_of("bucket", "GetTransaction").len());
+        testkit::with_tc_n(1, |tc| {
+            let route = draw::route(tc, &d.s);
+            assert!(read_account_meta(&d, &route, "o-test-l2", "t-0:own-meta1", Instant::now()).is_none());
+            assert!(read_tx_meta(&d, &route, "o-test-l2", 1, Instant::now() + Duration::from_secs(2)).is_none());
+        });
+        assert_eq!((ft.calls_of("bucket", "GetAccount").len(), ft.calls_of("bucket", "GetTransaction").len()), before);
+        assert!(ft.calls_of("bucket", "GetAccount").iter().all(|b| b["timeoutMs"].as_u64().unwrap() <= 3000));
     }
 }

@@ -4,10 +4,10 @@
 use crate::clients::{CallOpts, Outcome};
 use crate::draw;
 use crate::machine::{rule, Driver};
-use crate::read::{LedgerSel, ViewReq};
+use crate::read::{self, LedgerSel, ViewReq};
 use crate::rules::metadata::meta_map;
 use crate::wire::{self, Posting, U256};
-use crate::write::{BulkCtx, OrderGen, WritePlan, WriteResult};
+use crate::write::{BulkCtx, OrderGen, WritePlan, WriteResult, ATTEMPT_TIMEOUT};
 use hegel::stateful::ConcurrentRule;
 use hegel::TestCase;
 use serde_json::{json, Value};
@@ -19,6 +19,55 @@ const ALREADY_REVERTED: &str = "TRANSACTION_ALREADY_REVERTED";
 const CHAIN_BUDGET: Duration = Duration::from_secs(12);
 /// Above this many transactions the ledger gets no new reverts (DESIGN §3.2 taper).
 const REVERT_TAPER_TXS: u64 = 4000;
+/// The client's transport margin on top of a call's RPC deadline
+/// (`Clients::call_with_op`).
+const TRANSPORT_MARGIN: Duration = Duration::from_millis(1500);
+/// What one chain write must have left before it starts: one attempt, with
+/// the transport margin.
+pub const STEP_RESERVE: Duration = Duration::from_millis(ATTEMPT_TIMEOUT.as_millis() as u64 + TRANSPORT_MARGIN.as_millis() as u64);
+/// The longest RPC deadline of a client read inside a chain or rule.
+pub const READ_CAP: Duration = Duration::from_secs(3);
+/// The shortest RPC deadline worth sending a chain read with.
+const MIN_READ: Duration = Duration::from_secs(1);
+
+/// The retry budget of the next chain write, or `None` when less than
+/// `STEP_RESERVE` is left (the chain ends without asserting). The write's
+/// last attempt starts before `deadline - STEP_RESERVE`, so the whole write,
+/// that attempt included, ends by `deadline`.
+pub fn step_budget(deadline: Instant) -> Option<Duration> {
+    deadline.saturating_duration_since(Instant::now()).checked_sub(STEP_RESERVE)
+}
+
+/// The options of a linearizable client read inside a chain: an RPC deadline
+/// of `min(left - margin, READ_CAP)`, or `None` when less than `MIN_READ`
+/// would be left (the chain ends without asserting).
+pub fn chain_read_opts(deadline: Instant) -> Option<CallOpts> {
+    let left = deadline.saturating_duration_since(Instant::now()).checked_sub(TRANSPORT_MARGIN)?;
+    (left >= MIN_READ).then(|| CallOpts::linearizable().timeout(left.min(READ_CAP)))
+}
+
+/// The DESIGN §3.2 taper bands for a ledger holding `n` transactions: below
+/// 500 always, 500–2000 one half, 2000–4000 one eighth, from 4000 never.
+pub fn taper_count_draw(tc: &TestCase, n: u64) -> bool {
+    match n {
+        n if n < 500 => true,
+        n if n < 2000 => draw::chance(tc, 0.5),
+        n if n < REVERT_TAPER_TXS => draw::chance(tc, 0.125),
+        _ => false,
+    }
+}
+
+/// The taper of the rule-owned transactions on `o-<run>-l2` (never deleted,
+/// DESIGN §3.1): reads l2's `txCount` and applies the §3.2 bands. `None`
+/// means skip the creating step (also when l2 is unresolved or the view is
+/// unavailable).
+pub fn l2_taper(d: &Driver, tc: &TestCase, ledger: &str) -> Option<()> {
+    let v = d.view(&[ViewReq::ledger(LedgerSel::Name(ledger.to_string()))])?.pop()?;
+    if read::unresolved(&v) {
+        return None;
+    }
+    taper_count_draw(tc, wire::u64_field(&v, "txCount")).then_some(())
+}
 
 pub fn rules() -> Vec<ConcurrentRule<Driver>> {
     vec![rule("revert_concurrent", 2.0, revert_concurrent), rule("revert_twice", 0.6, revert_twice)]
@@ -55,9 +104,15 @@ pub fn revert_request(ledger: &str, id: u64, force: bool, at_effective_date: boo
 /// `revert` (weight 3): a committed transaction from `seek(txs)` (reserved
 /// transactions are invisible), 1/8 a revert transaction (`revertSeek`),
 /// `force` 1/2, `atEffectiveDate` 1/2, `metadata` 1/2; the opt-in adds
-/// `ERROR_REASON_TRANSACTION_ALREADY_REVERTED`.
+/// `ERROR_REASON_TRANSACTION_ALREADY_REVERTED`. Tapered by `txCount` (§3.2).
 fn gen_revert(d: &Driver, tc: &TestCase, ctx: &BulkCtx, opt_in: bool) -> Option<Value> {
-    let n = wire::u64_field(ctx.ledger_view, "txCount").max(1);
+    // Reverts create transactions: the in-gen half of the taper (`applies`
+    // cuts off at 4000 without a draw).
+    let count = wire::u64_field(ctx.ledger_view, "txCount");
+    if !taper_count_draw(tc, count) {
+        return None;
+    }
+    let n = count.max(1);
     let probe = draw::int_in(tc, 1, n).to_string();
     let of_revert = draw::chance(tc, 0.125);
     let force = draw::chance(tc, 0.5);
@@ -153,7 +208,7 @@ pub fn revert_concurrent(d: &Driver, tc: TestCase) {
         }
         // The original postings (immutable once committed).
         let req = json!({"ledger": ledger, "transactionId": target.to_string()});
-        let (_, out) = d.call(&route, "bucket", "GetTransaction", req, &CallOpts::linearizable());
+        let (_, out) = d.call(&route, "bucket", "GetTransaction", req, &CallOpts::linearizable().timeout(READ_CAP));
         let tx = out.response.as_ref().filter(|_| out.is_ok())?.get("transaction")?.clone();
         if tx.get("reverted").and_then(Value::as_bool).unwrap_or(false) {
             return None;
@@ -208,11 +263,13 @@ pub fn judge_concurrent(ledger: &str, target: u64, postings: &[Value], k: usize,
 // ---------------------------------------------------------------- revert_twice
 
 /// Dispatches one write of a chain on a fresh slot unit with what is left of
-/// the chain budget. `None` when no unit is free or the oracle refused.
+/// the chain budget (`step_budget`). `None` when the budget is spent, no unit
+/// is free or the oracle refused.
 fn chain_step(d: &Driver, plan: WritePlan, deadline: Instant) -> Option<WriteResult> {
+    let budget = step_budget(deadline)?;
     let unit = d.s.slots.try_acquire_up_to(1)?.take_one()?;
     let t = d.begin_write(plan, unit).ok()?;
-    Some(t.run(deadline.saturating_duration_since(Instant::now())))
+    Some(t.run(budget))
 }
 
 /// A definitive outcome whose failure reason makes a deterministic
@@ -224,7 +281,8 @@ fn inconclusive(o: &Outcome) -> bool {
 /// `revert_twice` (weight 0.6): a forced `world → t-0:own-rv<N>` transaction
 /// with reference `o-<run>-own-ref<M>` on `o-<run>-l2` (reserved: no
 /// generator can revert it), a forced revert, and a second forced revert —
-/// three sequential tracked writes within a 12 s chain budget.
+/// three sequential tracked writes within a 12 s chain budget. l2 is never
+/// deleted, so the rule follows the §3.2 taper on l2's `txCount`.
 pub fn revert_twice(d: &Driver, tc: TestCase) {
     d.guarded("revert_twice", &tc, |d, tc| {
         if !d.s.oracle_ok() {
@@ -235,6 +293,7 @@ pub fn revert_twice(d: &Driver, tc: TestCase) {
         let plans: Vec<WritePlan> = (0..3).map(|_| WritePlan::drawn(FAMILY, vec![], d, tc)).collect();
         let ledger = format!("o-{}-l2", d.s.run);
         let addr = draw::owned_address(&d.s, "t-0", "rv");
+        l2_taper(d, tc, &ledger)?;
         let reference = d.s.next_own_ref("ref");
         let deadline = Instant::now() + CHAIN_BUDGET;
         let mut plans = plans.into_iter();
@@ -427,5 +486,95 @@ mod tests {
         assert!(testkit::assertions().iter().any(|r| r.message == "double revert should return TRANSACTION_ALREADY_REVERTED" && r.cond));
         assert!(testkit::fired("double revert path exercised"));
         assert!(!testkit::fired("double revert should fail"));
+    }
+
+    #[test]
+    fn chain_budget_reserves_one_attempt_and_caps_reads() {
+        let now = Instant::now();
+        assert_eq!(step_budget(now), None);
+        assert_eq!(step_budget(now + Duration::from_secs(5)), None, "less than one attempt plus margin");
+        let b = step_budget(now + CHAIN_BUDGET).unwrap();
+        assert!(b <= CHAIN_BUDGET - STEP_RESERVE && b > Duration::from_secs(6), "{b:?}");
+        assert!(chain_read_opts(now).is_none());
+        assert!(chain_read_opts(now + Duration::from_secs(2)).is_none(), "0.5 s after the margin is too short");
+        let r = chain_read_opts(now + CHAIN_BUDGET).unwrap();
+        assert_eq!((r.timeout, r.consistency), (READ_CAP, Some("linearizable")));
+        let r = chain_read_opts(now + Duration::from_secs(3)).unwrap();
+        assert!(r.timeout <= Duration::from_millis(1500) && r.timeout >= MIN_READ, "{:?}", r.timeout);
+    }
+
+    #[test]
+    fn chain_step_without_budget_sends_nothing() {
+        let (d, ft, fo) = testkit::driver();
+        testkit::with_tc_n(1, |tc| {
+            let plan = WritePlan::drawn(FAMILY, vec![revert_request("o-test-l2", 1, true, false, None, false)], &d, tc);
+            assert!(chain_step(&d, plan, Instant::now() + Duration::from_secs(5)).is_none());
+        });
+        assert!(fo.calls("/write/begin").is_empty());
+        assert!(ft.calls().is_empty());
+    }
+
+    #[test]
+    fn taper_bands() {
+        let counts = std::sync::Mutex::new([0usize; 3]);
+        testkit::with_tc_n(800, |tc| {
+            assert!(taper_count_draw(tc, 0) && taper_count_draw(tc, 499));
+            assert!(!taper_count_draw(tc, 4000) && !taper_count_draw(tc, u64::MAX));
+            let mut c = counts.lock().unwrap();
+            c[0] += 1;
+            c[1] += taper_count_draw(tc, 1000) as usize;
+            c[2] += taper_count_draw(tc, 3000) as usize;
+        });
+        let [n, half, eighth] = *counts.lock().unwrap();
+        assert!(half > n / 4 && half < n * 3 / 4, "{half}/{n}");
+        assert!(eighth > 0 && eighth < n / 4, "{eighth}/{n}");
+    }
+
+    #[test]
+    fn gen_revert_follows_the_taper_and_falls_back_from_revert_seek() {
+        let (d, _ft, fo) = testkit::driver();
+        fo.set_view("seek", json!({"found": true, "wrapped": false, "entry": {"id": "3", "reverted": false}}));
+        // The only revert transaction is reserved: the core hides it, so
+        // revertSeek answers not found and the gen falls back to seek(txs).
+        fo.set_view("revertSeek", json!({"found": false, "wrapped": false, "entry": null}));
+        let counts = std::sync::Mutex::new((0usize, 0usize, 0usize));
+        testkit::with_tc_n(400, |tc| {
+            for (n, slot) in [(100u64, 0usize), (3000, 1)] {
+                let lv = json!({"ledger": "L", "txCount": n});
+                let ctx = BulkCtx { run: "test", ledger: "L", ledger_view: &lv, index_in_bulk: 0, len: 1 };
+                let got = gen_revert(&d, tc, &ctx, false);
+                let mut c = counts.lock().unwrap();
+                c.2 += (slot == 0) as usize;
+                if let Some(v) = got {
+                    assert_eq!(v["apply"]["action"]["revertTransaction"]["transactionId"], "3", "{v}");
+                    if slot == 0 {
+                        c.0 += 1;
+                    } else {
+                        c.1 += 1;
+                    }
+                }
+            }
+        });
+        let (low, high, n) = *counts.lock().unwrap();
+        assert_eq!(low, n, "below 500 transactions every draw reverts");
+        assert!(high < n / 4, "2000–4000: about one in eight ({high}/{n})");
+        assert!(fo.calls("/view").iter().any(|b| b.to_string().contains("revertSeek")), "the revert-of-a-revert branch ran");
+    }
+
+    #[test]
+    fn revert_twice_skips_a_full_l2_and_caps_concurrent_reads() {
+        let (d, ft, fo) = testkit::driver();
+        fo.set_view("ledger", json!({"txCount": 4000}));
+        for _ in 0..8 {
+            testkit::run_rule(&d, revert_twice);
+        }
+        assert!(fo.calls("/write/begin").is_empty(), "no new transaction on a full l2");
+
+        let (d, ft2, _fo, _) = concurrent_setup();
+        testkit::run_rule(&d, revert_concurrent);
+        let gets = ft2.calls_of("bucket", "GetTransaction");
+        assert!(!gets.is_empty());
+        assert!(gets.iter().all(|b| b["timeoutMs"].as_u64().unwrap() <= READ_CAP.as_millis() as u64), "{gets:?}");
+        drop(ft);
     }
 }
