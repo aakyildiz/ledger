@@ -1,0 +1,129 @@
+{
+  "requests": [
+    {
+      "createPreparedQuery": {
+        "ledger": "o-test-l1",
+        "query": {
+          "filter": {
+            "and": {
+              "filters": [
+                {
+                  "address": {
+                    "paramPrefix": "p0"
+                  }
+                },
+                {
+                  "field": {
+                    "field": {
+                      "metadata": "k1"
+                    },
+                    "stringCond": {
+                      "param": "p1"
+                    }
+                  }
+                }
+              ]
+            }
+          },
+          "name": "q-1",
+          "target": "QUERY_TARGET_ACCOUNTS"
+        }
+      }
+    },
+    {
+      "createPreparedQuery": {
+        "ledger": "o-test-l1",
+        "query": {
+          "filter": {
+            "or": {
+              "filters": [
+                {
+                  "address": {
+                    "paramExact": "p0"
+                  }
+                },
+                {
+                  "field": {
+                    "existsCond": {},
+                    "field": {
+                      "metadata": "k0"
+                    }
+                  }
+                }
+              ]
+            }
+          },
+          "name": "q-2",
+          "target": "QUERY_TARGET_TRANSACTIONS"
+        }
+      }
+    },
+    {
+      "createPreparedQuery": {
+        "ledger": "o-test-l1",
+        "query": {
+          "filter": {
+            "accountHasAsset": {
+              "assetBase": "USD",
+              "precision": 2
+            }
+          },
+          "name": "q-3",
+          "target": "QUERY_TARGET_ACCOUNTS"
+        }
+      }
+    },
+    {
+      "createPreparedQuery": {
+        "ledger": "o-test-l1",
+        "query": {
+          "name": "q-4",
+          "target": "QUERY_TARGET_ACCOUNTS"
+        }
+      }
+    },
+    {
+      "updatePreparedQuery": {
+        "filter": {
+          "address": {
+            "hardcodedPrefix": "world"
+          }
+        },
+        "ledger": "o-test-l1",
+        "name": "q-1"
+      }
+    },
+    {
+      "updatePreparedQuery": {
+        "ledger": "o-test-l1",
+        "name": "q-2"
+      }
+    },
+    {
+      "deletePreparedQuery": {
+        "ledger": "o-test-l1",
+        "name": "q-3"
+      }
+    },
+    {
+      "apply": {
+        "action": {
+          "createTransaction": {
+            "force": true,
+            "postings": [
+              {
+                "amount": {
+                  "v0": "1"
+                },
+                "asset": "USD/2",
+                "destination": "users:own-pq1",
+                "source": "world"
+              }
+            ]
+          }
+        },
+        "ledger": "o-test-l1"
+      }
+    }
+  ]
+}

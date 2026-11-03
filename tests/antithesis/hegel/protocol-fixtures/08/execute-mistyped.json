@@ -1,0 +1,14 @@
+{
+  "ledger": "o-test-l1",
+  "mode": "QUERY_MODE_LIST",
+  "pageSize": 5,
+  "parameters": {
+    "p0": {
+      "uint64Value": "1"
+    },
+    "p1": {
+      "stringValue": "not-a-number"
+    }
+  },
+  "queryName": "q-1"
+}

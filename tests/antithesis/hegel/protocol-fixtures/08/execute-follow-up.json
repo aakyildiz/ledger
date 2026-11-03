@@ -1,0 +1,21 @@
+{
+  "cursor": "opaque",
+  "ledger": "o-test-l1",
+  "mode": "QUERY_MODE_LIST",
+  "pageSize": 5,
+  "parameters": {
+    "p0": {
+      "stringValue": "users:"
+    },
+    "p1": {
+      "uint64Value": "42"
+    },
+    "p2": {
+      "int64Value": "-3"
+    },
+    "p3": {
+      "boolValue": true
+    }
+  },
+  "queryName": "q-1"
+}
