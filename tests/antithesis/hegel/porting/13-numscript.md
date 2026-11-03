@@ -108,5 +108,7 @@ as already existing`, the five verbatim reads) are free by policy.
 
 - None for dependencies. The native acceptance run
   (`RULES=ns_save,ns_read,ns_exec QUIET_PROBABILITY=0.05 run_native.sh 180`) could not be
-  run by task 13: the build host's disk was full (see the task report); task 99 should run
-  it and confirm the Sometimes literals above are hit with zero failing assertions.
+  run by task 13: the build host's disk was full at first, and on the re-run after review the
+  ledger server refused the setup writes with `WRITES_BLOCKED_DISK_FULL` (host disk 96% used);
+  task 99 should run it and confirm the Sometimes literals above are hit with zero failing
+  assertions.
