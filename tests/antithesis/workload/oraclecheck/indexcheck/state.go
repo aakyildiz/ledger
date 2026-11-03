@@ -54,12 +54,14 @@ type promotion struct {
 
 // retypeObs drives one retype window's closure, two-phase per node
 // (M/checker.go retypeObservation): a poll proving the retype's own log folded
-// (lastIndexedSequence >= openSeq) arms the node; a later poll listing the
-// index with pendingVersion == 0 confirms it. Nodes are service addresses.
+// (lastIndexedSequence >= openSeq) arms the node; a poll that began after the
+// arming poll ended (Ticket > armedAt) and lists the index with
+// pendingVersion == 0 confirms it. Nodes are service addresses.
 type retypeObs struct {
 	ledger, canonical string
 	openSeq           uint64
 	foldSeen          map[string]bool
+	armedAt           map[string]uint64 // MaxTicket of the poll that armed the node
 	pendClear         map[string]bool
 	confirmedAt       uint64
 }
@@ -121,9 +123,10 @@ func sortedKeys[V any](m map[string]V) []string {
 // drainHook records create frontiers and opens retype observations for a
 // drained bulk (M/validate.go:90-116, :440-458; M/checker.go:424-440), and
 // forgets a deleted ledger's observations.
-func drainHook(t *oc.Tracker, rec oc.WriteRecord, resp *servicepb.ApplyResponse, _ oracle.GlobalState, after oracle.GlobalState) []oc.Event {
+func drainHook(t *oc.Tracker, rec oc.WriteRecord, resp *servicepb.ApplyResponse, before oracle.GlobalState, after oracle.GlobalState) []oc.Event {
 	st := StateOf(t)
 	logs := resp.GetLogs()
+	retyped := retypedKeys(rec.Bulk.Requests, before)
 	for i, req := range rec.Bulk.Requests {
 		switch {
 		case req.GetCreateIndex() != nil:
@@ -153,13 +156,57 @@ func drainHook(t *oc.Tracker, rec oc.WriteRecord, resp *servicepb.ApplyResponse,
 			}
 			ledger := smft.GetLedger()
 			canonical := indexes.Canonical(indexes.MetadataID(tt, smft.GetKey()))
-			if _, open := after.Ledger(ledger).RetypeWindow(canonical); open {
+			_, wasOpen := before.Ledger(ledger).RetypeWindow(canonical)
+			if _, open := after.Ledger(ledger).RetypeWindow(canonical); open && (!wasOpen || retyped[retypeKey(ledger, canonical)]) {
+				// (Re-)arm only when this bulk opened the window or changed
+				// the declared type: a same-type re-declaration on an open
+				// window starts no new encoding, and resetting the
+				// observation on it could keep the window open for good.
 				st.noteRetypeCommit(ledger, canonical, oc.MaxLogSequence(logs))
 			}
 		}
 	}
 
 	return nil
+}
+
+// retypedKeys returns the (ledger, canonical) metadata indexes whose declared
+// type some SetMetadataFieldType of the bulk changed, walking the bulk in
+// order from before's declarations (so A→B→A within one bulk counts).
+func retypedKeys(reqs []*servicepb.Request, before oracle.GlobalState) map[string]bool {
+	type fk struct {
+		ledger string
+		tt     commonpb.TargetType
+		key    string
+	}
+	cur := map[fk]commonpb.MetadataType{}
+	declared := map[fk]bool{}
+	lookup := func(k fk) (commonpb.MetadataType, bool) {
+		if t, ok := cur[k]; ok {
+			return t, declared[k]
+		}
+		t, ok := before.Ledger(k.ledger).FieldTypeFor(k.tt, k.key)
+
+		return t, ok
+	}
+	out := map[string]bool{}
+	for _, req := range reqs {
+		switch {
+		case req.GetSetMetadataFieldType() != nil:
+			r := req.GetSetMetadataFieldType()
+			k := fk{r.GetLedger(), r.GetTargetType(), r.GetKey()}
+			if t, ok := lookup(k); !ok || t != r.GetType() {
+				out[retypeKey(k.ledger, indexes.Canonical(indexes.MetadataID(k.tt, k.key)))] = true
+			}
+			cur[k], declared[k] = r.GetType(), true
+		case req.GetRemoveMetadataFieldType() != nil:
+			r := req.GetRemoveMetadataFieldType()
+			k := fk{r.GetLedger(), r.GetTargetType(), r.GetKey()}
+			cur[k], declared[k] = 0, false
+		}
+	}
+
+	return out
 }
 
 // noteRetypeCommit registers (or re-arms, on a chained retype) the closure
@@ -175,6 +222,7 @@ func (s *State) noteRetypeCommit(ledger, canonical string, seq uint64) {
 		o.openSeq = seq
 	}
 	o.foldSeen = map[string]bool{}
+	o.armedAt = map[string]uint64{}
 	o.pendClear = map[string]bool{}
 	o.confirmedAt = 0
 }

@@ -16,7 +16,9 @@ use crate::write::{AttemptRecord, BulkCtx, OrderGen, WritePlan, WriteResult, IN_
 use hegel::stateful::ConcurrentRule;
 use hegel::TestCase;
 use serde_json::{json, Value};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 const FAMILY: &str = "indexes";
@@ -292,18 +294,30 @@ pub fn index_op(d: &Driver, tc: TestCase) {
 
 // ---------------------------------------------------------------- typed_metadata_cycle
 
-/// Cycles started so far; the first one creates the index of the shared
-/// uncoercible key `own-bad`, which every cycle writes a distinct
-/// unconvertible text to, so `inspect_index` can summarise (and page through)
-/// a key holding unconvertible values.
+/// The cycles in flight (their `<N>`), so a cycle's leftover sweep never
+/// touches the keys of a cycle that is still running.
 #[derive(Default)]
 pub struct TypedMeta {
-    pub cycles: AtomicU64,
+    pub inflight: Mutex<BTreeSet<u64>>,
 }
 
-/// The reserved key every cycle writes its uncoercible value under (declared
-/// INT64, indexed once, never removed).
+/// Removes a cycle from the in-flight set when it ends, however it ends.
+struct Inflight<'a>(&'a TypedMeta, u64);
+
+impl Drop for Inflight<'_> {
+    fn drop(&mut self) {
+        self.0.inflight.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.1);
+    }
+}
+
+/// The shared reserved key every cycle writes an unconvertible text to;
+/// declared INT64 and indexed by whichever cycle first finds the index absent
+/// from the model, never removed, so `inspect_index` can summarise (and page
+/// through) an indexed key holding unconvertible values.
 pub const BAD_KEY: &str = "own-bad";
+
+/// At most this many leftover keys of cut-short cycles are removed per cycle.
+pub const MAX_SWEEP: usize = 2;
 
 /// The deterministic assertion a cycle step re-asserts on its outcome.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -314,28 +328,61 @@ pub enum StepCheck {
     BoolOverNumeric,
 }
 
+/// The `<N>` of a per-cycle reserved key (`own-score<N>` / `own-bad<N>`).
+fn cycle_key_n(key: &str) -> Option<u64> {
+    let rest = key.strip_prefix("own-score").or_else(|| key.strip_prefix("own-bad"))?;
+    if rest.is_empty() || !rest.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    rest.parse().ok()
+}
+
+/// What a cycle learns from the owned `ledger` view of `l1` (pure): whether
+/// the shared `own-bad` index exists, and the per-cycle keys of cycles no
+/// longer in flight (cut short before their removes: their declaration, and
+/// for `own-score<N>` its index, would otherwise stay on l1 for good).
+pub fn cycle_plan_inputs(l1_owned: &Value, inflight: &BTreeSet<u64>) -> (bool, Vec<String>) {
+    let bad_canon = format!("metadata:TARGET_TYPE_ACCOUNT:{BAD_KEY}");
+    let bad_indexed = l1_owned["indexes"].as_array().is_some_and(|a| a.iter().any(|e| e["canonical"] == bad_canon.as_str()));
+    let mut leftovers: Vec<String> = l1_owned["fieldTypes"]["account"]
+        .as_object()
+        .map(|m| m.keys().filter(|k| cycle_key_n(k).is_some_and(|n| !inflight.contains(&n))).cloned().collect())
+        .unwrap_or_default();
+    leftovers.sort();
+    leftovers.truncate(MAX_SWEEP);
+    (bad_indexed, leftovers)
+}
+
 /// The steps of one typed-metadata cycle on reserved entities (pure).
-pub fn cycle_steps(ledger: &str, n: u64, value: u64, retypes: &[&str], index_bad: bool) -> Vec<(Value, StepCheck)> {
+/// Removing a declared type drops its metadata index in the same order
+/// (`applyRemoveMetadataFieldType`), so the removes are also the cleanup.
+pub fn cycle_steps(ledger: &str, n: u64, value: u64, retypes: &[&str], bad_indexed: bool, leftovers: &[String]) -> Vec<(Value, StepCheck)> {
     let key = format!("own-score{n}");
-    let bad = BAD_KEY;
+    let bad = format!("own-bad{n}");
     let addr = format!("users:own-score{n}");
     let acct = "TARGET_TYPE_ACCOUNT";
-    let mut s = vec![
-        (set_field_type(ledger, acct, &key, "METADATA_TYPE_INT64"), StepCheck::None),
-        (create_index(ledger, metadata_index_id(acct, &key)), StepCheck::None),
-        (account_string_meta(ledger, &addr, &key, &value.to_string()), StepCheck::None),
-    ];
+    let mut s: Vec<(Value, StepCheck)> = leftovers.iter().map(|k| (remove_field_type(ledger, acct, k), StepCheck::None)).collect();
+    s.push((set_field_type(ledger, acct, &key, "METADATA_TYPE_INT64"), StepCheck::None));
+    s.push((create_index(ledger, metadata_index_id(acct, &key)), StepCheck::None));
+    s.push((account_string_meta(ledger, &addr, &key, &value.to_string()), StepCheck::None));
     for t in retypes {
         s.push((set_field_type(ledger, acct, &key, t), StepCheck::Retype));
     }
     s.push((remove_field_type(ledger, acct, &key), StepCheck::None));
-    s.push((account_string_meta(ledger, &addr, bad, &format!("not-a-number-{value}")), StepCheck::None));
-    s.push((set_field_type(ledger, acct, bad, "METADATA_TYPE_INT64"), StepCheck::Int64OverUncoercible));
-    if index_bad {
-        s.push((create_index(ledger, metadata_index_id(acct, bad)), StepCheck::None));
-    }
+    // A fresh, undeclared key per cycle, so the INT64 declaration really
+    // lands over an uncoercible stored value every time.
+    s.push((account_string_meta(ledger, &addr, &bad, &format!("not-a-number-{value}")), StepCheck::None));
+    s.push((set_field_type(ledger, acct, &bad, "METADATA_TYPE_INT64"), StepCheck::Int64OverUncoercible));
     s.push((set_field_type(ledger, acct, &key, "METADATA_TYPE_BOOL"), StepCheck::BoolOverNumeric));
     s.push((remove_field_type(ledger, acct, &key), StepCheck::None));
+    s.push((remove_field_type(ledger, acct, &bad), StepCheck::None));
+    // Inspection coverage last: a duplicate create (two cycles racing on
+    // the absent index) fails here and costs no other step.
+    s.push((account_string_meta(ledger, &addr, BAD_KEY, &format!("not-a-number-{value}")), StepCheck::None));
+    if !bad_indexed {
+        s.push((set_field_type(ledger, acct, BAD_KEY, "METADATA_TYPE_INT64"), StepCheck::None));
+        s.push((create_index(ledger, metadata_index_id(acct, BAD_KEY)), StepCheck::None));
+    }
     s
 }
 
@@ -367,10 +414,23 @@ pub fn typed_metadata_cycle(d: &Driver, tc: TestCase) {
         let kinds = ["METADATA_TYPE_STRING", "METADATA_TYPE_BOOL", "METADATA_TYPE_INT64"];
         let retypes: Vec<&str> = (0..3).map(|_| *draw::one_of(tc, &kinds)).collect();
         let st = d.s.ext::<TypedMeta>();
-        let index_bad = st.cycles.fetch_add(1, Ordering::SeqCst) == 0;
         let n = d.s.next_own();
         let ledger = format!("{}l1", d.s.tracked_prefix());
-        let steps = cycle_steps(&ledger, n, value, &retypes, index_bad);
+        let inflight = {
+            let mut g = st.inflight.lock().unwrap_or_else(|e| e.into_inner());
+            g.insert(n);
+            g.clone()
+        };
+        let _inflight = Inflight(&st, n);
+        // The model, not a counter, decides whether the shared index is
+        // still to be made (a cut-short first cycle must not lose it).
+        let views = d.view(&[ViewReq::ledger(LedgerSel::Name(ledger.clone())).owned()])?;
+        let lv = views.first()?;
+        if unresolved(lv) {
+            return None;
+        }
+        let (bad_indexed, leftovers) = cycle_plan_inputs(lv, &inflight);
+        let steps = cycle_steps(&ledger, n, value, &retypes, bad_indexed, &leftovers);
         let plans: Vec<(WritePlan, StepCheck)> = steps
             .into_iter()
             .enumerate()
@@ -439,14 +499,17 @@ fn absent_ledger(d: &Driver, tc: &TestCase) -> String {
     format!("{}absent-{}", d.s.tracked_prefix(), draw::int_in(tc, 0, u32::MAX as u64))
 }
 
-/// An id to look up: 1/4 an id the workload never registers, else one of the
-/// ledger's pool (drawn after begin: an index into the view).
-fn lookup_id(tc: &TestCase, unregistered: bool, ledger_view: Option<&Value>) -> Value {
-    if unregistered || ledger_view.is_none() {
-        return metadata_index_id("TARGET_TYPE_ACCOUNT", &format!("unregistered-{}", draw::meta_key_model(tc)));
+/// An id to look up: 1/4 an id the workload never registers (its key drawn
+/// before begin), else one of the ledger's pool (drawn after begin: an index
+/// into the view, DESIGN §4.7).
+fn lookup_id(tc: &TestCase, unregistered: bool, unregistered_key: &str, ledger_view: Option<&Value>) -> Value {
+    match ledger_view {
+        Some(lv) if !unregistered => {
+            let pool = index_pool(lv);
+            pool[draw::pick(tc, pool.len())].clone()
+        }
+        _ => metadata_index_id("TARGET_TYPE_ACCOUNT", &format!("unregistered-{unregistered_key}")),
     }
-    let pool = index_pool(ledger_view.unwrap());
-    pool[draw::pick(tc, pool.len())].clone()
 }
 
 pub fn index_introspect(d: &Driver, tc: TestCase) {
@@ -461,6 +524,7 @@ pub fn index_introspect(d: &Driver, tc: TestCase) {
         let absent_name = if absent { Some(absent_ledger(d, tc)) } else { None };
         let pick = draw::ledger_pick(tc);
         let unregistered = draw::chance(tc, 0.25);
+        let unregistered_key = draw::meta_key_model(tc);
         let bucket_slot = arm == 3 && draw::chance(tc, 1.0 / 8.0);
         let route = draw::route(tc, &d.s);
         let opts = CallOpts::linearizable();
@@ -484,7 +548,7 @@ pub fn index_introspect(d: &Driver, tc: TestCase) {
             1 => json!({"scope": "SCOPE_ALL"}),
             2 => json!({"scope": "SCOPE_BUCKET"}),
             _ => {
-                let id = lookup_id(tc, unregistered, lv.as_ref());
+                let id = lookup_id(tc, unregistered, &unregistered_key, lv.as_ref());
                 if bucket_slot {
                     json!({"id": id})
                 } else {
@@ -538,6 +602,7 @@ pub fn inspect_index(d: &Driver, tc: TestCase) {
         // owned view, so the typed-metadata cycle's keys are inspected too.
         let owned_l1 = draw::chance(tc, 0.25);
         let absent = draw::chance(tc, 1.0 / 20.0);
+        let absent_name = if absent { Some(absent_ledger(d, tc)) } else { None };
         let pick = draw::ledger_pick(tc);
         let route = draw::route(tc, &d.s);
         let opts = CallOpts::linearizable();
@@ -550,8 +615,8 @@ pub fn inspect_index(d: &Driver, tc: TestCase) {
             views.push(ViewReq::named("checkpoints", json!({})));
         }
         let rt = d.read_begin("InspectIndex", &views, json!({}))?;
-        let (ledger, key) = if absent {
-            (absent_ledger(d, tc), undeclared_key)
+        let (ledger, key) = if let Some(a) = absent_name {
+            (a, undeclared_key)
         } else {
             let lv = rt.views().first()?.clone();
             if unresolved(&lv) {
@@ -766,10 +831,10 @@ mod tests {
 
     #[test]
     fn cycle_steps_stay_on_reserved_entities() {
-        let steps = cycle_steps("o-test-l1", 7, 42, &["METADATA_TYPE_STRING", "METADATA_TYPE_BOOL", "METADATA_TYPE_INT64"], true);
+        let steps = cycle_steps("o-test-l1", 7, 42, &["METADATA_TYPE_STRING", "METADATA_TYPE_BOOL", "METADATA_TYPE_INT64"], false, &[]);
         for (req, _) in &steps {
             let s = req.to_string();
-            assert!(s.contains("own-score7") || s.contains("\"own-bad\""), "{s}");
+            assert!(s.contains("own-score7") || s.contains("\"own-bad7\"") || s.contains("\"own-bad\""), "{s}");
             assert!(s.contains("\"o-test-l1\""));
         }
         let checks: Vec<StepCheck> = steps.iter().map(|(_, c)| *c).collect();
@@ -778,10 +843,62 @@ mod tests {
         assert!(checks.contains(&StepCheck::BoolOverNumeric));
         assert_eq!(steps[2].0["apply"]["action"]["addMetadata"]["metadata"]["own-score7"]["stringValue"], "42");
         assert_eq!(steps[2].0["apply"]["action"]["addMetadata"]["target"]["account"]["addr"], "users:own-score7");
+        // The INT64 declaration lands on a fresh key that holds the
+        // uncoercible text written just before it.
+        let int64 = steps.iter().position(|(_, c)| *c == StepCheck::Int64OverUncoercible).unwrap();
+        assert_eq!(steps[int64].0["setMetadataFieldType"]["key"], "own-bad7");
+        assert_eq!(steps[int64 - 1].0["apply"]["action"]["addMetadata"]["metadata"]["own-bad7"]["stringValue"], "not-a-number-42");
         assert!(steps.iter().any(|(r, _)| r["apply"]["action"]["addMetadata"]["metadata"]["own-bad"]["stringValue"] == "not-a-number-42"));
-        assert!(steps.iter().any(|(r, _)| r["createIndex"]["id"]["metadata"]["key"] == "own-bad"));
-        let later = cycle_steps("o-test-l1", 8, 1, &["METADATA_TYPE_STRING"], false);
-        assert!(!later.iter().any(|(r, _)| r.get("createIndex").is_some_and(|c| c["id"]["metadata"]["key"] == "own-bad")));
+        // Every per-cycle key is removed again (the remove drops its index).
+        for k in ["own-score7", "own-bad7"] {
+            let last_set = steps.iter().rposition(|(r, _)| r["setMetadataFieldType"]["key"] == k).unwrap();
+            assert!(steps[last_set..].iter().any(|(r, _)| r["removeMetadataFieldType"]["key"] == k), "{k} removed at the end");
+        }
+        // The shared index is created (declared first) only while absent,
+        // and last.
+        let creates_bad = |st: &[(Value, StepCheck)]| st.iter().any(|(r, _)| r["createIndex"]["id"]["metadata"]["key"] == "own-bad");
+        assert!(creates_bad(&steps));
+        assert_eq!(steps.last().unwrap().0["createIndex"]["id"]["metadata"]["key"], "own-bad");
+        assert_eq!(steps[steps.len() - 2].0["setMetadataFieldType"]["key"], "own-bad");
+        let later = cycle_steps("o-test-l1", 8, 1, &["METADATA_TYPE_STRING"], true, &["own-score3".into()]);
+        assert!(!creates_bad(&later));
+        assert_eq!(later[0].0["removeMetadataFieldType"]["key"], "own-score3", "leftovers are swept first");
+    }
+
+    #[test]
+    fn cycle_plan_inputs_read_the_model() {
+        let inflight: BTreeSet<u64> = [5].into_iter().collect();
+        let lv = json!({
+            "fieldTypes": {"account": {"own-score3": "METADATA_TYPE_INT64", "own-score5": "METADATA_TYPE_INT64",
+                "own-bad4": "METADATA_TYPE_INT64", "own-bad": "METADATA_TYPE_INT64", "k0": "METADATA_TYPE_STRING",
+                "own-scorex": "METADATA_TYPE_INT64", "own-score9": "METADATA_TYPE_BOOL"}},
+            "indexes": [{"canonical": "metadata:TARGET_TYPE_ACCOUNT:own-score3", "state": "ambiguous"}],
+        });
+        let (bad_indexed, leftovers) = cycle_plan_inputs(&lv, &inflight);
+        assert!(!bad_indexed, "own-bad declared but not indexed");
+        assert_eq!(leftovers, vec!["own-bad4".to_string(), "own-score3".to_string()], "capped, in-flight and shared keys spared");
+        let lv2 = json!({"fieldTypes": {"account": {}}, "indexes": [{"canonical": "metadata:TARGET_TYPE_ACCOUNT:own-bad"}]});
+        assert_eq!(cycle_plan_inputs(&lv2, &inflight), (true, vec![]));
+    }
+
+    #[test]
+    fn typed_metadata_cycle_creates_the_shared_index_while_the_model_lacks_it() {
+        let creates_bad = |fo: &testkit::FakeOracle| {
+            fo.calls("/write/begin").iter().any(|b| b["requests"].as_array().is_some_and(|rs| rs.iter().any(|r| r["createIndex"]["id"]["metadata"]["key"] == BAD_KEY)))
+        };
+        // Any number of cycles: absent from the model, every cycle tries.
+        let (d, _, fo) = testkit::driver();
+        fo.set_view("ledger", json!({"fieldTypes": {"account": {}}, "indexes": []}));
+        testkit::run_rule(&d, typed_metadata_cycle);
+        testkit::run_rule(&d, typed_metadata_cycle);
+        assert!(creates_bad(&fo));
+        assert!(fo.calls("/view").iter().filter(|v| v.to_string().contains("\"owned\":true")).count() >= 2, "the owned l1 view per cycle");
+        // Present in the model: no cycle re-creates it.
+        let (d, _, fo) = testkit::driver();
+        fo.set_view("ledger", json!({"fieldTypes": {"account": {}}, "indexes": [{"canonical": "metadata:TARGET_TYPE_ACCOUNT:own-bad"}]}));
+        testkit::run_rule(&d, typed_metadata_cycle);
+        assert!(!creates_bad(&fo));
+        assert!(d.s.ext::<TypedMeta>().inflight.lock().unwrap().is_empty(), "the cycle left the in-flight set");
     }
 
     #[test]

@@ -111,7 +111,7 @@ Fixtures: `W/oraclecheck/testdata/rejections/07-*.json`.
 | oracle: index listing / lookup on an absent ledger returned NotFound | `index_introspect` absent 2 % | no faults |
 | oracle: index inspection validated / gated / resumed / on an absent ledger | `inspect_index` | no faults |
 | oracle: index inspection summary matched the model / a populated index | `inspect_index` SUMMARY on an indexed key | no faults |
-| oracle: index inspection summary counted unconvertible values | `typed_metadata_cycle` writes `own-bad = "not-a-number-<v>"` (declared INT64, indexed by the first cycle); `inspect_index` inspects l1 with the owned view 1/4 | no faults |
+| oracle: index inspection summary counted unconvertible values | `typed_metadata_cycle` writes `own-bad = "not-a-number-<v>"` (declared INT64, indexed while the model lacks the index); `inspect_index` inspects l1 with the owned view 1/4 | no faults |
 | oracle: index inspection served from a checkpoint | `inspect_index` with `HEGEL_HAVE_CHECKPOINTS=1` | needs task 09 |
 | oracle: metadata field not in schema rejection exercised | `index_op` 1/16 probe | no faults |
 | a write attempt is refused while an index builds | any family write attempt answered `INDEX_BUILDING` | faults (99 removes it if the server never returns it on writes) |
@@ -127,14 +127,35 @@ Fixtures: `W/oraclecheck/testdata/rejections/07-*.json`.
   `index status validated` covered); the ledger-wide `GetIndexStatus` RPC is the stale poll.
 - `index demoted to ambiguous` fires on every not-ready observation (the old one only on an
   active→ambiguous flip), so it is reached right after creates without faults.
-- `typed_metadata_cycle` writes its uncoercible value under one shared reserved key
-  `own-bad` as `"not-a-number-<v>"` (the old driver used a fresh key and the fixed text
-  `"not-a-number"`); the first cycle also indexes `own-bad`, which is never removed. So the
-  index holds many distinct unconvertible values: `inspect_index` reaches `summary counted
-  unconvertible values` and `resumed from its cursor` on it. Each cycle ends by removing
-  its score key's declaration (keeps l1's schema small). `inspect_index` reads
-  `o-<run>-l1` with the owned `ledger` view 1/4 of the time (reads cannot disturb
-  rule-owned entities).
+- `typed_metadata_cycle` declares INT64 over an uncoercible value on a fresh reserved key
+  `own-bad<N>` per cycle (as the old driver's `bad-convert-<rand>`), so that check always
+  declares a type over uncoercible data, then removes it. Separately, every cycle writes
+  `"not-a-number-<v>"` under one shared reserved key `own-bad`, and, while the owned `ledger`
+  view of l1 shows no `metadata:TARGET_TYPE_ACCOUNT:own-bad` index (the model decides, not a
+  counter, so a cut-short cycle cannot lose it), declares it INT64 and creates its index as
+  the cycle's last two steps (a racing duplicate create fails last and costs nothing).
+  `own-bad` is never removed, so its index holds many distinct unconvertible values:
+  `inspect_index` reaches `summary counted unconvertible values` and `resumed from its
+  cursor` on it. `inspect_index` reads `o-<run>-l1` with the owned `ledger` view 1/4 of the
+  time (reads cannot disturb rule-owned entities).
+- Index growth on l1 is bounded: `RemoveMetadataFieldType` drops the key's metadata index in
+  the same order (server: the `RemovedMetadataFieldType` log carries the `DroppedIndex`;
+  model: `applyRemoveMetadataFieldType`), and every cycle ends by removing `own-score<N>`
+  and `own-bad<N>`. A cycle cut short (handoff, budget, failed step, no free slot) leaves
+  its declaration (and the `own-score<N>` index); the next cycle removes up to two such
+  leftovers first, skipping the keys of cycles still in flight (`TypedMeta.inflight`).
+- "Sequential on one slot unit": the steps run strictly one after another, but each takes
+  its own unit, because `begin_write` consumes the unit and the ticket releases it when it
+  ends (core `write.rs` API, not owned here). No free unit ends the cycle like a handoff.
+- Retype closure phase two accepts a node's `pendingVersion == 0` only from a poll that began
+  after the poll that armed the node ended (`Ticket > armedAt`, armedAt = that poll's
+  MaxTicket) and that still shows `lastIndexed >= openSeq`: `index_poll` runs concurrently,
+  unlike the old single poller goroutine, so "a later poll" must be later in time.
+- The drain hook (re-)arms a retype observation only when the bulk opened the window or
+  changed the declared type (walking the bulk in order, so A→B→A counts); a same-type
+  re-declaration on an open window keeps the observation.
+- `oracle: summary mode answered another arm` is checked before the generic page contract
+  (which otherwise reported the same case as `index inspection violates its own contract`).
 - `inspect_index` probes an absent ledger 1/20 (the spec lists the must-hit, not the rate).
 - Rejection fixture "drop of an absent index": not a rejection. The server tombstones the
   key and logs a `DroppedIndexLog` (`processDropIndex`), the model predicts success
@@ -147,7 +168,10 @@ Fixtures: `W/oraclecheck/testdata/rejections/07-*.json`.
 ## Requests to 99
 
 - Set `HEGEL_HAVE_CHECKPOINTS=1` in the driver env once task 09 (view `checkpoints`) is
-  merged; `oracle: index inspection served from a checkpoint` needs it.
+  merged; `oracle: index inspection served from a checkpoint` needs it. `inspect_index`
+  reads `checkpoints.live` (an array of decimal id strings, checked against
+  `hegel/09-query-checkpoints` `checkpointcheck/hooks.go viewCheckpoints`) and sends one as
+  `checkpointId`; re-check if 09's view shape changes before merge.
 - `a write attempt is refused while an index builds` needs faults; remove it if coverage
   shows the server never returns `INDEX_BUILDING` on writes.
 - Task 06's indexed-query validators depend on `index promoted to active` happening; with

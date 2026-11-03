@@ -62,8 +62,10 @@ func sameSet(a, b []string) bool {
 //     promotion confirmed at MaxTicket; the settle hook applies it once
 //     every operation ticketed at or before it finished. Verdicts are never
 //     aggregated across polls.
-//   - Retype closure: per node, a poll with lastIndexed >= openSeq arms it, a
-//     later poll listing the index with pendingVersion == 0 confirms it; once
+//   - Retype closure: per node, a poll with lastIndexed >= openSeq arms it
+//     (at the poll's MaxTicket); a poll that began after that (Ticket >
+//     armedAt), still sees lastIndexed >= openSeq and lists the index with
+//     pendingVersion == 0 confirms it; once
 //     every node of allNodes confirmed, the closure waits for the settle
 //     point like a promotion.
 func ValidateIndexStatusPoll(c *oc.ReadCtx) []oc.Event {
@@ -177,10 +179,15 @@ func ValidateIndexStatusPoll(c *oc.ReadCtx) []oc.Event {
 			case !o.foldSeen[node]:
 				if ns.lastIndexed >= o.openSeq {
 					o.foldSeen[node] = true
+					o.armedAt[node] = c.MaxTicket
 				}
-			default:
-				// Presence is part of the proof: an unlisted index reads as
-				// pending 0 through the map's zero value.
+			case c.Ticket > o.armedAt[node] && ns.lastIndexed >= o.openSeq:
+				// Phase two only from a poll that began after the arming
+				// poll ended (polls run concurrently: a poll that began
+				// earlier may have sampled the node before the fold), and
+				// that itself sees the fold. Presence is part of the proof:
+				// an unlisted index reads as pending 0 through the map's
+				// zero value.
 				if p, listed := ns.pending[o.canonical]; listed && p == 0 {
 					o.pendClear[node] = true
 				}

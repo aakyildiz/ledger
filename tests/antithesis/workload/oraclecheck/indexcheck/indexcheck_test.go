@@ -360,6 +360,95 @@ func TestRetypeClosureWaitsForEarlierReads(t *testing.T) {
 	require.False(t, open)
 }
 
+// pollAt posts a poll on an already begun ticket (a poll that overlaps
+// others), then finishes it.
+func (f *fixture) pollAt(tk uint64, nodes []string, per map[string]oc.Outcome) []oc.Event {
+	payload := PollPayload{}
+	for _, n := range nodes {
+		payload.PerNode = append(payload.PerNode, NodeOutcome{Node: n, Outcome: per[n]})
+	}
+	b, _ := json.Marshal(payload)
+	evs := ValidateIndexStatusPoll(f.ctx(KindIndexStatusPoll, tk, &servicepb.GetIndexStatusRequest{Ledger: f.L},
+		oc.Outcome{OK: true, Response: b}, PollParams{Nodes: nodes, AllNodes: allNodes}))
+
+	return append(evs, f.s.T.FinishRead(tk)...)
+}
+
+func TestRetypeClosureIgnoresPollsBegunBeforeArming(t *testing.T) {
+	t.Parallel()
+	f, id, canon := retypeFixture(t)
+	head := f.s.NextSeq - 1
+	clear := nodeStat(head, map[*commonpb.IndexID][2]uint32{id: {2, 0}})
+	// B begins first (it may sample a node before the fold), then A arms
+	// every node and ends, then B ends with clear-looking samples.
+	tkB := f.s.Read(KindIndexStatusPoll)
+	evs := f.poll(allNodes, everyNode(clear))
+	require.False(t, has(evs, EvRetypeClosed))
+	evs = f.pollAt(tkB, allNodes, everyNode(clear))
+	require.False(t, has(evs, EvRetypeClosed), "a poll begun before the arming poll ended is no proof")
+	_, open := f.s.T.Model().Ledger(f.L).RetypeWindow(canon)
+	require.True(t, open)
+	// A poll begun after the arming poll ended confirms.
+	evs = f.poll(allNodes, everyNode(clear))
+	require.True(t, has(evs, EvRetypeClosed))
+}
+
+func TestRetypeClosurePhaseTwoNeedsTheFold(t *testing.T) {
+	t.Parallel()
+	f, id, _ := retypeFixture(t)
+	head := f.s.NextSeq - 1
+	f.poll(allNodes, everyNode(nodeStat(head, map[*commonpb.IndexID][2]uint32{id: {2, 0}})))
+	// A later sample below the fold (a node that restarted from an older
+	// state) does not confirm, however its pending reads.
+	evs := f.poll(allNodes, everyNode(nodeStat(head-1, map[*commonpb.IndexID][2]uint32{id: {2, 0}})))
+	require.False(t, has(evs, EvRetypeClosed))
+	evs = f.poll(allNodes, everyNode(nodeStat(head, map[*commonpb.IndexID][2]uint32{id: {2, 0}})))
+	require.True(t, has(evs, EvRetypeClosed))
+}
+
+func TestRetypeClosureSameTypeRedeclareDoesNotReArm(t *testing.T) {
+	t.Parallel()
+	f, id, canon := retypeFixture(t)
+	head := f.s.NextSeq - 1
+	clear := nodeStat(head, map[*commonpb.IndexID][2]uint32{id: {2, 0}})
+	f.poll(allNodes, everyNode(clear)) // armed everywhere
+	f.write(setType(f.L, "k0", commonpb.MetadataType_METADATA_TYPE_INT64))
+	evs := f.poll(allNodes, everyNode(clear))
+	require.True(t, has(evs, EvRetypeClosed), "a same-type re-declaration keeps the observation")
+	_, open := f.s.T.Model().Ledger(f.L).RetypeWindow(canon)
+	require.False(t, open)
+}
+
+func TestRetypeClosureReArmsOnRoundTripInOneBulk(t *testing.T) {
+	t.Parallel()
+	f, id, _ := retypeFixture(t)
+	head := f.s.NextSeq - 1
+	clear := nodeStat(head, map[*commonpb.IndexID][2]uint32{id: {2, 0}})
+	f.poll(allNodes, everyNode(clear))
+	// INT64 → BOOL → INT64 in one bulk: same type before and after, yet a
+	// new rewrite chain.
+	f.write(setType(f.L, "k0", commonpb.MetadataType_METADATA_TYPE_BOOL), setType(f.L, "k0", commonpb.MetadataType_METADATA_TYPE_INT64))
+	evs := f.poll(allNodes, everyNode(clear))
+	require.False(t, has(evs, EvRetypeClosed))
+	evs = f.poll(allNodes, everyNode(clear))
+	require.False(t, has(evs, EvRetypeClosed), "re-armed at the round trip's log")
+}
+
+func TestRetypedKeys(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t)
+	f.write(setType(f.L, "k0", commonpb.MetadataType_METADATA_TYPE_STRING))
+	before := f.s.T.Model()
+	rm := &servicepb.Request{Type: &servicepb.Request_RemoveMetadataFieldType{RemoveMetadataFieldType: &servicepb.RemoveMetadataFieldTypeRequest{
+		Ledger: f.L, TargetType: acct, Key: "k0"}}}
+	k0 := retypeKey(f.L, indexes.Canonical(indexes.MetadataID(acct, "k0")))
+	k1 := retypeKey(f.L, indexes.Canonical(indexes.MetadataID(acct, "k1")))
+	require.Empty(t, retypedKeys([]*servicepb.Request{setType(f.L, "k0", commonpb.MetadataType_METADATA_TYPE_STRING)}, before))
+	require.True(t, retypedKeys([]*servicepb.Request{setType(f.L, "k0", commonpb.MetadataType_METADATA_TYPE_INT64)}, before)[k0])
+	require.True(t, retypedKeys([]*servicepb.Request{setType(f.L, "k1", commonpb.MetadataType_METADATA_TYPE_STRING)}, before)[k1], "first declaration")
+	require.True(t, retypedKeys([]*servicepb.Request{rm, setType(f.L, "k0", commonpb.MetadataType_METADATA_TYPE_STRING)}, before)[k0], "remove then declare")
+}
+
 // ---- introspection
 
 func listOutcome(entries ...*commonpb.Index) oc.Outcome {
@@ -487,7 +576,11 @@ func TestInspectSummaryCountsUnconvertible(t *testing.T) {
 	evs = f.read(KindInspectIndex, req, summary(2, 3, 0), nil, ValidateInspectIndex)
 	require.True(t, has(evs, EvInspectSummaryOutsideModel))
 	evs = f.read(KindInspectIndex, req, oc.Outcome{OK: true, Response: pj(&servicepb.InspectIndexResponse{})}, nil, ValidateInspectIndex)
-	require.NotEmpty(t, testutil.Findings(evs))
+	require.True(t, has(evs, EvSummaryOtherArm), "%v", testutil.IDs(evs))
+	require.False(t, has(evs, EvInspectContract), "the catalogued arm literal fires, not the generic contract")
+	evs = f.read(KindInspectIndex, req, oc.Outcome{OK: true, Response: pj(&servicepb.InspectIndexResponse{Result: &servicepb.InspectIndexResponse_Facets{
+		Facets: &servicepb.InspectFacets{}}})}, nil, ValidateInspectIndex)
+	require.True(t, has(evs, EvSummaryOtherArm), "%v", testutil.IDs(evs))
 
 	// A retype window accepts any summary.
 	f.write(setType(f.L, "k0", commonpb.MetadataType_METADATA_TYPE_STRING))
@@ -557,6 +650,49 @@ func TestIndexGapsView(t *testing.T) {
 	require.Contains(t, canons, indexes.Canonical(indexes.MetadataID(acct, "k1")))
 	require.NotContains(t, canons, indexes.Canonical(indexes.MetadataID(acct, "own-score1")))
 	require.Len(t, canons, len(match.WorkloadIndexes())-1+1)
+}
+
+// The gaps view is where index_op's "metadata indexes only on declared
+// keys" guarantee lives: every metadata gap is a key the model declares, and
+// reserved keys appear only with owned.
+func TestIndexGapsViewOnlyDeclaredKeys(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t)
+	tx := commonpb.TargetType_TARGET_TYPE_TRANSACTION
+	f.write(setType(f.L, "k1", commonpb.MetadataType_METADATA_TYPE_STRING))
+	f.write(setType(f.L, "k2", commonpb.MetadataType_METADATA_TYPE_INT64))
+	f.write(setType(f.L, "own-score7", commonpb.MetadataType_METADATA_TYPE_INT64))
+	f.write(setType(f.L, "own-bad", commonpb.MetadataType_METADATA_TYPE_INT64))
+	f.write(&servicepb.Request{Type: &servicepb.Request_SetMetadataFieldType{SetMetadataFieldType: &servicepb.SetMetadataFieldTypeRequest{
+		Ledger: f.L, TargetType: tx, Key: "k3", Type: commonpb.MetadataType_METADATA_TYPE_BOOL}}})
+	f.write(&servicepb.Request{Type: &servicepb.Request_RemoveMetadataFieldType{RemoveMetadataFieldType: &servicepb.RemoveMetadataFieldTypeRequest{
+		Ledger: f.L, TargetType: acct, Key: "k2"}}})
+	// Values without a declaration never make a gap.
+	f.write(testutil.AccountMetaReq(f.L, "users:1", "k0", "5"))
+	f.write(testutil.AccountMetaReq(f.L, "users:1", "own-other", "5"))
+
+	for _, owned := range []bool{false, true} {
+		params, _ := json.Marshal(map[string]any{"owned": owned})
+		res, err := viewIndexGaps(f.s.T.Model(), f.s.T, params)
+		require.NoError(t, err)
+		ls := f.s.T.Model().Ledger(f.L)
+		sawOwn := false
+		for _, g := range res.(map[string]any)["gaps"].(map[string][]GapEntry)[f.L] {
+			var id commonpb.IndexID
+			require.NoError(t, protojson.Unmarshal(g.ID, &id))
+			md := id.GetMetadata()
+			if md == nil {
+				continue
+			}
+			_, declared := ls.FieldTypeFor(md.GetTarget(), md.GetKey())
+			require.True(t, declared, "gap on undeclared key %s (owned=%v)", g.Canonical, owned)
+			if oc.IsReservedKey(md.GetKey()) {
+				require.True(t, owned, "reserved key %s without owned", g.Canonical)
+				sawOwn = true
+			}
+		}
+		require.Equal(t, owned, sawOwn)
+	}
 }
 
 func TestFieldNotInSchemaFailureHook(t *testing.T) {

@@ -69,6 +69,11 @@ func ValidateInspectIndex(c *oc.ReadCtx) []oc.Event {
 
 		return []oc.Event{oc.Violation(EvInspectContract, details)}
 	}
+	if mode == servicepb.InspectIndexMode_INSPECT_INDEX_MODE_SUMMARY && !resume && res.GetSummary() == nil {
+		// The catalogued literal for this arm, ahead of the generic page
+		// contract (which would otherwise report it first).
+		return []oc.Event{oc.Violation(EvSummaryOtherArm, details)}
+	}
 	if why := match.InspectPageViolation(res, mode, pageSize); why != "" {
 		details["why"] = why
 		if resume {
