@@ -55,6 +55,9 @@ pub enum Signal {
     BloomPopulateRaced,
 }
 
+/// A node stopping itself on an unrecoverable command failure (printed, not asserted).
+pub const FAIL_STOP: &str = "Terminal Raft command failure; stopping node";
+
 /// Line prefixes (server-signals §4) → signal. `[D]` lines need `LOG_LEVEL=debug`.
 pub const SIGNALS: [(&str, Signal); 8] = [
     ("Snapshot created", Signal::WalSnapshot),
@@ -67,8 +70,12 @@ pub const SIGNALS: [(&str, Signal); 8] = [
     ("Bloom task skipped SetReady: Rebuild occurred", Signal::BloomPopulateRaced),
 ];
 
-/// Invariant red flags (server-signals §4 "Red flags").
-pub const RED_FLAGS: [&str; 11] = [
+/// Invariant red flags (server-signals §4 "Red flags"). Not
+/// `Terminal Raft command failure; stopping node` (`node.go:263-266`): its
+/// only source is a failed persist of the conf state after a force-remove
+/// (`node.go:3558`), an I/O error, so it is a correct fail-stop under disk
+/// faults. It is logged as `FAIL_STOP` below, without an assertion.
+pub const RED_FLAGS: [&str; 10] = [
     "SENTINEL DIAG:",
     "CACHE COHERENCE:",
     "POST-COMMIT VOLUME ASSERTION FAILED",
@@ -78,7 +85,6 @@ pub const RED_FLAGS: [&str; 11] = [
     "Preload boundary mismatch",
     "preload coverage miss: read of undeclared key",
     "Pebble lags WAL snapshot",
-    "Terminal Raft command failure; stopping node",
     "Leadership gained Ready has no entries",
 ];
 
@@ -179,6 +185,8 @@ pub fn on_line(s: &Shared, l: &LogLine) {
     if let Some(flag) = red_flag(msg, structured) {
         println!("driver: red flag from {}: {}", l.node, l.raw);
         check_unreachable!("a server logs an invariant red flag", json!({"node": l.node, "nodeId": node_id, "flag": flag, "line": l.raw}));
+    } else if matches(msg, structured, FAIL_STOP) {
+        println!("driver: {} stopped on a terminal raft command failure: {}", l.node, l.raw);
     }
     if src != Source::Ledger {
         return;
@@ -283,7 +291,10 @@ mod tests {
         assert_eq!(r[0].kind, "Unreachable");
         assert_eq!(r[0].details["line"], line);
         assert_eq!(r[0].details["flag"], "CACHE COHERENCE:");
-        feed(&d.s, "restore-0", true, r#"{"msg":"Terminal Raft command failure; stopping node"}"#);
+        feed(&d.s, "restore-0", true, r#"{"msg":"Preload boundary mismatch: x"}"#);
+        assert_eq!(rec("a server logs an invariant red flag").len(), 2);
+        // A fail-stop on an I/O error is not an invariant red flag.
+        feed(&d.s, "ledger-0", true, r#"{"msg":"Terminal Raft command failure; stopping node","error":"persisting confstate after force-remove: no space left on device"}"#);
         assert_eq!(rec("a server logs an invariant red flag").len(), 2);
         // A client relaying an error message is not a server record.
         feed(&d.s, "client1", true, "op=3 error msg=\"Preload boundary mismatch\"");

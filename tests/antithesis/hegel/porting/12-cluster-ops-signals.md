@@ -8,9 +8,14 @@ the setup hook `ops_setup`.
 
 Error classes used below (`cluster_ops.rs`):
 
-- **transient**: no answer (`unknown`), a client-local error, `Unavailable`,
-  `DeadlineExceeded`, `Canceled`, reason `EXTERNAL_SERVICE_ERROR`, or `ResourceExhausted` +
-  `WRITES_BLOCKED_DISK_FULL` (the old `IsTransient` set plus the caller-side codes).
+- **transient**: no answer (`unknown`), a client-local dial failure (`local`, message
+  `dial:`), a remote `Unavailable`, `DeadlineExceeded` or `Canceled`, reason
+  `EXTERNAL_SERVICE_ERROR`, or `ResourceExhausted` + `WRITES_BLOCKED_DISK_FULL` (the old
+  `IsTolerated` set). Other client-local errors (request/response marshalling, the local
+  message-size limit) are driver or client bugs and never transient.
+- **backup transient**: transient without a remote `Canceled` (the backup drivers tolerated
+  `Canceled` only as caller cancellation, `backup.go:36-45`; the driver's own deadline shows
+  as no answer or `DeadlineExceeded`).
 - **busy**: `FailedPrecondition` whose message ends with
   `backup: destination already has a running job` (exact suffix, `IsBackupInProgress`).
 - **no full checkpoint**: `FailedPrecondition` whose message contains `full checkpoint`.
@@ -46,16 +51,16 @@ Error classes used below (`cluster_ops.rs`):
 | H/main.rs:928 | Sometimes: a checkpoint is created | verbatim | `cluster_checkpoint` |
 | H/main.rs:934 | Always: a successful backup contains files | renamed to the MD literal `backup should produce files` (AlwaysOrUnreachable) | backup job |
 | H/main.rs:936 | Sometimes: a backup completes | renamed to the MD literal `backup completed successfully` (Reachable) | backup job |
-| MD/singleton_driver_backup:52 | Unreachable: Backup returned unexpected error | verbatim (not busy, not transient, not `EXTERNAL_SERVICE_ERROR`) | backup job `run_chain` |
+| MD/singleton_driver_backup:52 | Unreachable: Backup returned unexpected error | verbatim (not busy, not backup-transient), full-only chains | backup job `run_chain` |
 | MD/singleton_driver_backup:63 | AlwaysOrUnreachable: backup should produce files | verbatim | `run_chain` |
 | MD/singleton_driver_backup:65 | Reachable: backup completed successfully | verbatim | `run_chain` |
 | W/internal/backup.go:81 | Sometimes: backup recovery after destination busy succeeds | verbatim; evaluated on every attempt after the first busy answer (as the old `RetryBackup`), retry ≤ 2 min from the first busy, drawn backoffs 500–5000 ms | `backup_call` |
-| MD/singleton_driver_incremental_backup | Unreachable: Backup (pre-incremental) returned unexpected error | merged into `Backup returned unexpected error` (the full backup of a chain is the same call with the same assertions) | `run_chain` |
-| MD/singleton_driver_incremental_backup | Reachable: incremental backup completed | verbatim | `run_chain` |
-| MD/singleton_driver_incremental_backup | Unreachable: IncrementalBackup returned unexpected error | verbatim (busy, transient, `EXTERNAL_SERVICE_ERROR`, no full checkpoint tolerated) | `run_chain` |
-| MD/singleton_driver_incremental_backup | Unreachable: second IncrementalBackup returned unexpected error | merged into `IncrementalBackup returned unexpected error`: one incremental per chain; the "second" is the next chain's incremental | `run_chain` |
-| MD/singleton_driver_incremental_backup:130 | AlwaysOrUnreachable: incremental backup log sequence should not regress | verbatim; compared with the highest `lastLogSequence` of the incrementals that completed before this one was sent (driver-global) | `run_chain` |
-| MD/singleton_driver_incremental_backup:137 | AlwaysOrUnreachable: incremental backup audit sequence should not regress | verbatim, same floor scheme | `run_chain` |
+| MD/singleton_driver_incremental_backup | Unreachable: Backup (pre-incremental) returned unexpected error | verbatim: the full backup of a chain that goes on with incrementals | `run_chain` |
+| MD/singleton_driver_incremental_backup | Reachable: incremental backup completed | verbatim (the first incremental of a chain) | `run_chain` |
+| MD/singleton_driver_incremental_backup | Unreachable: IncrementalBackup returned unexpected error | verbatim (busy, backup-transient, no full checkpoint tolerated) | `run_chain` |
+| MD/singleton_driver_incremental_backup | Unreachable: second IncrementalBackup returned unexpected error | verbatim: an incremental chain runs full, incremental, incremental, as the old driver | `run_chain` |
+| MD/singleton_driver_incremental_backup:130 | AlwaysOrUnreachable: incremental backup log sequence should not regress | verbatim: the second incremental against the first of the same chain (old shape). Not compared when a full backup of this driver (another chain of the same job) was in flight before the first, or started or ended before the second returned: a full backup restarts the export chain from its checkpoint (`manifest.go:100-114`), and the server only keeps one export chain monotonic (`manager.go:513-518`) | `run_chain` |
+| MD/singleton_driver_incremental_backup:137 | AlwaysOrUnreachable: incremental backup audit sequence should not regress | verbatim, same scheme | `run_chain` |
 | H/main.rs:1022 | Always: the store integrity check finds no error | renamed to the MD literal `CheckStore found integrity error` (AlwaysOrUnreachable) | check_store job |
 | H/main.rs:1023 | Sometimes: a store integrity check completes | renamed to `CheckStore completed successfully` (Reachable) | check_store job |
 | MD/parallel_driver_check_store | Unreachable: CheckStore returned unexpected error | verbatim | `run_check_store` |
@@ -75,7 +80,7 @@ Error classes used below (`cluster_ops.rs`):
 
 | Kind | Literal | Where |
 |---|---|---|
-| Always | a full backup's last log sequence covers every write acknowledged before it started | `run_chain` (`lastLogSequence ≥ Shared.acked_seq_high_water` recorded in the rule) |
+| Always | a full backup's applied index covers every barrier completed before it started | `run_chain`: `lastAppliedIndex ≥` the highest barrier commit index (`BarrierState.high`) recorded in the rule. Backup applies its Start order (`orchestrator.go:274`) before it takes the checkpoint, and a proposal resolves only after its Pebble commit (`applier.go` `submitAsyncCommit`), so the checkpoint is past every barrier that completed earlier. Replaces the spec's `lastLogSequence ≥ Shared.acked_seq_high_water` (see Deviations) |
 | Sometimes | a follower reports an out-of-sync or snapshotting status | `cluster_state` |
 | Sometimes | the leader reports a follower in snapshot progress | `cluster_state` |
 | Reachable | the driver parses a structured server log record | server_signals.rs |
@@ -90,7 +95,7 @@ Error classes used below (`cluster_ops.rs`):
 | Reachable | a cluster config change resets the cache epoch | (`Applying cluster config change: resetting cache and purging 0xFF`) |
 | Reachable | a bloom config change triggers a rebuild | (`Bloom filter config changed: purging blocks and rebuilding`) |
 | Reachable | a bloom populate races a rebuild | (`Bloom task skipped SetReady: Rebuild occurred`) |
-| Unreachable | a server logs an invariant red flag | server_signals.rs: records whose `msg` starts with `SENTINEL DIAG:`, `CACHE COHERENCE:`, `POST-COMMIT VOLUME ASSERTION FAILED`, `AGGREGATED VOLUME BALANCE CHECK FAILED`, `PERSISTED VOLUME UPDATE at invariant violation`, `TRANSIENT VOLUME at invariant violation`, `Preload boundary mismatch`, `preload coverage miss: read of undeclared key`, `Pebble lags WAL snapshot`, `Terminal Raft command failure; stopping node`, `Leadership gained Ready has no entries`; ledger and restore-target lines, from boot |
+| Unreachable | a server logs an invariant red flag | server_signals.rs: records whose `msg` starts with `SENTINEL DIAG:`, `CACHE COHERENCE:`, `POST-COMMIT VOLUME ASSERTION FAILED`, `AGGREGATED VOLUME BALANCE CHECK FAILED`, `PERSISTED VOLUME UPDATE at invariant violation`, `TRANSIENT VOLUME at invariant violation`, `Preload boundary mismatch`, `preload coverage miss: read of undeclared key`, `Pebble lags WAL snapshot`, `Leadership gained Ready has no entries`; ledger and restore-target lines, from boot. `Terminal Raft command failure; stopping node` is printed only (see Deviations) |
 
 Log signals are counted per node (`SignalState`, first occurrence printed as
 `driver: signal <name> first seen on <node>`), active or not; Reachables only while the
@@ -111,9 +116,10 @@ workload is active. Signal Reachables count only `ledger-*` lines (the main clus
 | primary compaction completed, secondary compaction completed | compaction | no faults |
 | a checkpoint is created | cluster_checkpoint | no faults |
 | backup completed successfully | backup job | no faults (needs minio) |
-| a full backup's last log sequence covers every write acknowledged before it started | backup job | no faults (needs minio) |
+| a full backup's applied index covers every barrier completed before it started | backup job | no faults (needs minio) |
 | backup recovery after destination busy succeeds | backup job, two concurrent chains (1/6) | no faults (needs minio) |
 | incremental backup completed | backup job (1/3 of chains) | no faults (needs minio) |
+| incremental backup log / audit sequence should not regress | backup job (1/3 of chains) | no faults (needs minio) |
 | CheckStore completed successfully | check_store job | no faults |
 | should be able to add NATS event sink, should be able to remove event sink | event_sinks | no faults |
 | a follower reports an out-of-sync or snapshotting status | cluster_state | faults + knobs |
@@ -134,6 +140,46 @@ workload is active. Signal Reachables count only `ledger-*` lines (the main clus
 `run_native.sh` runs one node: transfers, snapshots, sync windows and config changes cannot
 happen there, and minio/NATS are absent, so backups and sink adds fail there.
 
+## Deviations from the spec
+
+- **Full-backup coverage Always.** The spec asks for `lastLogSequence ≥
+  Shared.acked_seq_high_water`. That floor is not sound: the server's own comment
+  (`manager.go:513-518`) says a node's history-zone log sequence can be lower than one
+  already recorded after a checkpoint restore, and `Clients::note_apply` raises the
+  high-water on every successful Apply response, including late UDP events and (once task
+  18 lands) other clusters. The new literal compares the checkpoint's `lastAppliedIndex`
+  with the barrier high-water instead, which holds by construction.
+- **Incremental non-regression.** The spec compares each incremental with the previous
+  successful incremental of the process (driver-global). Every chain starts with a full
+  backup that restarts the export chain, so that floor is stronger than the old literals
+  and can fail on a correct server (COMMON: never strengthen an old check). Chains with
+  incrementals run full + two incrementals, as the old driver did.
+- **Red flag list.** `Terminal Raft command failure; stopping node` has one source, a failed
+  conf-state persist after a force-remove (`node.go:3558`): an I/O error, so a correct
+  fail-stop under disk faults. It is printed (`driver: <node> stopped on a terminal raft
+  command failure`) but not asserted.
+- **Time bounds.** Each rule body has one 10 s deadline (`Clock`): transfer (≤ 8 s), the
+  burst transfer (only while ≥ 3.5 s are left), the witness write and the final
+  `GetClusterState` are capped by it; compaction is 6 s + 2 s + 2 s; event sinks give the
+  leftover cleanup 2 s and each step ≤ 3 s; `cluster_state` makes one 2 s discovery call
+  (not `NodeMap::discover`) and stops querying nodes with less than 2 s left. `ops_setup`
+  spends at most 20 s; when it gave up, `transfer_leadership` creates `r-ops-<run>` after a
+  `LEDGER_NOT_FOUND` witness write.
+- **Long jobs.** Backup and CheckStore share one in-flight slot (one long job queued or
+  running), and are not submitted while a quiet-blocking job is queued or running, so one
+  job thread always stays free. A backup job has a 180 s budget for all its calls, busy
+  retries and waits; each call's timeout is capped by what is left.
+- **Backups and quiet periods.** Backup Start/Complete are Raft proposals, which spoil task
+  15's fenced checks. Before each Backup/IncrementalBackup call the job waits (within its
+  budget) while a quiet period may be open. 00c's `Shared` has no quiet flag, so
+  `QuietWatch` infers it: rules are parked during a quiet period, so each task-12 rule
+  records `(next_epoch, now)`; a quiet period is taken as open when the epoch moved past
+  that observation and `last_quiet_end` did not (or the epoch moved by two). A quiet period
+  that starts while a backup call runs is not detected.
+- **NodeCache.** A discovered member map is cached only when every member has a service
+  address and it lists at least the configured number of nodes; members without an address
+  are skipped.
+
 ## Requests to 99
 
 - `the driver receives restore-target logs` needs task 18's restore targets forwarding logs
@@ -141,13 +187,10 @@ happen there, and minio/NATS are absent, so backups and sink adds fail there.
 - `a node creates a main store query checkpoint` needs task 09's `createQueryCheckpoint`
   orders.
 - Backups use the server's default namespace (`bucketId` omitted, as the old drivers did);
-  task 18 uses `hegel-restore`. If task 18 ever sends Applies to restore targets through
-  `Driver::call`, those responses also raise `Shared.acked_seq_high_water`; the new
-  full-backup Always would then compare against another cluster's sequences. 99 should
-  check that restore-target Applies do not go through `note_apply`, or keep a separate
-  high-water.
-- Backup and CheckStore jobs are limited to one queued-or-running job each. Together they
-  can still occupy both job threads for minutes (a backup chain with busy retries ≤ 2 min
-  plus 90 s calls; CheckStore ≤ 60 s), delaying other families' jobs such as task 04's
-  quiet-blocking maintenance disable. If 99 sees that, a dedicated job thread for
-  long Rust-only jobs is the fix (00c's `jobs.rs`, not owned by 12).
+  task 18 uses `hegel-restore`. The full-backup Always uses barrier commit indexes of the
+  main cluster only (`barrier_monotonic`), so restore-target traffic cannot affect it.
+- A `Shared` flag "quiet period open" (set at Q0, cleared by `EndGuard`) would replace
+  `QuietWatch`'s inference in `cluster_ops.rs`.
+- Long jobs: one task-12 job at a time. If other families' long jobs also share the two
+  job threads, 99 may still want a dedicated thread for long Rust-only jobs (00c's
+  `jobs.rs`).
