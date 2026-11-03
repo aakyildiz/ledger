@@ -357,6 +357,7 @@ impl NsLedger {
     /// and `transfer` resolve to `Transfer`; a pinned version to its
     /// template; `latest` to the template of every possible version at or
     /// above the greatest acked one (deduplicated, in version order).
+    #[cfg(test)]
     pub fn candidates(&self, sel: &Selector, vars: &Vars) -> Vec<Vec<Posting>> {
         self.candidates_since(sel, vars, self.floor(sel))
     }
