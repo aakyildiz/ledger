@@ -106,8 +106,9 @@ No other new literal. All oracle literals are `oracle: ` + the `M/` suffix.
 | `a listing spans several pages` | list_traverse, small page sizes | no faults |
 | `oracle: kind-mismatched field query rejected on accounts` / `… on transactions` | list_accounts / list_transactions, 1/12 | needs task 07 |
 | `oracle: indexed account query served results`, `oracle: indexed transaction query served results`, `oracle: has-asset under a combinator served results` | list rules | needs task 07 |
-| `oracle: asset-index account query served results`, `oracle: asset-index account query gated` | list_accounts has-asset 1/6 | needs task 07 |
-| `oracle: has-asset precision overflow rejected` | list_accounts has-asset 1/16 × 1/6 | needs task 07 |
+| `oracle: asset-index account query served results` | list_accounts has-asset 1/6 | needs task 07 |
+| `oracle: asset-index account query gated` | list_accounts has-asset 1/6 (INDEX_NOT_FOUND) | no faults (hit in the native run), kept in the 07 block as the spec lists it |
+| `oracle: has-asset precision overflow rejected` | list_accounts has-asset 1/16 × 1/6 | no faults (hit in the native run) |
 | `oracle: coverage …` (Raw probes) | every index-backed read | needs task 07 |
 
 ## Deviations from the task spec
@@ -118,11 +119,11 @@ No other new literal. All oracle literals are `oracle: ` + the `M/` suffix.
   kind-mismatched leaf answers INDEX_NOT_FOUND (counted as "indexed … gated") until task 07
   creates indexes. Both literals are in the "reachable only with task 07 merged" asserter block.
 - **Two extra Reachables** ported from `M/` that the spec's list omits: `oracle: unsupported
-  builtin uint field rejected` (reached without faults) and `oracle: has-asset precision
-  overflow rejected` (07 block; the oracle's refused-filter classification also covers the
-  overflow, so whether it fires before task 07 depends on the server's reason code).
-- **`asset-index account query gated`** is also in the 07 block as the spec says, although an
-  INDEX_NOT_FOUND on a bare has-asset leaf already reaches it without indexes.
+  builtin uint field rejected` and `oracle: has-asset precision overflow rejected`; both were
+  hit without faults in the native run.
+- **`asset-index account query gated`** stays in the 07 block as the spec says, although an
+  INDEX_NOT_FOUND on a bare has-asset leaf already reaches it without indexes (hit in the
+  native run).
 - **Fixture paths.** The spec names `HG/protocol-fixtures/filters/*.json`; COMMON.md lets a
   family add files only under `HG/protocol-fixtures/<NN>/`, so they are in
   `HG/protocol-fixtures/06/filters/`.
@@ -144,3 +145,12 @@ No other new literal. All oracle literals are `oracle: ` + the `M/` suffix.
   `AddressRole` on accounts, `Not` without a child): inherited unchanged from `M/`; if the
   integrated run shows `ListAccounts returned unexpected error` with InvalidArgument for such a
   shape, the classification in `match.ClassifyRejectedFilter` (00b) needs the server's rule.
+
+## Native run (acceptance)
+
+`RULES=list_accounts,list_transactions,list_logs,list_traverse,smoke_tx run_native.sh 180`
+(with `HEALTH_{WAL,DATA}_THRESHOLD=0.995` in the environment because the shared build machine's
+disk was above the server's 80 % write gate): 26 576 list reads validated (12 522
+ListTransactions, 8 374 ListLogs, 5 680 ListAccounts), zero findings; every must-hit of the
+"no faults" rows above was hit; the only never-hit must-hits were the `oracle: coverage …`
+probes (task 07).

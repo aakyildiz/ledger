@@ -146,6 +146,11 @@ func init() {
 	registerAsserter(qc.EvUnsupportedBuiltinRejected, func(_ bool, d map[string]any) {
 		assert.Reachable("oracle: unsupported builtin uint field rejected", d)
 	})
+	// Reached without indexes: the oracle classifies the overflow as refused
+	// only after this check, and the server answers FILTER_COMPILATION_ERROR.
+	registerAsserter(qc.EvHasAssetPrecisionOverflowRejct, func(_ bool, d map[string]any) {
+		assert.Reachable("oracle: has-asset precision overflow rejected", d)
+	})
 
 	// reachable only with task 07 merged (indexes created, kind checks need a
 	// ready index); listed under "Requests to 99" in porting/06-list-queries.md.
@@ -169,8 +174,5 @@ func init() {
 	})
 	registerAsserter(qc.EvAssetIndexAccountQueryGated, func(_ bool, d map[string]any) {
 		assert.Reachable("oracle: asset-index account query gated", d)
-	})
-	registerAsserter(qc.EvHasAssetPrecisionOverflowRejct, func(_ bool, d map[string]any) {
-		assert.Reachable("oracle: has-asset precision overflow rejected", d)
 	})
 }
