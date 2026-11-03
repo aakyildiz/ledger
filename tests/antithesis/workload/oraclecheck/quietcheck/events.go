@@ -21,6 +21,7 @@ const (
 	EvAuditAdmissionEntry       oc.EventID = "oracle: an admission rejection reached the audit trail"
 	EvAuditUncommittedEntry     oc.EventID = "oracle: an uncommitted failure reached the audit trail"
 	EvAuditReplayStateDiffers   oc.EventID = "oracle: audit replay state differs from the online model"
+	EvAuditSequenceGap          oc.EventID = "oracle: the audit trail listing skips a sequence"
 	EvAuditReplayVerified       oc.EventID = "oracle: quiet audit replay verified" // Reachable
 	EvQuietGlobalStreamDiffers  oc.EventID = "oracle: quiet global log stream differs from the learned sequences"
 	EvQuietLogDatesDecrease     oc.EventID = "oracle: log dates decrease along the global sequence"

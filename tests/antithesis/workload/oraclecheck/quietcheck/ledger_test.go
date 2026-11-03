@@ -226,24 +226,32 @@ func TestExactState_UsageBelowTheModelIsLegal(t *testing.T) {
 	}
 }
 
-// A zero-balance cell of an address that is ephemeral by the current chart
-// may already be purged by the server: its absence (and the account's, when
-// that was its only state) is tolerated; any other absence is not.
-func TestExactState_PurgedZeroCellsTolerated(t *testing.T) {
+// The server purges only the zero-balance ephemeral cells a bulk touched,
+// exactly like the model: a zero cell under a pattern that became ephemeral
+// after it was drained stays on the server, so its absence is a finding; a
+// cell a later bulk drained under the ephemeral type is purged by both and
+// the model-consistent listing omits it.
+func TestExactState_PurgedZeroCellsExact(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t)
 	l := h.ledger(1)
 	h.write(false, testutil.CreateLedgerReq(l))
 	h.write(false, testutil.TxReq(l, "", "world", "z:1", "COIN", 5))
 	h.write(false, testutil.TxReq(l, "", "z:1", "t-1:a", "COIN", 5))
-	// z:1 now holds a zero-balance cell; typing z as ephemeral afterwards
-	// leaves the model's cell in place, while a server may purge it.
 	typed := h.write(false, onLedger(oracletest.AddTypeReqP("z", commonpb.AccountTypePersistence_ACCOUNT_TYPE_EPHEMERAL), l))
 	if typed.Status != oc.WCommitted {
 		t.Skipf("the model refuses the late ephemeral type: %v", typed.Outcome)
 	}
-	require.Contains(t, match.AccountUniverse(h.s.T.Model().Ledger(l)), "z:1")
+	// z:2 is drained under the ephemeral type: purged by the bulk.
+	h.write(false, testutil.TxReq(l, "", "world", "z:2", "COIN", 3), testutil.TxReq(l, "", "z:2", "t-1:a", "COIN", 3))
+	universe := match.AccountUniverse(h.s.T.Model().Ledger(l))
+	require.Contains(t, universe, "z:1", "an untouched zero cell is kept")
+	require.NotContains(t, universe, "z:2", "a drained ephemeral cell is purged")
 	h.openQuiet(t)
+	var seq uint64
+	evs := h.postLedger(t, l, qc.ScopeLinearizable, render(t, h, l), &seq)
+	require.Empty(t, ids(evs))
+
 	s := render(t, h, l)
 	var kept []*commonpb.Account
 	for _, a := range s.accts {
@@ -252,14 +260,6 @@ func TestExactState_PurgedZeroCellsTolerated(t *testing.T) {
 		}
 	}
 	s.accts = kept
-	var seq uint64
-	evs := h.postLedger(t, l, qc.ScopeLinearizable, s, &seq)
-	require.Empty(t, ids(evs))
-
-	// world is not ephemeral: its absence is a finding.
-	s = render(t, h, l)
-	require.Equal(t, "t-1:a", s.accts[0].GetAddress())
-	s.accts = s.accts[1:]
 	evs = h.postLedger(t, l, qc.ScopeLinearizable, s, &seq)
 	require.Contains(t, ids(evs), qc.EvQuietAcctsDiffer)
 }

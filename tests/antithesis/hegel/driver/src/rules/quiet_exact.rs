@@ -164,8 +164,14 @@ fn list_all(
             Ok(o) => o,
             Err(p) => return p,
         };
+        if !out.complete {
+            // The client cut the stream at max_items: the page is truncated
+            // and carries no cursor, so posting it would lose rows.
+            println!("driver: exact quiet check: {method} page truncated by the client");
+            return Phase::Failed;
+        }
         let items = out.items.clone().unwrap_or_default();
-        let last = out.next_cursor.is_empty() || (items.is_empty() && out.complete);
+        let last = out.next_cursor.is_empty() || items.is_empty();
         if !page(items, last) {
             return Phase::Failed;
         }
@@ -448,6 +454,10 @@ mod tests {
         ft.script("bucket", "ListAuditEntries", vec![page(vec![json!({"sequence": "12"})], ""), page(vec![json!({"sequence": "1"})], "c1"), page(vec![json!({"sequence": "2"})], "")]);
         ft.script("bucket", "ListLogs", vec![page(vec![json!({"sequence": "1"})], "x"), page(vec![], "")]);
         ft.script("bucket", "Barrier", vec![ok(json!({"commitIndex": "7"}))]);
+        // An empty listing is a complete stream with no cursor.
+        for m in ["ListLogs", "ListTransactions", "ListAccounts"] {
+            ft.set_default("bucket", m, page(vec![], ""));
+        }
         d.s.quiets_since_exact.store(5, Ordering::SeqCst);
         crate::quiet::run_quiet(&d, Some(&hook(BUDGET)), Some(Box::new(the_plan(false))));
 
@@ -498,6 +508,20 @@ mod tests {
         assert!(a.iter().any(|x| x.message == "the full state check completes in a quiet period" && !x.cond));
         assert!(!a.iter().any(|x| x.message == "the full state check completes in a quiet period" && x.cond));
         assert_eq!(d.s.quiets_since_exact(), 2, "not reset: the run did not complete");
+    }
+
+    /// A page the client cut at max_items (complete:false, no cursor) is not
+    /// the end of the listing: the phase fails instead of posting it final.
+    #[test]
+    fn a_truncated_page_fails_the_phase() {
+        let (d, ft, fo) = testkit::driver();
+        testkit::reset();
+        let truncated = FakeReply::Outcome(Outcome::from_json(&json!({"ok": true, "items": [{"sequence": "1"}], "complete": false})));
+        ft.script("bucket", "ListAuditEntries", vec![page(vec![json!({"sequence": "1"})], ""), truncated]);
+        crate::quiet::run_quiet(&d, Some(&hook(BUDGET)), Some(Box::new(the_plan(false))));
+        assert!(sections(&fo, "audit").is_empty(), "nothing of a truncated listing is posted");
+        let a = testkit::assertions();
+        assert!(a.iter().any(|x| x.message == "the full state check completes in a quiet period" && !x.cond));
     }
 
     #[test]

@@ -34,6 +34,9 @@ func init() {
 	registerAsserter(qc.EvAuditReplayStateDiffers, func(_ bool, d map[string]any) {
 		assert.Unreachable("oracle: audit replay state differs from the online model", d)
 	})
+	registerAsserter(qc.EvAuditSequenceGap, func(_ bool, d map[string]any) {
+		assert.Unreachable("oracle: the audit trail listing skips a sequence", d)
+	})
 	registerAsserter(qc.EvAuditReplayVerified, func(_ bool, d map[string]any) {
 		assert.Reachable("oracle: quiet audit replay verified", d)
 	})

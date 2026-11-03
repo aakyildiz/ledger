@@ -5,6 +5,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	oc "github.com/formancehq/ledger/v3/tests/antithesis/workload/oraclecheck"
 	"github.com/formancehq/ledger/v3/tests/antithesis/workload/oraclecheck/testutil"
 )
 
@@ -55,4 +56,27 @@ func TestGlobalStream(t *testing.T) {
 	}
 	evs := globalStream(good, model, bulks, s.T.CommittedLogs())
 	require.Equal(t, EvQuietGlobalStreamDiffers, evs[0].ID)
+}
+
+// Two tracked bulks whose logs interleave: bulk A got sequences 10 and 12,
+// bulk B got 11. Every sequence of A's range is some tracked log (11 is B's),
+// so only the disjointness of the ranges catches it.
+func TestGlobalStream_InterleavedBulks(t *testing.T) {
+	t.Parallel()
+	model := testutil.NewSession("").T.Model()
+	logs := map[uint64]oc.CommittedLog{
+		10: {Ledger: "o-test-l1", ID: 1}, 11: {Ledger: "o-test-l1", ID: 2}, 12: {Ledger: "o-test-l1", ID: 3},
+	}
+	contiguous := map[uint64]oc.CommittedBulk{
+		10: {Wid: "a", MinSeq: 10, MaxSeq: 11}, 12: {Wid: "b", MinSeq: 12, MaxSeq: 12},
+	}
+	require.Empty(t, globalStream(map[string][]rowRef{}, model, contiguous, logs))
+
+	interleaved := map[uint64]oc.CommittedBulk{
+		10: {Wid: "a", MinSeq: 10, MaxSeq: 12}, 11: {Wid: "b", MinSeq: 11, MaxSeq: 11},
+	}
+	evs := globalStream(map[string][]rowRef{}, model, interleaved, logs)
+	require.Len(t, evs, 1)
+	require.Equal(t, EvQuietGlobalStreamDiffers, evs[0].ID)
+	require.Contains(t, evs[0].Details["problems"].([]string)[0], "overlap")
 }

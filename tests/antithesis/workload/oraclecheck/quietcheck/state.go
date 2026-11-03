@@ -44,7 +44,10 @@ type state struct {
 	replay oracle.GlobalState
 	// cursor is the last audit sequence consumed.
 	cursor uint64
-	// decided: records an audit entry was matched to.
+	// decided: records an audit entry was matched to whose ticket is above
+	// scanned. A record at or below scanned is settled (matched, reported
+	// missing, or owed nothing) and counts as decided: finish prunes it from
+	// the map, so the map holds only the current interval's matches.
 	decided map[string]bool
 	// conflictSeen counts the IDEMPOTENCY_KEY_CONFLICT entries per key not yet
 	// consumed by an owed conflict record (any number of attempts may reach
@@ -60,7 +63,14 @@ type state struct {
 	forceResync bool
 
 	// ---- current epoch ----
-	epoch         uint64
+	// epoch and begins identify the quiet period the fields below belong to:
+	// the driver's epoch number and the tracker's QuietBegins count (a reused
+	// epoch number, e.g. after a driver restart, still starts afresh).
+	epoch  uint64
+	begins uint64
+	// ranges is the wid → committed log range index, built once per quiet
+	// period (the tracker's table only grows; quiet periods freeze it).
+	ranges        map[string]oc.CommittedBulk
 	auditChunks   int
 	auditDone     bool
 	resynced      bool
@@ -84,8 +94,10 @@ func newState(t *oc.Tracker) *state {
 // differs from the last one seen.
 func load(t *oc.Tracker, epoch uint64) *state {
 	st, _ := t.Ext(extKey, func() any { return newState(t) }).(*state)
-	if st.parts == nil || st.epoch != epoch {
+	if st.parts == nil || st.epoch != epoch || st.begins != t.QuietBegins() {
 		st.epoch = epoch
+		st.begins = t.QuietBegins()
+		st.ranges = nil
 		st.auditChunks = 0
 		st.auditDone = false
 		st.resynced = false
@@ -98,6 +110,26 @@ func load(t *oc.Tracker, epoch uint64) *state {
 	}
 
 	return st
+}
+
+// rangesByWid returns the committed bulk ranges indexed by wid, built once
+// per quiet period.
+func (st *state) rangesByWid(t *oc.Tracker) map[string]oc.CommittedBulk {
+	if st.ranges == nil {
+		bulks := t.CommittedBulks()
+		st.ranges = make(map[string]oc.CommittedBulk, len(bulks))
+		for _, b := range bulks {
+			st.ranges[b.Wid] = b
+		}
+	}
+
+	return st.ranges
+}
+
+// isDecided reports whether rec was matched to an audit entry, or is settled
+// (at or below the scanned ticket).
+func (st *state) isDecided(rec oc.WriteRecord) bool {
+	return rec.Ticket <= st.scanned || st.decided[rec.Wid]
 }
 
 func init() {

@@ -303,3 +303,85 @@ func TestAuditReplay_PartialChunkThenComplete(t *testing.T) {
 	require.Empty(t, ids(evs))
 	require.True(t, reached(evs, qc.EvAuditReplayVerified))
 }
+
+// The FSM numbers audit entries without gaps: a listing that skips one —
+// first entry after the cursor, inside a chunk, or across chunks — is a
+// finding, and the epoch is not verified.
+func TestAuditReplay_SequenceGap(t *testing.T) {
+	t.Parallel()
+	for name, drop := range map[string]func(h *harness) int{
+		"the first entry":  func(*harness) int { return 0 },
+		"a foreign entry":  func(h *harness) int { return entryIndex(t, h, "r-x-k1") },
+		"the last but one": func(h *harness) int { return len(h.trail) - 2 },
+	} {
+		for _, chunk := range []int{1, 3, 500} {
+			h := newHarness(t)
+			script(t, h)
+			i := drop(h)
+			h.trail = append(h.trail[:i], h.trail[i+1:]...) // not renumbered
+			evs, _ := h.quiet(chunk)
+			require.Contains(t, ids(evs), qc.EvAuditSequenceGap, "%s, chunk %d", name, chunk)
+			require.False(t, reached(evs, qc.EvAuditReplayVerified))
+		}
+	}
+}
+
+// A tracked commit missing from the trail is reported once and its response
+// released with the rest: it must not pin every later response.
+func TestAuditReplay_MissingEntryDoesNotPinResponses(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	s := script(t, h)
+	i := entryIndex(t, h, s.move.Key)
+	h.trail = append(h.trail[:i], h.trail[i+1:]...)
+	renumber(h.trail)
+	evs, _ := h.quiet(500)
+	require.Contains(t, ids(evs), qc.EvAuditMissingSuccess)
+	require.Empty(t, h.s.T.HeldResponses(), "settled records release their responses, reported or not")
+
+	l := h.ledger(1)
+	h.write(true, testutil.TxReq(l, "", "world", "t-1:g", "COIN", 3))
+	require.Len(t, h.s.T.HeldResponses(), 1)
+	evs, _ = h.quiet(500)
+	require.Empty(t, ids(evs))
+	require.True(t, reached(evs, qc.EvAuditReplayVerified))
+	require.Empty(t, h.s.T.HeldResponses())
+}
+
+// Surplus conflict entries (several attempts of one conflict) do not carry
+// over to a later quiet period, where they would cover a later conflict on
+// the same key whose entry is missing.
+func TestAuditReplay_ConflictSurplusDoesNotCarryOver(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	l := h.ledger(1)
+	h.write(false, testutil.CreateLedgerReq(l))
+	orig := h.write(true, testutil.TxReq(l, "", "world", "t-1:a", "COIN", 100))
+	h.conflict(orig, 3, testutil.TxReq(l, "", "world", "t-1:a", "COIN", 101))
+	evs, _ := h.quiet(500)
+	require.Empty(t, ids(evs))
+	require.True(t, reached(evs, qc.EvAuditReplayVerified))
+
+	h.conflict(orig, 1, testutil.TxReq(l, "", "world", "t-1:a", "COIN", 102))
+	h.trail = h.trail[:len(h.trail)-1] // its only entry is lost
+	evs, _ = h.quiet(500)
+	require.Contains(t, ids(evs), qc.EvAuditMissingFailure)
+}
+
+// The per-epoch state is keyed by the tracker's quiet-period count, not only
+// the driver's epoch number: a reused epoch number (a restarted driver
+// starting again at 1) still gets a verdict.
+func TestAuditReplay_ReusedEpochNumber(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	script(t, h)
+	evs, _ := h.quiet(500)
+	require.True(t, reached(evs, qc.EvAuditReplayVerified))
+
+	h.write(true, testutil.TxReq(h.ledger(1), "", "world", "t-1:h", "COIN", 3))
+	h.epoch = 0 // the next quiet period is epoch 1 again
+	evs, _ = h.quiet(500)
+	require.Empty(t, ids(evs))
+	require.True(t, reached(evs, qc.EvAuditReplayVerified))
+	require.Empty(t, h.s.T.HeldResponses())
+}

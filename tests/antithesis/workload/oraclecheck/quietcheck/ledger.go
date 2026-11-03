@@ -240,67 +240,12 @@ func txsDiffer(ls oracle.LedgerState, txs []*commonpb.Transaction) string {
 	return ""
 }
 
-// purgeable reports whether the model's address matches an ephemeral or
-// transient account type, whose zero-balance cells the server purges.
-func purgeable(ls oracle.LedgerState, addr string) bool {
-	ty := ls.MatchAddress(addr)
-
-	return ty != nil && (ty.Persistence == commonpb.AccountTypePersistence_ACCOUNT_TYPE_EPHEMERAL ||
-		ty.Persistence == commonpb.AccountTypePersistence_ACCOUNT_TYPE_TRANSIENT)
-}
-
-// modelCells is addr's volume cells; tolerated lists the zero-balance cells
-// of a purgeable address, which the server may already have dropped.
-func modelCells(ls oracle.LedgerState, addr string) (cells map[match.AssetColor]oracle.VolumePair, tolerated map[match.AssetColor]bool) {
-	cells, tolerated = map[match.AssetColor]oracle.VolumePair{}, map[match.AssetColor]bool{}
-	purge := purgeable(ls, addr)
-	for k, vp := range ls.Volumes().From(oracle.VolumeKey{Address: addr}) {
-		if k.Address != addr {
-			break
-		}
-		key := match.AssetColor{Asset: k.Asset, Color: k.Color}
-		cells[key] = vp
-		if purge && vp.Input.Cmp(&vp.Output) == 0 {
-			tolerated[key] = true
-		}
-	}
-
-	return cells, tolerated
-}
-
-// accountMatchesTolerant is AccountMatches, except that purged zero cells of
-// a purgeable address may be absent from the served account (model-reads
-// §3.6, §5.13).
-func accountMatchesTolerant(ls oracle.LedgerState, addr string, a *commonpb.Account) bool {
-	if match.AccountMatches(ls, addr, a) {
-		return true
-	}
-	if !match.MetadataMatches(ls, addr, a.GetMetadata()) || a.GetFirstUsage() != nil || a.GetInsertionDate() != nil || a.GetUpdatedAt() != nil {
-		return false
-	}
-	got, ok := match.AccountVolumeSet(a)
-	if !ok {
-		return false
-	}
-	cells, tolerated := modelCells(ls, addr)
-	for k, vp := range got {
-		want, in := cells[k]
-		if !in || want.Input.Cmp(&vp.Input) != 0 || want.Output.Cmp(&vp.Output) != 0 {
-			return false
-		}
-	}
-	for k := range cells {
-		if _, served := got[k]; !served && !tolerated[k] {
-			return false
-		}
-	}
-
-	return true
-}
-
-// accountsDiffer requires the listed set to be AccountUniverse (an account
-// whose only state is purged zero cells may be absent) and every listed
-// account to match the model.
+// accountsDiffer requires the listed set to be exactly AccountUniverse and
+// every listed account to match the model exactly (AccountMatches). The
+// model purges exactly the cells the FSM purges — zero-balance ephemeral or
+// transient cells a bulk touched (purgeZeroBalance, write_set_ephemeral_purge
+// .go classifies only the bulk's volume updates) — so no absence is tolerated:
+// a zero cell under a pattern that became ephemeral later stays on the server.
 func accountsDiffer(ls oracle.LedgerState, accts []*commonpb.Account) string {
 	universe := match.AccountUniverse(ls)
 	inUniverse := make(map[string]bool, len(universe))
@@ -315,17 +260,13 @@ func accountsDiffer(ls oracle.LedgerState, accts []*commonpb.Account) string {
 			return fmt.Sprintf("account %s is listed twice", addr)
 		case !inUniverse[addr]:
 			return fmt.Sprintf("account %s is listed but holds no state in the model", addr)
-		case !accountMatchesTolerant(ls, addr, a):
+		case !match.AccountMatches(ls, addr, a):
 			return fmt.Sprintf("account %s differs from the model", addr)
 		}
 		served[addr] = true
 	}
 	for _, addr := range universe {
-		if served[addr] {
-			continue
-		}
-		cells, tolerated := modelCells(ls, addr)
-		if len(ls.AccountMetadata(addr)) > 0 || len(cells) != len(tolerated) {
+		if !served[addr] {
 			return fmt.Sprintf("account %s of the model is not listed (%d listed, %d in the model)", addr, len(accts), len(universe))
 		}
 	}
@@ -455,6 +396,16 @@ func globalStream(served map[string][]rowRef, model oracle.GlobalState, bulks ma
 		mins = append(mins, m)
 	}
 	slices.Sort(mins)
+	// Committed bulk ranges must not overlap: with every sequence of a range
+	// belonging to some tracked log (checked below), disjoint ranges mean each
+	// range holds only its own bulk's logs, so two tracked bulks whose logs
+	// interleave are caught here.
+	for i := 1; i < len(mins); i++ {
+		prev, cur := bulks[mins[i-1]], bulks[mins[i]]
+		if cur.MinSeq <= prev.MaxSeq {
+			note("bulks %s [%d,%d] and %s [%d,%d] overlap: their logs interleave", prev.Wid, prev.MinSeq, prev.MaxSeq, cur.Wid, cur.MinSeq, cur.MaxSeq)
+		}
+	}
 	for _, m := range mins {
 		b := bulks[m]
 		for s := b.MinSeq; s <= b.MaxSeq && s != 0; s++ {

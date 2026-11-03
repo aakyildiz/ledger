@@ -3,6 +3,7 @@ package quietcheck
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"slices"
 	"strconv"
 	"strings"
@@ -31,6 +32,15 @@ type AuditBody struct {
 type AuditNext struct {
 	Cursor string `json:"cursor"`
 	Resync bool   `json:"resync"`
+	// Skipped is the audit interval a resync skipped, (from, to] (only on
+	// the chunk that resynchronised).
+	Skipped *SkippedRange `json:"skipped,omitempty"`
+}
+
+// SkippedRange is an audit interval (From, To] the replay did not judge.
+type SkippedRange struct {
+	From string `json:"from"`
+	To   string `json:"to"`
 }
 
 const reasonIdempotencyConflict = "IDEMPOTENCY_KEY_CONFLICT"
@@ -72,21 +82,32 @@ func auditSection(t *oc.Tracker, epoch, _ uint64, raw json.RawMessage) (any, []o
 		if err != nil {
 			return nil, nil, oc.Protocol("a resync needs the audit head in the first chunk", map[string]any{"head": body.Head})
 		}
+		from := st.cursor
 		st.resync(t, head)
+		log.Printf("oracle: quiet audit replay resynchronised in epoch %d: audit sequences (%d, %d] skipped (held responses were dropped)", epoch, from, head)
+		n := next()
+		n.Skipped = &SkippedRange{From: strconv.FormatUint(from, 10), To: strconv.FormatUint(head, 10)}
 
-		return next(), nil, nil
+		return n, nil, nil
 	}
 	st.auditChunks++
 
-	ranges := map[string]oc.CommittedBulk{}
-	for _, b := range t.CommittedBulks() {
-		ranges[b.Wid] = b
-	}
+	ranges := st.rangesByWid(t)
 
 	var evs []oc.Event
+	gapReported := false
 	for _, e := range entries {
 		if e.GetSequence() <= st.cursor {
 			continue // overlap with what an earlier chunk consumed
+		}
+		if e.GetSequence() != st.cursor+1 && !gapReported {
+			// The FSM numbers entries without gaps (NextAuditSequenceID), so
+			// a gap is a listing (pagination or filter) defect; the skipped
+			// entries can never be replayed.
+			gapReported = true
+			evs = append(evs, oc.Violation(EvAuditSequenceGap, map[string]any{
+				"cursor": st.cursor, "sequence": e.GetSequence(), "epoch": epoch,
+			}))
 		}
 		evs = append(evs, st.replayEntry(t, e, ranges)...)
 		st.cursor = e.GetSequence()
@@ -120,6 +141,8 @@ func (st *state) resync(t *oc.Tracker, head uint64) {
 	st.forceResync = false
 	st.obligations = nil
 	st.scanned = t.ReadFrontier()
+	clear(st.decided)
+	clear(st.conflictSeen)
 	if held := t.HeldResponses(); len(held) > 0 {
 		t.ReleaseCommittedResponses(held[len(held)-1])
 	}
@@ -164,7 +187,7 @@ func (st *state) replayEntry(t *oc.Tracker, e *auditpb.AuditEntry, ranges map[st
 
 	var tried []map[string]any
 	for _, b := range recs {
-		if st.decided[b.Wid] {
+		if st.isDecided(b) {
 			continue
 		}
 		res := st.replay.Apply(b.Bulk)
@@ -278,10 +301,7 @@ func classify(rec oc.WriteRecord, ranges map[string]oc.CommittedBulk) (obligatio
 
 // finish runs at the end of the trail: completeness, fingerprint, release.
 func (st *state) finish(t *oc.Tracker) []oc.Event {
-	ranges := map[string]oc.CommittedBulk{}
-	for _, b := range t.CommittedBulks() {
-		ranges[b.Wid] = b
-	}
+	ranges := st.rangesByWid(t)
 	epochCount := t.QuietBegins()
 	for tk := st.scanned + 1; tk <= t.ReadFrontier(); tk++ {
 		rec, ok := t.RecordByTicket(tk)
@@ -339,13 +359,43 @@ func (st *state) finish(t *oc.Tracker) []oc.Event {
 		st.replay = model
 	}
 
+	// Release every held response whose record is settled (matched to an
+	// entry, or reported missing above): a reported record must not pin the
+	// responses after it until the tracker's cap forces a resync.
 	held := t.HeldResponses()
 	n := 0
-	for n < len(held) && st.decided[held[n]] {
+	for n < len(held) {
+		rec, ok := t.Record(held[n])
+		if !ok || !st.isDecided(rec) {
+			break
+		}
 		n++
 	}
 	if n > 0 {
 		t.ReleaseCommittedResponses(held[n-1])
+	}
+
+	// Prune what settled records no longer need: their matches (isDecided
+	// covers them through scanned) and the surplus conflict entries of keys
+	// whose conflict records all settled — a surplus must not cover a later
+	// conflict whose entry is missing.
+	for wid := range st.decided {
+		if rec, ok := t.Record(wid); !ok || rec.Ticket <= st.scanned {
+			delete(st.decided, wid)
+		}
+	}
+	for key := range st.conflictSeen {
+		settled := true
+		for _, rec := range t.WritesByKey(key) {
+			if rec.Role == oc.RoleConflict && rec.Ticket > st.scanned {
+				settled = false
+
+				break
+			}
+		}
+		if settled {
+			delete(st.conflictSeen, key)
+		}
 	}
 
 	return evs

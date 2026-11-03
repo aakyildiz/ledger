@@ -60,6 +60,7 @@ func TestAuditReplay_Resync(t *testing.T) {
 	next, evs := post(t, s.T, 1, 0, AuditBody{Head: "40", Entries: []json.RawMessage{json.RawMessage(`{"sequence":"1"}`)}})
 	require.True(t, next.Resync)
 	require.Equal(t, "40", next.Cursor)
+	require.Equal(t, &SkippedRange{From: "0", To: "40"}, next.Skipped, "the skipped interval is reported")
 	require.Empty(t, evs, "a resync is not a finding")
 	require.Equal(t, "40", s.T.AuditCursor())
 	require.Empty(t, s.T.HeldResponses())

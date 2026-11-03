@@ -48,6 +48,9 @@ Unreachable (findings):
 - `oracle: an admission rejection reached the audit trail`
 - `oracle: an uncommitted failure reached the audit trail`
 - `oracle: audit replay state differs from the online model`
+- `oracle: the audit trail listing skips a sequence` (not in the spec's list: the spec requires
+  the entries to be "contiguous from cursor+1", and the FSM numbers them without gaps
+  (`fsmstate.go` `AppendAuditEntry`), so a gap is a listing defect that needs its own literal)
 - `oracle: quiet log stream differs from the model`, `oracle: quiet transactions differ from the model`,
   `oracle: quiet accounts differ from the model`, `oracle: quiet ledger stats boundaries differ from the model`,
   `oracle: quiet ledger info differs from the model`
@@ -93,30 +96,60 @@ Must-hit:
   the representability test above, which fails the day an arm appears.
 - **Conflicts.** Conflict bodies under one key cannot be told apart in the trail: the replay
   counts `IDEMPOTENCY_KEY_CONFLICT` entries per key, and each conflict record owed an entry
-  consumes one at completeness time.
+  consumes one at completeness time. Once every conflict record of a key has settled, the
+  key's surplus (extra attempts) is dropped, so it cannot cover a later conflict on the same
+  key whose entry is missing.
 - **Completeness bookkeeping.** Records are classified by scanning tickets
   (`RecordByTicket`) from the last scanned one; each owed record is checked once, at the
-  first complete replay after it ended, and reported at most once.
+  first complete replay after it ended, and reported at most once. A record at or below the
+  scanned ticket is settled and counts as decided, so the per-wid match table is pruned at each
+  completion and holds only the current interval.
+- **Response release.** At completion every held response whose record settled — matched to
+  an entry *or* reported missing — is released (a prefix of the held list), so one missing
+  entry cannot pin every later response until the tracker's cap forces a resync.
+- **Per-period state** is reset when the driver's epoch number *or* the tracker's
+  `QuietBegins` count changes (a reused epoch number still starts afresh). The wid → range
+  index of the committed bulks is built once per quiet period, not per chunk.
 - **After a fingerprint mismatch** the replay re-seeds from `Model()`, so the next quiet period
   checks the next interval instead of repeating one finding forever.
 - **Frozen keys in the diff.** `GlobalState` exposes no accessor for the idempotency table,
   so the per-ledger diff of `oracle: audit replay state differs from the online model` names
   frozen keys only as the residual explanation when nothing else differs.
-- **Purged zero cells.** A model cell may be absent from a served account only when its
-  balance is zero and the address matches an ephemeral or transient type by the current chart
-  (the server may have purged it; the model purges only cells a bulk touched); an account whose
-  only state is such cells may be absent from the listing.
+- **Purged zero cells: no tolerance (deviation from the spec text).** The spec allows purged
+  zero cells to be absent. The FSM purges only the cells a bulk's volume updates touched
+  (`write_set_ephemeral_purge.go` classifies `update`s), and the model purges exactly those
+  (`purgeZeroBalance` over the bulk's touched cells), so a purged cell is already absent from
+  the model. The exact state therefore uses `AccountMatches` and the listed set must equal
+  `AccountUniverse`, like the old validators. A tolerance would hide a server dropping a zero
+  cell it must keep, e.g. under a pattern that became ephemeral after the cell was drained
+  (`TestExactState_PurgedZeroCellsExact`).
 - **Per-node stats.** No per-node stats literal exists, so the node scope posts logs,
   transactions, accounts and info only; a node-scope stats part is refused (`protocol`).
 - **Global stream** runs once per epoch, after every live tracked ledger's linearizable log
   listing matched the model; it checks served sequences against the learned global stream
-  (`Model().Logs()`), per-ledger monotonicity, committed-bulk contiguity (`CommittedBulks` ×
-  `CommittedLogs`) and log dates along the sequence.
+  (`Model().Logs()`), per-ledger monotonicity, committed-bulk contiguity and log dates along
+  the sequence. Contiguity: every sequence of a bulk's `[MinSeq, MaxSeq]` is a tracked log
+  (`CommittedLogs`), and the bulk ranges sorted by `MinSeq` do not overlap; together they mean
+  a range holds only its own bulk's logs (two interleaved tracked bulks overlap). The
+  foundation's tables carry no per-bulk log count, so the `MaxSeq-MinSeq+1 == count` form is
+  expressed as this equivalent pair.
 - **Resync** test: the tracker's response cap (100 000) cannot be reached in a unit test, so
-  the side table has a test-only `forceResync` flag (`resync_internal_test.go`).
+  the side table has a test-only `forceResync` flag (`resync_internal_test.go`). The resync
+  logs the skipped interval in the oracle's log and returns it as `next.skipped`
+  (`{"from","to"}`, the interval `(from, to]`).
+- **Audit chunks** must continue the cursor: the first entry after the cursor is `cursor+1`
+  and each next one `prev+1`, within and across chunks; a gap is reported once per chunk.
+- **Real server test.** `TestQuietIntegration_RealServer` (`bin/oracle/h_quiet_test.go`,
+  in-process one-node server, skipped with `-short`) runs two quiet periods of real writes —
+  ledger creates (one multi-create bulk), single- and multi-ledger commits, a chart order, FSM
+  failures with a tracked and an untracked key, conflicts of one and two attempts, a
+  cluster-scoped checkpoint create (empty `ledgers`), a ledger delete — pages the real
+  `ListAuditEntries` with the driver's filter into the audit section and the real ledger reads
+  into the ledger section, and requires both verdicts with no finding.
 - **Ledger reads** are paged by cursor with `pageSize` 500; the audit listing pages with the
   filter `AUDIT_FIELD_SEQUENCE ≥ cursor+1` and the cursor. The hook stops paging when the oracle
-  answers `next.resync: true`.
+  answers `next.resync: true`, and treats a page the client truncated at `max_items`
+  (`complete:false`) as a failed phase rather than the last page.
 
 ## Requests to 99
 
