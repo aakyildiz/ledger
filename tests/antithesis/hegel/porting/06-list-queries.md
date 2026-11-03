@@ -18,6 +18,16 @@ leaves (declared field types from `ledger`, a reference from `seek(txByRef)`, tr
 stamps and log dates from `stamps`, the log head from `ledger.logCount`) carry pre-drawn picks
 resolved against the views of the same ticket; there are no post-begin draws at all.
 
+Index targeting (coverage fix, run 3d8b6ff1…-67-0): `FilterCtx` also reads the `ledger` view's
+`indexes` and keeps, per target, the keys with an **active**, non-reserved metadata index. A
+Field leaf picks among those keys with probability 3/4 when any is declared (else any declared
+key, as before), so a metadata-field filter usually needs an index the model holds active and
+the `oracle: coverage a metadata-field index served …` probes can be true. `list_accounts` and
+`list_transactions` aim at `o-<run>-l1` 1/4 of the time (by name; never deleted), where task
+07's `metadata_index_bootstrap` keeps `k0` (accounts, STRING) and `k1` (transactions, INT64)
+indexed. `KeyListPlan` (lists.rs) is the one-leaf list on a given key that task 07's
+`schema_bulk` retype probe sends right after a committed retype (hint `retype_probe`).
+
 ## Old assertions
 
 | Old source | Old assertion (kind: literal) | New | Where |
@@ -110,7 +120,7 @@ No other new literal. All oracle literals are `oracle: ` + the `M/` suffix.
 | `oracle: asset-index account query served results` | list_accounts has-asset 1/6 | needs task 07 |
 | `oracle: asset-index account query gated` | list_accounts has-asset 1/6 (INDEX_NOT_FOUND) | no faults (hit in the native run), kept in the 07 block as the spec lists it |
 | `oracle: has-asset precision overflow rejected` | list_accounts has-asset 1/16 × 1/6 | no faults (hit in the native run) |
-| `oracle: coverage …` (Raw probes) | every index-backed read | needs task 07 |
+| `oracle: coverage …` (Raw probes) | every index-backed read; the metadata-field probes need a leaf on an active metadata index (3/4 of leaves when one is declared, l1 aimed 1/4) and a non-empty page; the retype probe is task 07's `schema_bulk` retype + `KeyListPlan` | needs task 07 |
 
 ## Deviations from the task spec
 

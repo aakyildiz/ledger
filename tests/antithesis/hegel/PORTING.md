@@ -1222,6 +1222,16 @@ leaves (declared field types from `ledger`, a reference from `seek(txByRef)`, tr
 stamps and log dates from `stamps`, the log head from `ledger.logCount`) carry pre-drawn picks
 resolved against the views of the same ticket; there are no post-begin draws at all.
 
+Index targeting (coverage fix, run 3d8b6ff1…-67-0): `FilterCtx` also reads the `ledger` view's
+`indexes` and keeps, per target, the keys with an **active**, non-reserved metadata index. A
+Field leaf picks among those keys with probability 3/4 when any is declared (else any declared
+key, as before), so a metadata-field filter usually needs an index the model holds active and
+the `oracle: coverage a metadata-field index served …` probes can be true. `list_accounts` and
+`list_transactions` aim at `o-<run>-l1` 1/4 of the time (by name; never deleted), where task
+07's `metadata_index_bootstrap` keeps `k0` (accounts, STRING) and `k1` (transactions, INT64)
+indexed. `KeyListPlan` (lists.rs) is the one-leaf list on a given key that task 07's
+`schema_bulk` retype probe sends right after a committed retype (hint `retype_probe`).
+
 ## Old assertions
 
 | Old source | Old assertion (kind: literal) | New | Where |
@@ -1314,7 +1324,7 @@ No other new literal. All oracle literals are `oracle: ` + the `M/` suffix.
 | `oracle: asset-index account query served results` | list_accounts has-asset 1/6 | needs task 07 |
 | `oracle: asset-index account query gated` | list_accounts has-asset 1/6 (INDEX_NOT_FOUND) | no faults (hit in the native run), kept in the 07 block as the spec lists it |
 | `oracle: has-asset precision overflow rejected` | list_accounts has-asset 1/16 × 1/6 | no faults (hit in the native run) |
-| `oracle: coverage …` (Raw probes) | every index-backed read | needs task 07 |
+| `oracle: coverage …` (Raw probes) | every index-backed read; the metadata-field probes need a leaf on an active metadata index (3/4 of leaves when one is declared, l1 aimed 1/4) and a non-empty page; the retype probe is task 07's `schema_bulk` retype + `KeyListPlan` | needs task 07 |
 
 ## Deviations from the task spec
 
@@ -1409,6 +1419,7 @@ Fixtures: `W/oraclecheck/testdata/rejections/07-*.json`.
 | InspectIndex (`M/index_inspect.go`) | Rust `inspect_index` + read kind `InspectIndex` (a resume is a second ticket whose request carries `cursor`) |
 | Index op / schema gens (`M/actions.go:1076-1154`, `M/indexes.go:512-622`) | Rust `index_op`, order gens `schema_set` / `schema_remove`, local `schema_bulk` |
 | `MD/parallel_driver_indexes` | `index_bootstrap` + `index_op` + `index_poll` (tracked, oracle-judged) |
+| Metadata-index seeds on l1 (new, coverage) | `metadata_index_bootstrap`: `setMetadataFieldType` then `createIndex`, separate tracked writes, for `k0` on accounts (STRING) and `k1` on transactions (INT64) |
 | `MD/parallel_driver_typed_metadata` | `typed_metadata_cycle` on reserved entities |
 | `MD/parallel_driver_projection_alignment` | asset index from `index_bootstrap`/`index_op`; prepared-query half is task 08's |
 
@@ -1484,8 +1495,12 @@ Fixtures: `W/oraclecheck/testdata/rejections/07-*.json`.
 
 - `oracle: metadata field not in schema rejection exercised` (Reachable, failure hook):
   a CreateIndex on an undeclared metadata field was rejected and explained by the model.
-- `a write attempt is refused while an index builds` (Rust Sometimes, from the attempt logs
-  of this family's writes; DESIGN §4.9).
+- `a write attempt is refused while an index builds` (Rust Sometimes, DESIGN §4.9): an arm
+  of `write::explore_attempt`, so it sees every tracked attempt of every family. The only
+  write-path `INDEX_BUILDING` is a `createQueryCheckpoint` (task 09) while the audit
+  projection rebuilds after a restart (`admission.go` `checkQueryCheckpointProjectionReady`);
+  index-family writes never get it. It used to be checked only on this family's attempt
+  logs, so it could never be true (run 3d8b6ff1…-67-0).
 - Promotion is sound across polls: only one poll covering every discovered node can
   promote (critic C9), verdicts are never aggregated across polls.
 
@@ -1496,7 +1511,9 @@ Fixtures: `W/oraclecheck/testdata/rejections/07-*.json`.
 | oracle: index promoted to active | `index_bootstrap`/`index_op` create, then an all-nodes `index_poll` | no faults |
 | oracle: index demoted to ambiguous | `index_poll` right after a create (node not built yet) | no faults (more under faults) |
 | oracle: index promotion deferred behind an earlier operation | `index_poll` while a concurrent rule holds an older ticket | no faults (concurrency ≥ 2) |
-| oracle: retype window closed | `schema_bulk` retypes a declared key that `index_op` indexed; two later `index_poll`s | no faults |
+| oracle: retype window closed | `schema_bulk` retypes a declared key that `index_op` / `metadata_index_bootstrap` indexed; two later `index_poll`s | no faults |
+| oracle: coverage a metadata-field index served a model-verified page on accounts / transactions | `metadata_index_bootstrap` (k0 / k1 on l1) + `index_poll` promotion, then a list query whose Field leaf aims at the active index (task 06) | no faults |
+| oracle: coverage a query was served while a retype window was open | `schema_bulk` retype probe (1/4): re-declare an actively indexed key on l1, then one list on that key right away | no faults |
 | oracle: index status validated | `index_introspect` GetIndexStatus arm | no faults |
 | oracle: index status reported a materialised index file | `index_poll` | no faults |
 | oracle: index listing validated / fleet-wide … / bucket-scoped index listing validated | `index_introspect` list arms | no faults |
@@ -1508,7 +1525,7 @@ Fixtures: `W/oraclecheck/testdata/rejections/07-*.json`.
 | oracle: index inspection summary counted unconvertible values | `typed_metadata_cycle` writes `own-bad = "not-a-number-<v>"` (declared INT64, indexed while the model lacks the index); `inspect_index` inspects l1 with the owned view 1/4 | no faults |
 | oracle: index inspection served from a checkpoint | `inspect_index` with `HEGEL_HAVE_CHECKPOINTS=1` | needs task 09 |
 | oracle: metadata field not in schema rejection exercised | `index_op` 1/16 probe | no faults |
-| a write attempt is refused while an index builds | any family write attempt answered `INDEX_BUILDING` | faults (99 removes it if the server never returns it on writes) |
+| a write attempt is refused while an index builds | a `createQueryCheckpoint` attempt (task 09) answered `INDEX_BUILDING` inside the audit-projection rebuild after a restart | faults (rare) |
 | changing metadata type should not crash (+ the two declaring literals) | `typed_metadata_cycle` | no faults (AlwaysOrUnreachable) |
 
 ## Deviations from the spec
@@ -1557,7 +1574,23 @@ Fixtures: `W/oraclecheck/testdata/rejections/07-*.json`.
   `indexcheck.TestDropOfAbsentIndexIsANoOpSuccess` instead of a fixture.
 - `index_op`: create with 1/3 (gap) or 1/8 (no gap), else a drop of a pool index (present
   or not); a create without a gap targets a pool index, so it is a duplicate
-  (`INDEX_ALREADY_EXISTS`).
+  (`INDEX_ALREADY_EXISTS`). A create picks a metadata gap 3/4 of the time when there is one
+  (the builtins are bootstrapped; field-leaf queries need metadata indexes).
+- `metadata_index_bootstrap` (new, coverage fix for run 3d8b6ff1…-67-0, where no transaction
+  metadata index and only two account ones were ever promoted): reads the public `ledger`
+  view of l1 and, per seed (`k0` accounts STRING, `k1` transactions INT64) whose index the
+  model lacks, declares the type (unless already declared with it) and creates the index as
+  **separate** tracked writes, so the create sees a committed declaration. Its own done flag
+  (not `index_bootstrap`'s): `chance(1/2)` per run until done, then `chance(1/8)` to re-create
+  a seed index that `index_op` dropped or `schema_remove` took with its declaration.
+  `INDEX_ALREADY_EXISTS` on a create counts as done.
+- `schema_bulk` retype probe (new): 1/4 of runs read l1's public view; if a declared,
+  non-reserved key has an active metadata index, the bulk is one `setMetadataFieldType` on
+  it (the current type 1/2, else one of STRING / INT64 / BOOL / UINT64; a same-type
+  re-declaration opens a window in the model too), and after it commits one
+  ListAccounts / ListTransactions page filtered on that key (`lists::KeyListPlan`, drawn
+  before the write), so a page can be served while the window is open. Otherwise the run is
+  the usual 1–2-order bulk on a drawn ledger.
 
 ## Requests to 99
 
@@ -1566,8 +1599,9 @@ Fixtures: `W/oraclecheck/testdata/rejections/07-*.json`.
   reads `checkpoints.live` (an array of decimal id strings, checked against
   `hegel/09-query-checkpoints` `checkpointcheck/hooks.go viewCheckpoints`) and sends one as
   `checkpointId`; re-check if 09's view shape changes before merge.
-- `a write attempt is refused while an index builds` needs faults; remove it if coverage
-  shows the server never returns `INDEX_BUILDING` on writes.
+- `a write attempt is refused while an index builds` needs faults and a checkpoint create
+  inside the audit rebuild window; it is now asserted on every tracked attempt
+  (`write::explore_attempt`), not only on this family's (which never get it).
 - Task 06's indexed-query validators depend on `index promoted to active` happening; with
   `index_op` at weight 1.0 roughly half of the pool is present at any time.
 
@@ -3150,7 +3184,7 @@ none was removed; each is justified here:
 | `a write attempt hits a preload miss` | Sometimes | `BALANCE_NOT_PRELOADED` / `PRELOAD_UNAVAILABLE` need a leader change or a cache miss under faults | faults |
 | `a write attempt is blocked by clock skew` | Sometimes | `WRITES_BLOCKED_CLOCK_SKEW` needs Antithesis clock faults | faults |
 | `a write attempt is refused as a stale proposal` | Sometimes | `STALE_PROPOSAL` needs a leadership change between plan and apply (more with per-node cache thresholds, see below) | faults + knobs |
-| `a write attempt is refused while an index builds` | Sometimes | the only write-path `INDEX_BUILDING` is a `createQueryCheckpoint` while the audit projection rebuilds after a restart (`admission.go` `checkQueryCheckpointProjectionReady`): reachable, kept | faults |
+| `a write attempt is refused while an index builds` | Sometimes | the only write-path `INDEX_BUILDING` is a `createQueryCheckpoint` while the audit projection rebuilds after a restart (`admission.go` `checkQueryCheckpointProjectionReady`): reachable, kept. Since run 3d8b6ff1…-67-0 it is an arm of `write::explore_attempt` (every tracked attempt, so the checkpoint creates of task 09 too); before, only index-family attempts were checked, which never get it | faults |
 | `the leader reports a follower in snapshot progress` | Sometimes | a follower more than `RAFT_COMPACTION_MARGIN` entries behind while the leader reports it (`a follower reports an out-of-sync or snapshotting status` was hit once under local faults) | faults + knobs |
 | `a restore cycle survives a restart of restore-0` | Sometimes | needs restore-0 killed mid-cycle | faults |
 | `a cluster config change resets the cache epoch` | Reachable | needs per-node `CACHE_ROTATION_THRESHOLD`, which the compose file equalises until the server divergence below is fixed | knobs (disabled) |

@@ -338,6 +338,11 @@ pub fn explore_attempt(out: &Outcome) {
         "STALE_PROPOSAL" => check_sometimes!(true, "a write attempt is refused as a stale proposal", json!({"code": out.code})),
         "BALANCE_NOT_PRELOADED" | "PRELOAD_UNAVAILABLE" => check_sometimes!(true, "a write attempt hits a preload miss", json!({"reason": out.reason})),
         "WRITES_BLOCKED_CLOCK_SKEW" => check_sometimes!(true, "a write attempt is blocked by clock skew", json!({"code": out.code})),
+        // The only write-path INDEX_BUILDING is a createQueryCheckpoint
+        // while the audit projection rebuilds (admission.go
+        // checkQueryCheckpointProjectionReady); every tracked attempt of every
+        // family passes here.
+        "INDEX_BUILDING" => check_sometimes!(true, "a write attempt is refused while an index builds", json!({"code": out.code})),
         _ => {}
     }
 }
@@ -991,6 +996,25 @@ mod tests {
         assert!(testkit::fired("a tracked write plan has between 1 and 64 requests"));
         assert!(fo.calls("/write/begin").is_empty());
         assert!(ft.calls_of("bucket", "Apply").is_empty());
+    }
+
+    #[test]
+    fn index_building_attempts_are_explored() {
+        testkit::reset();
+        explore_attempt(&Outcome { ok: false, code: "Unavailable".into(), reason: "INDEX_BUILDING".into(), ..Default::default() });
+        assert!(testkit::fired("a write attempt is refused while an index builds"));
+    }
+
+    #[test]
+    fn a_checkpoint_create_refused_while_the_projection_rebuilds_is_explored() {
+        let (d, ft, _) = testkit::driver();
+        testkit::reset();
+        ft.script("bucket", "Apply", vec![FakeReply::Outcome(Outcome { ok: false, code: "Unavailable".into(), reason: "INDEX_BUILDING".into(), ..Default::default() }), FakeReply::Outcome(ok_apply(1))]);
+        let unit = d.s.slots.try_acquire_up_to(1).unwrap().take_one().unwrap();
+        let res = d.dispatch(plan(&d, 1), unit);
+        assert!(res.is_success(), "{res:?}");
+        assert_eq!(res.attempts()[0].reason, "INDEX_BUILDING");
+        assert!(testkit::fired("a write attempt is refused while an index builds"));
     }
 
     #[test]
