@@ -1,6 +1,12 @@
 # Antithesis deployment for the hegel driver: a 3-node ledger cluster, MinIO
 # (backups) and NATS (event sinks), three client containers running the
-# ledger's Go gRPC client, and the driver. Build context: repository root.
+# ledger's Go gRPC client, the oracle service, and the driver. Build context:
+# repository root.
+
+# The query-checkpoint limit is replicated cluster policy; the oracle models
+# the same value and the driver sends it in /setup (DESIGN §8).
+x-qcl: &qcl "10"
+
 x-ledger: &ledger
   platform: linux/amd64
   build:
@@ -14,12 +20,26 @@ x-ledger: &ledger
     DATA_DIR: /data/app
     CLUSTER_ID: default
     INSECURE: "true"
-    DEBUG: "true"
+    # DEBUG is not bound by the server (go-libs skips it); LOG_LEVEL is the
+    # knob that surfaces Debugf lines (server-signals spool/sync messages).
+    LOG_LEVEL: debug
     JSON_FORMATTING_LOGGER: "true"
-    SNAPSHOT_THRESHOLD: "200"
-    CACHE_ROTATION_THRESHOLD: "50"
-    SPOOL_SEGMENT_MAX_BYTES: "262144"
-    BLOOM_VOLUMES_EXPECTED_KEYS: "1000000"
+    # Followers more than 100 entries behind get a snapshot: sync-with-leader
+    # gated windows and spool replay (SNAPSHOT_THRESHOLD was a dead knob).
+    RAFT_COMPACTION_MARGIN: "100"
+    MAINTENANCE_INTERVAL: 5s
+    # Small segments rotate and seal often (spool pruning after resync).
+    SPOOL_SEGMENT_MAX_BYTES: "4096"
+    RAFT_REPLAY_BATCH_SIZE: "32"
+    SNAPSHOT_PARALLELISM: "1"
+    PEBBLE_MAX_CHECKPOINTS: "3"
+    # Never expire idempotency entries: the oracle never evicts them, and
+    # clock jitter would otherwise break replay determinism.
+    IDEMPOTENCY_TTL: 0s
+    QUERY_CHECKPOINT_LIMIT: *qcl
+    # CACHE_ROTATION_THRESHOLD and BLOOM_VOLUMES_EXPECTED_KEYS differ per node
+    # (services below): a leadership change then bumps the cache epoch and
+    # rebuilds the bloom filter.
     BLOOM_METADATA_EXPECTED_KEYS: "1000000"
     BLOOM_REFERENCES_EXPECTED_KEYS: "1000000"
     SENTINEL_MODE: "true"
@@ -53,19 +73,19 @@ services:
     <<: *ledger
     container_name: ledger-0
     hostname: ledger-0
-    environment: { <<: *ledger-env, NODE_ID: "1" }
+    environment: { <<: *ledger-env, NODE_ID: "1", CACHE_ROTATION_THRESHOLD: "50", BLOOM_VOLUMES_EXPECTED_KEYS: "1000000" }
     volumes: [ledger-0-wal:/data/raft, ledger-0-data:/data/app]
   ledger-1:
     <<: *ledger
     container_name: ledger-1
     hostname: ledger-1
-    environment: { <<: *ledger-env, NODE_ID: "2" }
+    environment: { <<: *ledger-env, NODE_ID: "2", CACHE_ROTATION_THRESHOLD: "64", BLOOM_VOLUMES_EXPECTED_KEYS: "1000001" }
     volumes: [ledger-1-wal:/data/raft, ledger-1-data:/data/app]
   ledger-2:
     <<: *ledger
     container_name: ledger-2
     hostname: ledger-2
-    environment: { <<: *ledger-env, NODE_ID: "3" }
+    environment: { <<: *ledger-env, NODE_ID: "3", CACHE_ROTATION_THRESHOLD: "80", BLOOM_VOLUMES_EXPECTED_KEYS: "1000002" }
     volumes: [ledger-2-wal:/data/raft, ledger-2-data:/data/app]
 
   minio:
@@ -108,6 +128,24 @@ services:
   client2: { <<: *client, container_name: client2, hostname: client2 }
   client3: { <<: *client, container_name: client3, hostname: client3 }
 
+  # The oracle service: passive and deterministic, no cluster access. Excluded
+  # from faults with the driver. Its stdout is captured by Antithesis
+  # directly; the driver parses nothing from it, so no forward-logs.
+  oracle:
+    platform: linux/amd64
+    build:
+      context: ../../..
+      dockerfile: tests/antithesis/hegel/oracle/Dockerfile
+    image: ledger-hegel-oracle:latest
+    container_name: oracle
+    hostname: oracle
+    init: true
+    restart: on-failure
+    entrypoint: ["/usr/local/bin/oracle"]
+    environment:
+      ORACLE_ADDR: ":8090"
+      QUERY_CHECKPOINT_LIMIT: *qcl
+
   driver:
     platform: linux/amd64
     build:
@@ -121,7 +159,12 @@ services:
       LEDGER_NODES: ledger-0:8888,ledger-1:8888,ledger-2:8888
       CLIENT_URLS: http://client1:8080,http://client2:8080,http://client3:8080
       MINIO_URL: http://minio:9000
+      ORACLE_URL: http://oracle:8090
+      QUERY_CHECKPOINT_LIMIT: *qcl
       RUST_BACKTRACE: "1"
+
+  # ==== 18-restore (services appended by tasks/18) ====
+  # ==== end 18-restore ====
 
 volumes:
   ledger-0-wal:
@@ -131,3 +174,5 @@ volumes:
   ledger-2-wal:
   ledger-2-data:
   minio-data:
+  # ==== 18-restore (services appended by tasks/18) ====
+  # ==== end 18-restore ====

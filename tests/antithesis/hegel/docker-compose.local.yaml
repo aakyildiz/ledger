@@ -1,6 +1,17 @@
-# Local runs only: SDK output to a file, and frequent quiet periods.
+# Local runs only: SDK output to files, frequent quiet periods and exclusive
+# windows, and the oracle's full journal and batch dumps for offline replay.
 services:
   driver:
     environment:
       ANTITHESIS_SDK_LOCAL_OUTPUT: /tmp/sdk.jsonl
       QUIET_PROBABILITY: "0.004"
+      EXCLUSIVE_PROBABILITY: "0.004"
+  oracle:
+    environment:
+      ANTITHESIS_SDK_LOCAL_OUTPUT: /journal/sdk.jsonl
+      ORACLE_JOURNAL_FILE: /journal/oracle.jsonl
+      ORACLE_DUMP_BATCHES: "1"
+    volumes: [journal:/journal]
+
+volumes:
+  journal:
