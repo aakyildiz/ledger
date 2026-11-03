@@ -205,6 +205,13 @@ func TestCheckpointRead_StatsListsAggregateLog(t *testing.T) {
 	require.Empty(t, testutil.Findings(validate(t, s, cc.KindCheckpointRead, agg, okOut(t, matchtest.RenderAggregate(frozen, l1, opts)), ap)))
 	evs = validate(t, s, cc.KindCheckpointRead, agg, okOut(t, matchtest.RenderAggregate(s.T.Model(), l1, opts)), ap)
 	require.Equal(t, []oc.EventID{cc.EvReadOutsideFrozen}, testutil.IDs(testutil.Findings(evs)))
+	// AGGREGATE_OVERFLOW is explained only when the frozen fold overflows
+	// (task 99); the fixture's small amounts never do.
+	overflow := oc.Outcome{Code: "FailedPrecondition", Reason: "AGGREGATE_OVERFLOW"}
+	maxp := &servicepb.AggregateVolumesRequest{Ledger: l1, CheckpointId: 1, UseMaxPrecision: true}
+	require.False(t, match.AggregateOverflows(frozen.Ledger(l1), nil, match.AggOptions{UseMaxPrecision: true}))
+	evs = validate(t, s, cc.KindCheckpointRead, maxp, overflow, ap)
+	require.Equal(t, []oc.EventID{cc.EvReadOutsideFrozen}, testutil.IDs(testutil.Findings(evs)))
 
 	la := &servicepb.ListAccountsRequest{Ledger: l1, Options: &commonpb.ListOptions{Read: &commonpb.ReadOptions{CheckpointId: 1}, PageSize: 1}}
 	page, next := matchtest.RenderAccountPage(frozen, l1, matchtest.AccountPageReq{PageSize: 1})

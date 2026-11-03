@@ -102,6 +102,7 @@ type armResult struct {
 	frozenMatches bool
 	concrete      bool // the answer carried model-verified content (coverage)
 	skip          bool // nothing to judge (truncated stream, unknown sequence)
+	explained     bool // a non-NotFound refusal the frozen state explains (AGGREGATE_OVERFLOW)
 	fleetRows     int  // ListLedgers: rows served
 	details       map[string]any
 }
@@ -118,7 +119,7 @@ func ValidateCheckpointRead(c *oc.ReadCtx) []oc.Event {
 	if !ok {
 		return []oc.Event{oc.Violation(EvProtocolMalformedRead, map[string]any{"kind": KindCheckpointRead, "arm": p.Arm, "request": rawOrNull(c.Request)})}
 	}
-	if res.skip {
+	if res.skip || res.explained {
 		return nil
 	}
 	err := rpcError(c.Outcome)
@@ -243,8 +244,8 @@ func checkpointArm(c *oc.ReadCtx, arm string) (res armResult, id uint64, ok bool
 			// The server refuses a fold past 256 bits (a useMaxPrecision
 			// rescale over high-precision cells); legal iff the frozen fold
 			// overflows (task 99, stack finding).
-			res.frozenMatches = match.LedgerIsLive(frozen, res.ledger) && match.AggregateOverflows(frozen.Ledger(res.ledger), nil, opts)
-			res.concrete = false
+			res.explained = match.LedgerIsLive(frozen, res.ledger) && match.AggregateOverflows(frozen.Ledger(res.ledger), nil, opts)
+			res.frozenMatches, res.concrete = false, false
 		}
 		res.details["prefixes"] = req.GetGroupByPrefixes()
 		if served {
