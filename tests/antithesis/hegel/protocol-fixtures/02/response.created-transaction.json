@@ -1,0 +1,75 @@
+{
+  "logs": [
+    {
+      "payload": {
+        "apply": {
+          "ledgerName": "o-1a2b-l2",
+          "log": {
+            "data": {
+              "createdTransaction": {
+                "transaction": {
+                  "id": "2",
+                  "insertedAt": {
+                    "data": "1793836800000040"
+                  },
+                  "postCommitVolumes": {
+                    "volumesByAccount": {
+                      "t-0:1": {
+                        "volumes": [
+                          {
+                            "asset": "COIN",
+                            "volumes": {
+                              "input": {
+                                "magnitude": "Dg=="
+                              },
+                              "output": {}
+                            }
+                          }
+                        ]
+                      },
+                      "world": {
+                        "volumes": [
+                          {
+                            "asset": "COIN",
+                            "volumes": {
+                              "input": {},
+                              "output": {
+                                "magnitude": "Dg=="
+                              }
+                            }
+                          }
+                        ]
+                      }
+                    }
+                  },
+                  "postings": [
+                    {
+                      "amount": {
+                        "v0": "9"
+                      },
+                      "asset": "COIN",
+                      "destination": "t-0:1",
+                      "source": "world"
+                    }
+                  ],
+                  "reference": "o-1a2b-ref2",
+                  "timestamp": {
+                    "data": "1793836800000040"
+                  },
+                  "updatedAt": {
+                    "data": "1793836800000040"
+                  }
+                }
+              }
+            },
+            "date": {
+              "data": "1793836800000040"
+            },
+            "id": "2"
+          }
+        }
+      },
+      "sequence": "40"
+    }
+  ]
+}

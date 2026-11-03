@@ -1,0 +1,8 @@
+{
+  "apply": {
+    "action": {
+      "createTransaction": {}
+    },
+    "ledger": "o-1a2b-l1"
+  }
+}

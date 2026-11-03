@@ -1,0 +1,6 @@
+{
+  "name": "02 tx_rejected / tx_reference_reuse: duplicate of an acked reference without skip",
+  "setup": [{"createLedger": {"name": "o-rej-l2", "defaultEnforcementMode": "CHART_ENFORCEMENT_AUDIT", "accountTypes": {"t-0": {"name": "t-0", "pattern": "t-0:{id}"}, "t-1": {"name": "t-1", "pattern": "t-1:{id}", "persistence": "ACCOUNT_TYPE_EPHEMERAL"}, "t-2": {"name": "t-2", "pattern": "t-2:{id}", "persistence": "ACCOUNT_TYPE_TRANSIENT"}}}}, {"apply": {"ledger": "o-rej-l2", "action": {"createTransaction": {"reference": "o-rej-ref1", "postings": [{"source": "world", "destination": "t-0:1", "asset": "USD/2", "amount": {"v0": "7"}}]}}}}],
+  "requests": [{"apply": {"ledger": "o-rej-l2", "action": {"createTransaction": {"reference": "o-rej-ref1", "force": true, "postings": [{"source": "world", "destination": "fees", "asset": "USD/2", "amount": {"v0": "7"}}], "metadata": {"own-conflict": {"stringValue": "second"}}}}}}],
+  "expectReason": "TRANSACTION_REFERENCE_CONFLICT"
+}
