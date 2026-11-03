@@ -19,6 +19,7 @@ pub mod ledgers;
 pub mod maintenance;
 // ==== end 04-ledgers-chart-maintenance mods ====
 // ==== 05-point-reads mods ====
+pub mod point_reads;
 // ==== end 05-point-reads mods ====
 // ==== 06-list-queries mods ====
 // ==== end 06-list-queries mods ====
@@ -64,6 +65,7 @@ pub fn rules() -> Vec<ConcurrentRule<Driver>> {
     v.extend(maintenance::rules());
     // ==== end 04-ledgers-chart-maintenance rules ====
     // ==== 05-point-reads rules ====
+    v.extend(point_reads::rules());
     // ==== end 05-point-reads rules ====
     // ==== 06-list-queries rules ====
     // ==== end 06-list-queries rules ====
