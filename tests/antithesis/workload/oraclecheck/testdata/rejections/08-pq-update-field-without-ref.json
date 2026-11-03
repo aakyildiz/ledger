@@ -1,0 +1,41 @@
+{
+  "name": "08-pq-update-field-without-ref",
+  "setup": [
+    {
+      "createLedger": {
+        "name": "o-rej-l1",
+        "defaultEnforcementMode": "CHART_ENFORCEMENT_AUDIT"
+      }
+    },
+    {
+      "createPreparedQuery": {
+        "ledger": "o-rej-l1",
+        "query": {
+          "name": "q-1",
+          "target": "QUERY_TARGET_ACCOUNTS",
+          "filter": {
+            "address": {
+              "hardcodedPrefix": "users:"
+            }
+          }
+        }
+      }
+    }
+  ],
+  "requests": [
+    {
+      "updatePreparedQuery": {
+        "ledger": "o-rej-l1",
+        "name": "q-1",
+        "filter": {
+          "field": {
+            "stringCond": {
+              "hardcoded": "v0"
+            }
+          }
+        }
+      }
+    }
+  ],
+  "expectReason": "FILTER_COMPILATION_ERROR"
+}

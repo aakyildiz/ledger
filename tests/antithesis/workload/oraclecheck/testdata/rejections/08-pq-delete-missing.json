@@ -1,0 +1,20 @@
+{
+  "name": "08-pq-delete-missing",
+  "setup": [
+    {
+      "createLedger": {
+        "name": "o-rej-l1",
+        "defaultEnforcementMode": "CHART_ENFORCEMENT_AUDIT"
+      }
+    }
+  ],
+  "requests": [
+    {
+      "deletePreparedQuery": {
+        "ledger": "o-rej-l1",
+        "name": "q-1"
+      }
+    }
+  ],
+  "expectReason": "PREPARED_QUERY_NOT_FOUND"
+}

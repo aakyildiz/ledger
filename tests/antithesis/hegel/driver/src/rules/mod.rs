@@ -29,6 +29,7 @@ pub mod lists;
 pub mod indexes;
 // ==== end 07-indexes-typed-metadata mods ====
 // ==== 08-prepared-queries mods ====
+pub mod prepared;
 // ==== end 08-prepared-queries mods ====
 // ==== 09-query-checkpoints mods ====
 // ==== end 09-query-checkpoints mods ====
@@ -77,6 +78,7 @@ pub fn rules() -> Vec<ConcurrentRule<Driver>> {
     v.extend(indexes::rules());
     // ==== end 07-indexes-typed-metadata rules ====
     // ==== 08-prepared-queries rules ====
+    v.extend(prepared::rules());
     // ==== end 08-prepared-queries rules ====
     // ==== 09-query-checkpoints rules ====
     // ==== end 09-query-checkpoints rules ====
@@ -122,6 +124,7 @@ pub fn order_gens() -> Vec<crate::write::OrderGen> {
     v.extend(indexes::order_gens());
     // ==== end 07-indexes-typed-metadata order_gens ====
     // ==== 08-prepared-queries order_gens ====
+    v.extend(prepared::order_gens());
     // ==== end 08-prepared-queries order_gens ====
     // ==== 09-query-checkpoints order_gens ====
     // ==== end 09-query-checkpoints order_gens ====

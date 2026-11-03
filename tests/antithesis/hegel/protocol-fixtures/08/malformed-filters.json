@@ -1,0 +1,83 @@
+{
+  "requests": [
+    {
+      "createPreparedQuery": {
+        "ledger": "o-test-l1",
+        "query": {
+          "filter": {
+            "address": {}
+          },
+          "name": "q-1",
+          "target": "QUERY_TARGET_ACCOUNTS"
+        }
+      }
+    },
+    {
+      "createPreparedQuery": {
+        "ledger": "o-test-l1",
+        "query": {
+          "filter": {
+            "field": {
+              "stringCond": {
+                "hardcoded": "v0"
+              }
+            }
+          },
+          "name": "q-2",
+          "target": "QUERY_TARGET_TRANSACTIONS"
+        }
+      }
+    },
+    {
+      "createPreparedQuery": {
+        "ledger": "o-test-l1",
+        "query": {
+          "filter": {
+            "reverted": {
+              "value": true
+            }
+          },
+          "name": "q-3",
+          "target": "QUERY_TARGET_ACCOUNTS"
+        }
+      }
+    },
+    {
+      "createPreparedQuery": {
+        "ledger": "o-test-l1",
+        "query": {
+          "filter": {
+            "accountHasAsset": {
+              "assetBase": "USD",
+              "precision": 2
+            }
+          },
+          "name": "q-4",
+          "target": "QUERY_TARGET_TRANSACTIONS"
+        }
+      }
+    },
+    {
+      "updatePreparedQuery": {
+        "filter": {
+          "address": {}
+        },
+        "ledger": "o-test-l1",
+        "name": "q-5"
+      }
+    },
+    {
+      "updatePreparedQuery": {
+        "filter": {
+          "field": {
+            "stringCond": {
+              "hardcoded": "v0"
+            }
+          }
+        },
+        "ledger": "o-test-l1",
+        "name": "q-6"
+      }
+    }
+  ]
+}

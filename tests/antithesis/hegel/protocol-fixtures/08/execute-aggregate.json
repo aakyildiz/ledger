@@ -1,0 +1,5 @@
+{
+  "ledger": "o-test-l1",
+  "mode": "QUERY_MODE_AGGREGATE_VOLUMES",
+  "queryName": "q-1"
+}

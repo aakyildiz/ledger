@@ -1,0 +1,25 @@
+{
+  "name": "08-pq-update-missing",
+  "setup": [
+    {
+      "createLedger": {
+        "name": "o-rej-l1",
+        "defaultEnforcementMode": "CHART_ENFORCEMENT_AUDIT"
+      }
+    }
+  ],
+  "requests": [
+    {
+      "updatePreparedQuery": {
+        "ledger": "o-rej-l1",
+        "name": "q-1",
+        "filter": {
+          "address": {
+            "hardcodedPrefix": "world"
+          }
+        }
+      }
+    }
+  ],
+  "expectReason": "PREPARED_QUERY_NOT_FOUND"
+}

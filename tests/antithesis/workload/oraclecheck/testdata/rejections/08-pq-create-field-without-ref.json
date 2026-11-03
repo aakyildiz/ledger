@@ -1,0 +1,30 @@
+{
+  "name": "08-pq-create-field-without-ref",
+  "setup": [
+    {
+      "createLedger": {
+        "name": "o-rej-l1",
+        "defaultEnforcementMode": "CHART_ENFORCEMENT_AUDIT"
+      }
+    }
+  ],
+  "requests": [
+    {
+      "createPreparedQuery": {
+        "ledger": "o-rej-l1",
+        "query": {
+          "name": "q-1",
+          "target": "QUERY_TARGET_ACCOUNTS",
+          "filter": {
+            "field": {
+              "stringCond": {
+                "hardcoded": "v"
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "expectReason": "FILTER_COMPILATION_ERROR"
+}

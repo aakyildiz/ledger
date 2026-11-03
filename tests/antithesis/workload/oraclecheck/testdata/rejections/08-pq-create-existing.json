@@ -1,0 +1,42 @@
+{
+  "name": "08-pq-create-existing",
+  "setup": [
+    {
+      "createLedger": {
+        "name": "o-rej-l1",
+        "defaultEnforcementMode": "CHART_ENFORCEMENT_AUDIT"
+      }
+    },
+    {
+      "createPreparedQuery": {
+        "ledger": "o-rej-l1",
+        "query": {
+          "name": "q-1",
+          "target": "QUERY_TARGET_ACCOUNTS",
+          "filter": {
+            "address": {
+              "hardcodedPrefix": "users:"
+            }
+          }
+        }
+      }
+    }
+  ],
+  "requests": [
+    {
+      "createPreparedQuery": {
+        "ledger": "o-rej-l1",
+        "query": {
+          "name": "q-1",
+          "target": "QUERY_TARGET_TRANSACTIONS",
+          "filter": {
+            "address": {
+              "hardcodedExact": "world"
+            }
+          }
+        }
+      }
+    }
+  ],
+  "expectReason": "PREPARED_QUERY_ALREADY_EXISTS"
+}
