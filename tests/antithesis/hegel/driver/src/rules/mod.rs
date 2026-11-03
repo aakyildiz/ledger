@@ -22,6 +22,7 @@ pub mod smoke;
 // ==== 09-query-checkpoints mods ====
 // ==== end 09-query-checkpoints mods ====
 // ==== 10-audit mods ====
+pub mod audit;
 // ==== end 10-audit mods ====
 // ==== 11-quiet-exact mods ====
 // ==== end 11-quiet-exact mods ====
@@ -60,6 +61,7 @@ pub fn rules() -> Vec<ConcurrentRule<Driver>> {
     // ==== 09-query-checkpoints rules ====
     // ==== end 09-query-checkpoints rules ====
     // ==== 10-audit rules ====
+    v.extend(audit::rules());
     // ==== end 10-audit rules ====
     // ==== 11-quiet-exact rules ====
     // ==== end 11-quiet-exact rules ====

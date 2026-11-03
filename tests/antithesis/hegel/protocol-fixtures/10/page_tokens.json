@@ -1,0 +1,64 @@
+{
+  "cases": [
+    {
+      "key": "1",
+      "token": "eyJrZXkiOiIxIn0"
+    },
+    {
+      "key": "4",
+      "token": "eyJrZXkiOiI0In0"
+    },
+    {
+      "key": "18446744073709551615",
+      "token": "eyJrZXkiOiIxODQ0Njc0NDA3MzcwOTU1MTYxNSJ9"
+    },
+    {
+      "key": "not-a-cursor",
+      "token": "eyJrZXkiOiJub3QtYS1jdXJzb3IifQ"
+    },
+    {
+      "key": "-1",
+      "token": "eyJrZXkiOiItMSJ9"
+    },
+    {
+      "key": "0x10",
+      "token": "eyJrZXkiOiIweDEwIn0"
+    },
+    {
+      "key": " 12",
+      "token": "eyJrZXkiOiIgMTIifQ"
+    },
+    {
+      "key": "12 ",
+      "token": "eyJrZXkiOiIxMiAifQ"
+    },
+    {
+      "key": "1.0",
+      "token": "eyJrZXkiOiIxLjAifQ"
+    },
+    {
+      "key": "18446744073709551616",
+      "token": "eyJrZXkiOiIxODQ0Njc0NDA3MzcwOTU1MTYxNiJ9"
+    },
+    {
+      "key": "quote\"back\\slash",
+      "token": "eyJrZXkiOiJxdW90ZVwiYmFja1xcc2xhc2gifQ"
+    },
+    {
+      "key": "a\u003cb\u0026c\u003e",
+      "token": "eyJrZXkiOiJhXHUwMDNjYlx1MDAyNmNcdTAwM2UifQ"
+    },
+    {
+      "key": "tab\tnew\nline",
+      "token": "eyJrZXkiOiJ0YWJcdG5ld1xubGluZSJ9"
+    },
+    {
+      "key": "ctl\u0001",
+      "token": "eyJrZXkiOiJjdGxcdTAwMDEifQ"
+    },
+    {
+      "key": "é",
+      "token": "eyJrZXkiOiLDqSJ9"
+    }
+  ]
+}
