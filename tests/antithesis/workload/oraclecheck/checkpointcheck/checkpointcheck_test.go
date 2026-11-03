@@ -387,7 +387,9 @@ func TestRegistryAndSchedule(t *testing.T) {
 	require.Empty(t, testutil.Findings(evs))
 
 	sreq := &clusterpb.GetQueryCheckpointScheduleRequest{}
-	sched := func(cron string) oc.Outcome { return okOut(t, &clusterpb.GetQueryCheckpointScheduleResponse{Cron: cron}) }
+	sched := func(cron string) oc.Outcome {
+		return okOut(t, &clusterpb.GetQueryCheckpointScheduleResponse{Cron: cron})
+	}
 	evs = validate(t, s, cc.KindCheckpointSchedule, sreq, sched(""), nil)
 	require.Empty(t, testutil.Findings(evs))
 	require.True(t, rawHit(evs, cc.CovScheduleRead))
