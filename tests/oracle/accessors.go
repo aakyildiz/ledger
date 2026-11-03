@@ -201,14 +201,16 @@ func (g *GlobalState) LearnTxStamps(ledger string, id uint64, timestamp, inserte
 	}
 
 	rec := *ls.txs.Get(int(id - 1))
-	if rec.timestamp == nil {
+	if rec.timestamp == nil && timestamp != nil {
 		rec.timestamp = timestamp
+		rec.timestampLearned = true
 	}
 	if rec.insertedAt == nil {
 		rec.insertedAt = insertedAt
 	}
-	if rec.revertedAt == nil && rec.reverted {
+	if rec.revertedAt == nil && rec.reverted && revertedAt != nil {
 		rec.revertedAt = revertedAt
+		rec.revertedAtLearned = true
 	}
 
 	ls.txs = ls.txs.Set(int(id-1), &rec)
