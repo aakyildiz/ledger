@@ -122,4 +122,8 @@ Must-hit:
 
 - None of the must-hits need another family. A run with `RULES=smoke_tx,smoke_get_account`
   reaches all of them (the native acceptance run of this task).
-- The disk of the shared build machine filled during this task; see the task report.
+- Acceptance run (300 s, `QUIET_PROBABILITY=0.05 RULES=smoke_tx,smoke_get_account`): 77 quiet
+  periods, every one with the audit, linearizable and per-node phases complete and no finding;
+  every must-hit above was hit. The shared build host's disk was above the ledger's default
+  disk-full write gate, so the run exported `HEALTH_WAL_THRESHOLD=0.999 HEALTH_DATA_THRESHOLD=0.999`
+  (inherited by the native ledger process); nothing in `run_native.sh` changed.
