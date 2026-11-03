@@ -253,3 +253,20 @@ func TestConnClosingError(t *testing.T) {
 	require.True(t, s.ownClose(out))
 	require.False(t, s.ownClose(errOutcome(status.Error(codes.Canceled, "context canceled"))))
 }
+
+// An RPC whose HTTP request has already given up and that is still running
+// when the grace expires (the HTTP server shut down cleanly, the wait for
+// in-flight RPCs timed out) is cut off without a UDP event.
+func TestShutdownGraceExpiresForAbandonedRPC(t *testing.T) {
+	t.Parallel()
+	h := newShutdownHarness(t, 300*time.Millisecond)
+	t.Cleanup(func() { close(h.f.hold) })
+
+	_, err := h.post(1, "plain", 100*time.Millisecond)
+	require.Error(t, err)
+	h.waitCalls(t, 1)
+	close(h.stop)
+	require.NoError(t, <-h.served)
+	require.True(t, h.s.conns.closing.Load())
+	require.Empty(t, h.events(t, 500*time.Millisecond), "no UDP event for an RPC the client cut off")
+}

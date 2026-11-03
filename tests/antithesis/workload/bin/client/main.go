@@ -201,21 +201,28 @@ func (s *server) serve(lis net.Listener, stop <-chan struct{}, grace time.Durati
 
 	ctx, cancel := context.WithTimeout(context.Background(), grace)
 	defer cancel()
-	if err := httpServer.Shutdown(ctx); err != nil {
-		log.Printf("shutdown: %v", err)
-	}
+	shutErr := httpServer.Shutdown(ctx)
 	if err := <-served; err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Printf("serve: %v", err)
 	}
-	rpcsDone := make(chan struct{})
-	go func() {
-		s.inFlight.Wait()
-		close(rpcsDone)
-	}()
-	select {
-	case <-rpcsDone:
-	case <-ctx.Done():
-		log.Printf("shutdown: in-flight RPCs still running after %s; closing their connections", grace)
+	if shutErr != nil {
+		// The grace ran out with handlers still open. One may not have
+		// called inFlight.Add yet, and an Add from zero concurrent with
+		// Wait is a WaitGroup misuse, so do not wait: the grace is spent.
+		log.Printf("shutdown: %v; closing the gRPC connections", shutErr)
+	} else {
+		// Every handler has returned, so every inFlight.Add happened
+		// before this Wait.
+		rpcsDone := make(chan struct{})
+		go func() {
+			s.inFlight.Wait()
+			close(rpcsDone)
+		}()
+		select {
+		case <-rpcsDone:
+		case <-ctx.Done():
+			log.Printf("shutdown: in-flight RPCs still running after %s; closing their connections", grace)
+		}
 	}
 	s.conns.close()
 
