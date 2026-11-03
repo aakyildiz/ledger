@@ -105,8 +105,16 @@ cd tests/antithesis/workload && go test ./bin/oracle -run TestReplayJournal -arg
 ```
 
 Coverage: add `docker-compose.coverage.yaml` to `COMPOSE_FILE`, run, stop the
-stack with `docker compose stop` (Go writes counters at a normal exit), then
-read the `coverage` volume with `go tool covdata`.
+stack with `docker compose stop` (Go writes counters at a normal exit), copy
+the `coverage` volume out and read it with `go tool covdata` (merge the
+`ledger-*` and `restore-0` directories, then `go tool covdata textfmt` and
+`go tool cover -func` from the repository root).
+
+`docker compose build` can fail with `image "…" already exists` when several
+services share one image (the three clients, the three ledgers, the two
+restore targets) and the Docker engine uses the containerd image store; run it
+again (the second pass is cached), or build one service per image
+(`docker compose build driver client1 oracle ledger-0 restore-0`, as CI does).
 
 ## Launching
 
@@ -130,7 +138,26 @@ be hit.
 `tests/antithesis/workload/bin/oracle/**` in `.results.coverage`: the oracle
 is instrumented for its assertions, not for coverage.
 
-COVERAGE_GAPS_PLACEHOLDER
+### Coverage gaps (local 45-minute coverage run)
+
+Measured by task 99 with `docker-compose.coverage.yaml` (ledger nodes, the
+restore targets' server child and `ledgerctl`, clients, oracle), 45 minutes
+with hand-made kills, pauses and restarts. Functions under the five audited
+packages that never ran, by class; the Antithesis run checks them with
+`snouty runs show … .results.coverage`:
+
+| Package | Never run / functions | What is left |
+|---|---|---|
+| `internal/infra/node` | 52 / 240 | Membership changes (`AddLearner`, `PromoteLearner`, `RemoveNode`, `ForceRemoveNode`, drain, pending removals): operator-driven, out of scope. Snapshot catch-up (`TrySyncSnapshot`, `setOutOfSync`, checkpoint boundaries during replay): needs a follower more than `RAFT_COMPACTION_MARGIN` behind, i.e. longer partitions than local runs make (faults). Error/stop paths and the raft logger adapter's warning/fatal levels (faults). |
+| `internal/infra/state` | 68 / 406 | Mirror sync (`applyMirrorSyncUpdate`, `QueueMirrorSync`, mirror status): needs an external mirror source, not in this deployment. Idempotency eviction: disabled on purpose (`IDEMPOTENCY_TTL=0`). Sentinel offense dumps and coverage-miss paths: only on a server bug. Event-sink cursors (`SetSinkCursor`): task 12 adds and removes NATS sinks within one rule, so no delivery advanced a cursor locally. Drain/marker-only applies (membership, out of scope). `Error()` methods of error types. |
+| `internal/infra/backup` | 3 / 97 | Azure storage (disabled build), the rebuild's volume/metadata moves (restore of a backup with moved volumes; faults). |
+| `internal/application/indexbuilder` | 9 / 174 | History-replay invariant failures, batch discard and backfill purge after a generation change (faults or a server bug). |
+| `internal/application/admission` | 18 / 106 | Preload-unavailable classification (`markPreloadUnavailable`, `classifyResolutionFailure`: faults), TLS DSN checks, typed errors' accessors. |
+
+The audited packages' statement coverage was 66.8 % (`node`), 70.4 %
+(`state`), 73.2 % (`backup`), 71.2 % (`indexbuilder`) and 76.2 %
+(`admission`). The remaining gaps are fault-only, out of scope, or disabled by
+a knob on purpose.
 
 ## What was not ported
 
