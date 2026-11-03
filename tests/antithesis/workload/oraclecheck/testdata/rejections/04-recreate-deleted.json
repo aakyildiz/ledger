@@ -1,0 +1,28 @@
+{
+  "name": "04-recreate-deleted",
+  "setup": [
+    {
+      "createLedger": {
+        "name": "o-rej-l1",
+        "metadata": {
+          "k0": {
+            "stringValue": "v0"
+          }
+        }
+      }
+    },
+    {
+      "deleteLedger": {
+        "name": "o-rej-l1"
+      }
+    }
+  ],
+  "requests": [
+    {
+      "createLedger": {
+        "name": "o-rej-l1"
+      }
+    }
+  ],
+  "expectReason": "LEDGER_DELETED"
+}

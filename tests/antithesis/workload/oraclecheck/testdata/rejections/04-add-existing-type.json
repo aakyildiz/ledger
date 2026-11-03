@@ -1,0 +1,33 @@
+{
+  "name": "04-add-existing-type",
+  "setup": [
+    {
+      "createLedger": {
+        "name": "o-rej-l1"
+      }
+    },
+    {
+      "addAccountType": {
+        "ledger": "o-rej-l1",
+        "accountType": {
+          "name": "t-5",
+          "pattern": "t-5:{id}",
+          "persistence": "ACCOUNT_TYPE_EPHEMERAL"
+        }
+      }
+    }
+  ],
+  "requests": [
+    {
+      "addAccountType": {
+        "ledger": "o-rej-l1",
+        "accountType": {
+          "name": "t-5",
+          "pattern": "t-5:{id}",
+          "persistence": "ACCOUNT_TYPE_TRANSIENT"
+        }
+      }
+    }
+  ],
+  "expectReason": "ACCOUNT_TYPE_ALREADY_EXISTS"
+}

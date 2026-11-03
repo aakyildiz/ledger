@@ -1,0 +1,48 @@
+{
+  "name": "04-strict-violation",
+  "setup": [
+    {
+      "createLedger": {
+        "name": "o-rej-l1",
+        "defaultEnforcementMode": "CHART_ENFORCEMENT_AUDIT"
+      }
+    },
+    {
+      "addAccountType": {
+        "ledger": "o-rej-l1",
+        "accountType": {
+          "name": "t-7",
+          "pattern": "t-7:{id}"
+        }
+      }
+    },
+    {
+      "setDefaultEnforcementMode": {
+        "ledger": "o-rej-l1",
+        "enforcementMode": "CHART_ENFORCEMENT_STRICT"
+      }
+    }
+  ],
+  "requests": [
+    {
+      "apply": {
+        "ledger": "o-rej-l1",
+        "action": {
+          "createTransaction": {
+            "postings": [
+              {
+                "source": "world",
+                "destination": "users:1",
+                "asset": "COIN",
+                "amount": {
+                  "v0": "5"
+                }
+              }
+            ]
+          }
+        }
+      }
+    }
+  ],
+  "expectReason": "ACCOUNT_NOT_MATCHING_TYPE"
+}

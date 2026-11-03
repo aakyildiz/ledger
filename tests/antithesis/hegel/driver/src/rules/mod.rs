@@ -10,6 +10,9 @@ pub mod smoke;
 // ==== 03-reverts-metadata-idempotency mods ====
 // ==== end 03-reverts-metadata-idempotency mods ====
 // ==== 04-ledgers-chart-maintenance mods ====
+pub mod chart;
+pub mod ledgers;
+pub mod maintenance;
 // ==== end 04-ledgers-chart-maintenance mods ====
 // ==== 05-point-reads mods ====
 // ==== end 05-point-reads mods ====
@@ -48,6 +51,9 @@ pub fn rules() -> Vec<ConcurrentRule<Driver>> {
     // ==== 03-reverts-metadata-idempotency rules ====
     // ==== end 03-reverts-metadata-idempotency rules ====
     // ==== 04-ledgers-chart-maintenance rules ====
+    v.extend(ledgers::rules());
+    v.extend(chart::rules());
+    v.extend(maintenance::rules());
     // ==== end 04-ledgers-chart-maintenance rules ====
     // ==== 05-point-reads rules ====
     // ==== end 05-point-reads rules ====
@@ -89,6 +95,7 @@ pub fn order_gens() -> Vec<crate::write::OrderGen> {
     // ==== 03-reverts-metadata-idempotency order_gens ====
     // ==== end 03-reverts-metadata-idempotency order_gens ====
     // ==== 04-ledgers-chart-maintenance order_gens ====
+    v.extend(chart::order_gens());
     // ==== end 04-ledgers-chart-maintenance order_gens ====
     // ==== 05-point-reads order_gens ====
     // ==== end 05-point-reads order_gens ====
@@ -209,6 +216,7 @@ pub fn setup_hooks() -> Vec<crate::setup::SetupHook> {
     // ==== 03-reverts-metadata-idempotency setup_hooks ====
     // ==== end 03-reverts-metadata-idempotency setup_hooks ====
     // ==== 04-ledgers-chart-maintenance setup_hooks ====
+    v.extend(maintenance::setup_hooks());
     // ==== end 04-ledgers-chart-maintenance setup_hooks ====
     // ==== 05-point-reads setup_hooks ====
     // ==== end 05-point-reads setup_hooks ====

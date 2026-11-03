@@ -1,0 +1,19 @@
+{
+  "name": "04-remove-absent-type",
+  "setup": [
+    {
+      "createLedger": {
+        "name": "o-rej-l1"
+      }
+    }
+  ],
+  "requests": [
+    {
+      "removeAccountType": {
+        "ledger": "o-rej-l1",
+        "name": "t-5"
+      }
+    }
+  ],
+  "expectReason": "ACCOUNT_TYPE_NOT_FOUND"
+}
