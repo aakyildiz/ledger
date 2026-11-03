@@ -221,7 +221,13 @@ fn decimal_parsing() {
 #[test]
 fn go_response_fixtures_parse() {
     let skipped = fixture("response.order-skipped.json");
-    assert_eq!(skipped_facts(&skipped), Some(("TRANSACTION_REFERENCE_CONFLICT".into(), "o-1a2b-l2".into(), "o-1a2b-ref1".into(), 1)));
+    assert_eq!(skipped_facts(&skipped), Some(("TRANSACTION_REFERENCE_CONFLICT".into(), "o-1a2b-l2".into(), "o-1a2b-ref1".into(), Some(1))));
+    // An absent existingTransactionId (always rendered: `optional` field)
+    // never passes for id 0.
+    let mut no_id = skipped.clone();
+    let facts = no_id.pointer_mut("/logs/0/payload/apply/log/data/orderSkipped/details/transactionReferenceConflict").and_then(Value::as_object_mut).expect("fixture shape");
+    assert!(facts.remove("existingTransactionId").is_some());
+    assert_eq!(skipped_facts(&no_id).map(|f| f.3), Some(None));
     let created = fixture("response.created-transaction.json");
     assert_eq!(skipped_facts(&created), None);
     let (d, _, _) = testkit::driver();
@@ -596,18 +602,125 @@ fn setup_hook_creates_the_stress_ledger() {
 
 #[test]
 fn bulk_rule_spans_ledgers_and_records_l2_refs() {
-    let (d, ft, fo) = testkit::driver();
-    ft.set_default("bucket", "Apply", FakeReply::Outcome(ok_seq(1)));
+    // Every gen produces with `aimed` (seeks hit), so each chosen ledger's
+    // share of the bulk is non-empty.
+    let (d, ft, fo) = aimed();
+    let created: Value = serde_json::from_str(&fixture("response.created-transaction.json").to_string().replace("o-1a2b-", "o-test-")).unwrap();
+    ft.set_default("bucket", "Apply", FakeReply::Outcome(Outcome::from_json(&json!({"ok": true, "response": created}))));
     for _ in 0..200 {
         testkit::run_rule(&d, tx_bulk);
     }
     let begins = fo.calls("/write/begin");
     assert!(!begins.is_empty());
-    let multi = begins.iter().filter(|b| b["hint"]["ledgers"].as_array().unwrap().len() > 1).count();
-    assert!(multi > 0, "no multi-ledger bulk in 200 runs");
+    let mut multi = 0;
     for b in &begins {
         assert_eq!(b["family"], "tx");
-        let ls: BTreeSet<_> = b["hint"]["ledgers"].as_array().unwrap().iter().map(|x| x.to_string()).collect();
-        assert_eq!(ls.len(), b["hint"]["ledgers"].as_array().unwrap().len(), "distinct ledgers");
+        let hinted: BTreeSet<String> = b["hint"]["ledgers"].as_array().unwrap().iter().map(|x| x.as_str().unwrap().to_string()).collect();
+        assert_eq!(hinted.len(), b["hint"]["ledgers"].as_array().unwrap().len(), "distinct ledgers");
+        let touched: BTreeSet<String> = b["requests"].as_array().unwrap().iter().filter_map(ledger_of).collect();
+        assert_eq!(touched, hinted, "every chosen ledger gets an order: {b}");
+        if hinted.len() > 1 {
+            multi += 1;
+        }
     }
+    assert!(multi > 0, "no multi-ledger bulk in 200 runs");
+    let (id, legs) = d.s.ext::<RefBook>().get("o-test-ref2").expect("an acked l2 reference is recorded");
+    assert_eq!(id, 2);
+    assert_eq!(legs, vec![Leg::new("world", "t-0:1", 9u64, "COIN", "")]);
+}
+
+#[test]
+fn bulk_rule_records_only_l2_refs() {
+    let (d, ft, _) = aimed();
+    let created: Value = serde_json::from_str(&fixture("response.created-transaction.json").to_string().replace("o-1a2b-l2", "o-test-l1").replace("o-1a2b-", "o-test-")).unwrap();
+    ft.set_default("bucket", "Apply", FakeReply::Outcome(Outcome::from_json(&json!({"ok": true, "response": created}))));
+    for _ in 0..20 {
+        testkit::run_rule(&d, tx_bulk);
+    }
+    assert!(d.s.ext::<RefBook>().get("o-test-ref2").is_none());
+}
+
+#[test]
+fn l2_probes_follow_the_taper() {
+    let (d, ft, fo) = testkit::driver();
+    ft.set_default("bucket", "Apply", FakeReply::Outcome(ok_seq(1)));
+    let probes: [(&str, fn(&Driver, TestCase)); 3] = [("tx_transient", tx_transient), ("tx_reference_race", tx_reference_race), ("tx_drain_probe", tx_drain_probe)];
+    fo.set_view("ledger", json!({"txCount": 4000}));
+    for (name, rule) in probes {
+        let before = fo.calls("/write/begin").len();
+        for _ in 0..30 {
+            testkit::run_rule(&d, rule);
+        }
+        assert_eq!(fo.calls("/write/begin").len(), before, "{name} wrote to l2 at txCount 4000");
+    }
+    let views = fo.calls("/view");
+    assert!(views.iter().any(|v| v.to_string().contains("o-test-l2")), "the taper reads l2's view");
+    // 2000..4000: one in eight; some runs write, most do not.
+    fo.set_view("ledger", json!({"txCount": 3000}));
+    let before = fo.calls("/write/begin").len();
+    for _ in 0..200 {
+        testkit::run_rule(&d, tx_transient);
+    }
+    let n = fo.calls("/write/begin").len() - before;
+    assert!(n > 0 && n < 100, "{n} writes in 200 runs at txCount 3000");
+    fo.set_view("ledger", json!({"txCount": 0}));
+    for (name, rule) in probes {
+        let before = fo.calls("/write/begin").len();
+        testkit::run_rule(&d, rule);
+        assert!(fo.calls("/write/begin").len() > before, "{name} below the taper");
+    }
+}
+
+#[test]
+fn stress_admits_one_job_at_a_time_and_stops_at_the_cap() {
+    let (d, ft, _) = testkit::driver();
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    for _ in 0..crate::jobs::JOB_THREADS {
+        let gate = gate.clone();
+        d.submit_job(Job {
+            name: "gate",
+            blocks_quiet: false,
+            run: Box::new(move |_| {
+                let (m, cv) = &*gate;
+                let mut open = m.lock().unwrap();
+                while !*open {
+                    open = cv.wait(open).unwrap();
+                }
+            }),
+        });
+    }
+    testkit::wait_until(Duration::from_secs(5), || d.s.jobs.len() == crate::jobs::JOB_THREADS);
+    for _ in 0..20 {
+        testkit::run_rule(&d, tx_stress);
+    }
+    assert_eq!(d.s.jobs.len(), crate::jobs::JOB_THREADS + 1, "one stress job queued, however often the rule runs");
+    let st = d.s.ext::<StressGate>();
+    assert_eq!(st.inflight.load(Ordering::SeqCst), 1);
+    ft.set_default("bucket", "Apply", FakeReply::Outcome(ok_seq(1)));
+    {
+        let (m, cv) = &*gate;
+        *m.lock().unwrap() = true;
+        cv.notify_all();
+    }
+    testkit::wait_until(Duration::from_secs(10), || d.s.jobs.len() == 0);
+    assert_eq!(st.inflight.load(Ordering::SeqCst), 0, "the job releases its slot");
+    testkit::run_rule(&d, tx_stress);
+    testkit::wait_until(Duration::from_secs(10), || ft.calls_of("bucket", "Apply").len() == 2 && d.s.jobs.len() == 0);
+    st.orders.store(STRESS_ORDER_CAP, Ordering::SeqCst);
+    for _ in 0..5 {
+        testkit::run_rule(&d, tx_stress);
+    }
+    assert_eq!(d.s.jobs.len(), 0, "no stress job past the per-run cap");
+    assert_eq!(ft.calls_of("bucket", "Apply").len(), 2);
+}
+
+#[test]
+fn stress_job_creates_a_missing_ledger() {
+    let (d, ft, _) = testkit::driver();
+    ft.script("bucket", "Apply", vec![FakeReply::Outcome(fail("LEDGER_NOT_FOUND")), FakeReply::Outcome(ok_seq(1))]);
+    let reqs = stress_requests("r-stress-test", "k-ref", &[Leg::new("world", "t-0:1", 1u64, "COIN", "")], 2);
+    stress_job(&d, UntrackedSend::new(reqs, Some("k".into())), 2, "k");
+    let calls = ft.calls_of("bucket", "Apply");
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[1]["request"]["unsigned"]["requests"][0]["createLedger"]["name"], "r-stress-test");
 }

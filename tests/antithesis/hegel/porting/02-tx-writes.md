@@ -129,9 +129,34 @@ protocol fixtures `HG/protocol-fixtures/02/` (regenerate with
 - `tx_stress`: at most 64 posting templates are drawn and cycled across the bulk (each order
   keeps a unique reference `r-<run>-k<N>-ref-<i>`), so a 5000-order bulk does not cost ~30 000
   hegel draws. The ledger is `r-stress-<run>` as the spec names it.
+- `tx_stress` admission (`StressGate`): at most one stress job queued or running (the rule
+  returns before drawing otherwise; a concurrent winner is decided by a compare-and-swap after
+  the draws), and at most `STRESS_ORDER_CAP = 100 000` stress orders per run. A stress job holds
+  a job thread for up to 180 s, and the two job threads also serve other families'
+  quiet-blocking jobs (04's maintenance disable, 12/18), which must not wait behind a stress
+  backlog; the cap bounds `r-stress-<run>`, which is never deleted.
+- `tx_setup` retries for 20 s (plus one send budget), not a minute, to leave the shared setup
+  budget to other hooks; a stress job that gets `LEDGER_NOT_FOUND` sends the idempotent
+  `createLedger` itself, so the next stress bulk finds the ledger.
+- Taper on l2: `tx_transient`, `tx_reference_race` and `tx_drain_probe` commit on l2 (never
+  deleted), so each reads l2's `txCount` first and applies the DESIGN §3.2 bands (≥ 4000
+  never, 2000–4000 one in eight, 500–2000 half). `tx_reference_reuse` and `tx_boundary`
+  commit no transaction (a conflict, an OrderSkipped log, or a rejection) and are not tapered.
+- Multi-ledger bulks: the bulk size is at least the number of chosen ledgers and every chosen
+  ledger gets at least one order, so a 2–3-ledger pick really spans its ledgers.
+- `OrderSkipped.context.existingTransactionId` is compared exactly: the proto field is
+  `optional`, so the server always renders it; an absent field fails the check (it is never
+  read as 0).
+- The "and continued" Raw probe is true when **any later** order of the bulk committed after
+  the skip (spec wording); `M/apply_surface.go` required the immediately next order.
 - The Raw probe is emitted only for committed bulks that carry a REFERENCE_CONFLICT opt-in
   (the singleton emitted every probe on every commit).
 
 ## Requests to 99
 
-- None. No new dependency.
+- No new dependency.
+- Acceptance and swarm selection: hegel's swarm testing enables only a subset of the allowed
+  rules per test case, so a single `run_native.sh` with all eight rules may never run a given
+  rule (the first acceptance run never ran `tx_stress`). `tx_stress` was therefore also run
+  alone (`RULES=tx_stress,tx_local_bulk`). 99 should check every 02 must-hit over the union of
+  runs, not per run.

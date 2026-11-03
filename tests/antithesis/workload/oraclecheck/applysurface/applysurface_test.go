@@ -63,6 +63,29 @@ func TestApplySurface_TrailingSkipDoesNotHit(t *testing.T) {
 	require.False(t, evs[0].Cond, "a skip without a successor proves nothing about continuing")
 }
 
+// skip, skip, commit: a later (not only the next) committed order counts.
+func TestApplySurface_SkipSkipThenSuccessorHits(t *testing.T) {
+	t.Parallel()
+	g := seeded(t)
+	evs := drain(t, g,
+		withSkip(testutil.TxReq("L", "r", "world", "users:2", "COIN", 1)),
+		withSkip(testutil.TxReq("L", "r", "world", "users:3", "COIN", 2)),
+		testutil.AccountMetaReq("L", "t-1:3", "k0", "v"))
+	require.Len(t, evs, 1)
+	require.True(t, evs[0].Cond)
+}
+
+// skip, skip at the end: nothing committed after the skips.
+func TestApplySurface_SkipsOnlyDoNotHit(t *testing.T) {
+	t.Parallel()
+	g := seeded(t)
+	evs := drain(t, g,
+		withSkip(testutil.TxReq("L", "r", "world", "users:2", "COIN", 1)),
+		withSkip(testutil.TxReq("L", "r", "world", "users:3", "COIN", 2)))
+	require.Len(t, evs, 1)
+	require.False(t, evs[0].Cond)
+}
+
 func TestApplySurface_FreshReferenceOptInDoesNotHit(t *testing.T) {
 	t.Parallel()
 	g := seeded(t)

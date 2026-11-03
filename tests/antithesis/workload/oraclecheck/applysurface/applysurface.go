@@ -85,8 +85,9 @@ func OptsInto(req *servicepb.Request, reason commonpb.ErrorReason) bool {
 }
 
 // SkippedAndContinued decides the probe for one validated commit: some order
-// opted into reason was skipped (OrderSkipped with that reason) and the next
-// order of the bulk committed (not skipped). Request-based: the opt-in is
+// opted into reason was skipped (OrderSkipped with that reason) and some
+// order later in the bulk committed (not skipped; task 02 spec, wider than
+// M/'s "immediately next order"). Request-based: the opt-in is
 // read from the requests, the outcome from the model result that the commit
 // check already agreed with.
 func SkippedAndContinued(bulk oracle.Bulk, res oracle.ApplyResult, reason commonpb.ErrorReason) bool {
@@ -97,8 +98,10 @@ func SkippedAndContinued(bulk oracle.Bulk, res oracle.ApplyResult, reason common
 		if skippedReason(order.Skipped) != reason {
 			continue
 		}
-		if i+1 < len(res.Orders) && res.Orders[i+1].Skipped == nil {
-			return true
+		for _, later := range res.Orders[i+1:] {
+			if later.Skipped == nil {
+				return true
+			}
 		}
 	}
 

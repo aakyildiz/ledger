@@ -21,7 +21,8 @@ use hegel::stateful::ConcurrentRule;
 use hegel::TestCase;
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 pub const FAMILY: &str = "tx";
@@ -44,6 +45,11 @@ pub const STRESS_BUDGET: Duration = Duration::from_secs(180);
 /// cycles them (each order still carries its own unique reference). Drawing
 /// all 5000 postings would cost ~30 000 hegel draws in one rule.
 pub const STRESS_TEMPLATES: usize = 64;
+/// At most this many stress orders are submitted per run, which bounds
+/// `r-stress-<run>` (never deleted).
+pub const STRESS_ORDER_CAP: usize = 100_000;
+/// `tx_setup`'s retry deadline (the setup budget is shared by every hook).
+pub const SETUP_DEADLINE: Duration = Duration::from_secs(20);
 
 pub fn rules() -> Vec<ConcurrentRule<Driver>> {
     vec![
@@ -206,7 +212,12 @@ pub fn taper_applies(ctx: &BulkCtx) -> bool {
 /// The in-gen half of the taper: below 500 always, 500–2000 half,
 /// 2000–4000 one in eight.
 pub fn taper_draw(tc: &TestCase, ctx: &BulkCtx) -> bool {
-    match tx_count(ctx.ledger_view) {
+    taper_count_draw(tc, tx_count(ctx.ledger_view))
+}
+
+/// The taper bands of DESIGN §3.2 for a ledger holding `n` transactions.
+pub fn taper_count_draw(tc: &TestCase, n: u64) -> bool {
+    match n {
         n if n < 500 => true,
         n if n < 2000 => draw::chance(tc, 0.5),
         n if n < 4000 => draw::chance(tc, 0.125),
@@ -216,6 +227,18 @@ pub fn taper_draw(tc: &TestCase, ctx: &BulkCtx) -> bool {
 
 fn l2(d: &Driver) -> String {
     format!("o-{}-l2", d.s.run)
+}
+
+/// The taper for the rules that commit on l2 (never deleted, DESIGN §3.1):
+/// reads l2's `txCount` and applies the §3.2 bands; `None` means skip the
+/// rule (also when the view is unavailable or l2 is not resolved).
+fn l2_taper(d: &Driver, tc: &TestCase) -> Option<()> {
+    let views = d.view(&[ViewReq::ledger(LedgerSel::Name(l2(d)))])?;
+    let v = views.first()?;
+    if unresolved(v) {
+        return None;
+    }
+    taper_count_draw(tc, tx_count(v)).then_some(())
 }
 
 fn stress_ledger(d: &Driver) -> String {
@@ -427,7 +450,9 @@ fn inconclusive(o: &Outcome) -> bool {
 
 /// The OrderSkipped facts of the first log of an Apply response: (reason
 /// derived from the details arm, ledger, reference, existing tx id).
-pub fn skipped_facts(resp: &Value) -> Option<(String, String, String, u64)> {
+/// `existingTransactionId` is an `optional` proto field, so the server
+/// always renders it (even 0); an absent one is `None` and never matches.
+pub fn skipped_facts(resp: &Value) -> Option<(String, String, String, Option<u64>)> {
     let logs = crate::wire::apply_logs(resp);
     let sk = crate::wire::order_skipped(logs.first()?)?;
     let details = sk.get("details")?.as_object()?;
@@ -436,7 +461,7 @@ pub fn skipped_facts(resp: &Value) -> Option<(String, String, String, u64)> {
         "transactionReferenceConflict" => "TRANSACTION_REFERENCE_CONFLICT".to_string(),
         other => other.to_string(),
     };
-    Some((reason, str_field(facts, "ledger").to_string(), str_field(facts, "reference").to_string(), facts.get("existingTransactionId").and_then(as_u64).unwrap_or(0)))
+    Some((reason, str_field(facts, "ledger").to_string(), str_field(facts, "reference").to_string(), facts.get("existingTransactionId").and_then(as_u64)))
 }
 
 // ---------------------------------------------------------------- bulk rules
@@ -483,9 +508,11 @@ fn bulk_body(d: &Driver, tc: &TestCase, gens: &[OrderGen], rule_name: &'static s
             }
         }
     }
-    let size = draw::bulk_size_mixed(tc);
-    let mut counts = vec![0usize; ledgers.len()];
-    for _ in 0..size {
+    // Every chosen ledger gets at least one order, so a multi-ledger pick
+    // really spans its ledgers.
+    let size = draw::bulk_size_mixed(tc).max(ledgers.len());
+    let mut counts = vec![1usize; ledgers.len()];
+    for _ in ledgers.len()..size {
         counts[draw::pick(tc, ledgers.len())] += 1;
     }
     let mut reqs = Vec::new();
@@ -543,6 +570,7 @@ pub fn tx_transient(d: &Driver, tc: TestCase) {
         if !d.s.oracle_ok() {
             return None;
         }
+        l2_taper(d, tc)?;
         let balanced = draw::chance(tc, 0.5);
         let amount = draw::amount_positive(tc);
         let asset = draw::asset(tc);
@@ -586,6 +614,7 @@ pub fn tx_reference_race(d: &Driver, tc: TestCase) {
         if !d.s.oracle_ok() {
             return None;
         }
+        l2_taper(d, tc)?;
         let mut g = d.s.slots.try_acquire_up_to(7)?;
         if g.len() < 2 {
             return None;
@@ -676,7 +705,7 @@ pub fn tx_reference_reuse(d: &Driver, tc: TestCase) {
         check_always_or_unreachable!(reason == "TRANSACTION_REFERENCE_CONFLICT", "OrderSkipped reason must be TRANSACTION_REFERENCE_CONFLICT", json!({"reason": reason}));
         check_always_or_unreachable!(f_ref == reference, "OrderSkipped.context.reference must match the requested reference", json!({"context_reference": f_ref, "expected": reference}));
         check_always_or_unreachable!(f_ledger == ledger, "OrderSkipped.context.ledger must match the target ledger", json!({"context_ledger": f_ledger, "expected": ledger}));
-        check_always_or_unreachable!(f_id == first_id, "OrderSkipped.context.existingTransactionId must point to the first tx", json!({"context_existingTransactionId": f_id, "expected": first_id}));
+        check_always_or_unreachable!(f_id == Some(first_id), "OrderSkipped.context.existingTransactionId must point to the first tx", json!({"context_existingTransactionId": f_id, "expected": first_id}));
         check_reachable!("reference-conflict skip path exercised", details);
         Some(())
     });
@@ -703,6 +732,7 @@ pub fn tx_drain_probe(d: &Driver, tc: TestCase) {
         if !d.s.oracle_ok() {
             return None;
         }
+        l2_taper(d, tc)?;
         let amount = draw::int_in(tc, 100, 10_099);
         let asset = draw::asset(tc);
         let ledger = l2(d);
@@ -818,10 +848,40 @@ pub fn stress_requests(ledger: &str, tag: &str, templates: &[Leg], size: usize) 
         .collect()
 }
 
+/// Admission state of the stress jobs: at most one queued or running (each
+/// holds a job thread for up to `STRESS_BUDGET`, and the two job threads
+/// also serve other families' quiet-blocking jobs), and at most
+/// `STRESS_ORDER_CAP` orders per run.
+#[derive(Default)]
+pub struct StressGate {
+    pub inflight: AtomicUsize,
+    pub orders: AtomicUsize,
+}
+
+impl StressGate {
+    fn open(&self) -> bool {
+        self.inflight.load(Ordering::SeqCst) == 0 && self.orders.load(Ordering::SeqCst) < STRESS_ORDER_CAP
+    }
+}
+
+/// Releases the stress slot when the job ends (also on unwind).
+struct StressSlot(Arc<StressGate>);
+
+impl Drop for StressSlot {
+    fn drop(&mut self) {
+        self.0.inflight.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// tx_stress: a geometric 1..5000 untracked bulk on `r-stress-<run>`, sent
-/// from a job (MD/parallel_driver_transactions).
+/// from a job (MD/parallel_driver_transactions). Skipped while a stress job
+/// is queued or running, and once the per-run order cap is reached.
 pub fn tx_stress(d: &Driver, tc: TestCase) {
     d.guarded("tx_stress", &tc, |d, tc| {
+        let gate = d.s.ext::<StressGate>();
+        if !gate.open() {
+            return None;
+        }
         let size = draw::bulk_size_stress(tc);
         let nt = size.min(STRESS_TEMPLATES);
         let mut templates = Vec::with_capacity(nt);
@@ -841,7 +901,19 @@ pub fn tx_stress(d: &Driver, tc: TestCase) {
         send.backoffs_ms = backoffs;
         send.attempt_timeout = STRESS_ATTEMPT_TIMEOUT;
         send.budget = STRESS_BUDGET;
-        d.submit_job(Job { name: "tx-stress", blocks_quiet: false, run: Box::new(move |d: &Driver| stress_job(d, send, size, &key)) });
+        if gate.inflight.compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+            return Some(()); // a concurrent tx_stress won the slot
+        }
+        let slot = StressSlot(gate.clone());
+        gate.orders.fetch_add(size, Ordering::SeqCst);
+        d.submit_job(Job {
+            name: "tx-stress",
+            blocks_quiet: false,
+            run: Box::new(move |d: &Driver| {
+                let _slot = slot;
+                stress_job(d, send, size, &key)
+            }),
+        });
         Some(())
     });
 }
@@ -852,6 +924,10 @@ fn stress_job(d: &Driver, send: UntrackedSend, size: usize, key: &str) {
     if !crate::clients::definitive(out) {
         return;
     }
+    if out.reason == "LEDGER_NOT_FOUND" {
+        // tx_setup ran out of time: create the ledger for the next bulk.
+        create_stress_ledger(d);
+    }
     let details = json!({"key": key, "size": size, "outcome": out.summary()});
     if out.is_ok() {
         let logs = out.response.as_ref().map(|resp| crate::wire::apply_logs(resp).len()).unwrap_or(0);
@@ -860,22 +936,35 @@ fn stress_job(d: &Driver, send: UntrackedSend, size: usize, key: &str) {
     check_sometimes!(out.is_ok() || out.reason == "EXECUTION_PLAN_TOO_LARGE", "should be able to create bulk transactions", details);
 }
 
+/// One keyed, idempotent `createLedger` of `r-stress-<run>`; true when it
+/// exists afterwards.
+fn create_stress_ledger_with(d: &Driver, key: &str) -> (bool, Outcome) {
+    let ledger = stress_ledger(d);
+    let mut send = UntrackedSend::new(vec![json!({"createLedger": {"name": ledger}})], Some(key.to_string()));
+    send.schedule = (0..d.s.clients.len().max(1)).map(crate::clients::Route::lib).collect();
+    let r = d.send_untracked(send);
+    (r.outcome.is_ok() || r.outcome.reason == "LEDGER_ALREADY_EXISTS", r.outcome)
+}
+
+fn create_stress_ledger(d: &Driver) -> bool {
+    create_stress_ledger_with(d, &d.s.next_untracked_key()).0
+}
+
 /// Setup hook: creates `r-stress-<run>` (untracked, keyed, retried for up
-/// to a minute; no draws).
+/// to `SETUP_DEADLINE`; no draws). A stress job that still finds no ledger
+/// creates it.
 pub fn tx_setup(d: &Driver) {
     let ledger = stress_ledger(d);
     let key = d.s.next_untracked_key();
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + SETUP_DEADLINE;
     loop {
-        let mut send = UntrackedSend::new(vec![json!({"createLedger": {"name": ledger}})], Some(key.clone()));
-        send.schedule = (0..d.s.clients.len().max(1)).map(crate::clients::Route::lib).collect();
-        let r = d.send_untracked(send);
-        if r.outcome.is_ok() || r.outcome.reason == "LEDGER_ALREADY_EXISTS" {
+        let (ready, outcome) = create_stress_ledger_with(d, &key);
+        if ready {
             println!("setup: tx_setup: {ledger} ready");
             return;
         }
         if Instant::now() >= deadline {
-            println!("setup: tx_setup: {ledger} not created: {}", r.outcome.summary());
+            println!("setup: tx_setup: {ledger} not created: {}", outcome.summary());
             return;
         }
         std::thread::sleep(Duration::from_millis(500));

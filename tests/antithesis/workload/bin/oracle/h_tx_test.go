@@ -1,6 +1,7 @@
 package main
 
 import (
+	"os"
 	"testing"
 
 	"github.com/antithesishq/antithesis-sdk-go/assert"
@@ -33,9 +34,10 @@ func TestTxAsserters_EmitLiterals(t *testing.T) {
 		}
 		assertEvents([]oc.Event{oc.Raw(txcheck.EvSkipRefConflictContinued, true, nil)})
 	})
-	if events == nil {
-		return
+	if os.Getenv("LEDGER_SDK_TEST_CHILD") == t.Name() {
+		return // the child process only runs the scenario
 	}
+	require.NotEmpty(t, events, "the SDK emitted nothing")
 	for _, id := range reasons {
 		require.True(t, sdktest.Find(t, events, string(id)).Hit, id)
 	}
