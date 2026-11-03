@@ -594,11 +594,14 @@ func globalLogTerm(seq uint64, l *globalLog) Digest {
 }
 
 // frozenOutcome is a keyed bulk's recorded outcome: the exact requests it
-// committed (to tell a genuine replay from a same-key/different-body conflict)
-// and the per-order results the server will echo on every replay.
+// carried (to tell a genuine replay from a same-key/different-body conflict)
+// and either the per-order results the server will echo on every replay (a
+// success, failure == "") or the frozen failure reason (a domain.ErrReason*
+// value; orders nil), which the server replays as a ReplayedFailure.
 type frozenOutcome struct {
 	requests []*servicepb.Request
 	orders   []OrderResult
+	failure  string
 }
 
 // frozenOutcomeTerm fingerprints one frozen entry. Frozen idempotency outcomes
@@ -607,10 +610,11 @@ type frozenOutcome struct {
 // keyed transactions (identical business state, opposite id assignments) and a
 // replay can no longer resolve to the id the server actually returned. Only the
 // outcome identity a replay reveals (per-order id) needs fingerprinting, not
-// the whole result.
+// the whole result. The frozen failure reason is part of the identity: a key
+// holding a frozen failure replays it, a key holding nothing executes fresh.
 func frozenOutcomeTerm(key string, fo *frozenOutcome) Digest {
 	t := newTerm("IK")
-	t.str(key)
+	t.str(key, fo.failure)
 	t.u64(uint64(len(fo.orders)))
 	for i, o := range fo.orders {
 		revertedID := uint64(0)
@@ -772,6 +776,15 @@ type txRecord struct {
 	// whose cell lands in the exclusion projection gets no row. The any-role
 	// index is the union of the two bits.
 	indexedAddrs map[string]uint8
+	// timestampLearned and revertedAtLearned mark timestamp / revertedAt
+	// values that are observation state rather than business state: filled by
+	// LearnTxStamps from a commit response, or inherited at apply time from a
+	// learned value (an at-effective-date revert of a server-dated original).
+	// Fingerprint hashes the values whatever their origin; BusinessFingerprint
+	// treats a learned value as unknown (nil), so learning one never changes
+	// it. insertedAt is always learned and needs no flag.
+	timestampLearned  bool
+	revertedAtLearned bool
 }
 
 // Bits of txRecord.indexedAddrs / IndexedAddrs.
@@ -796,13 +809,38 @@ type revertEffect struct {
 //     (TRANSIENT_ACCOUNT_NON_ZERO) not attributable to a single order.
 //   - State: the resulting state (equals the input state when !OK).
 //   - Orders: per-request detail, index-aligned with bulk.Requests, truncated
-//     at the first failing order.
+//     at the first failing order. Nil for a replayed failure: the server
+//     replays only the frozen reason.
+//   - Stage: where the server produces this outcome (see Stage). Apply sets it
+//     on every result; the zero value belongs to no stage and is never frozen.
+//   - Replayed: the outcome is a frozen one the dedup gate returned (success or
+//     failure) rather than a fresh evaluation of the bulk.
 type ApplyResult struct {
-	OK     bool
-	Reason string
-	State  GlobalState
-	Orders []OrderResult
+	OK       bool
+	Reason   string
+	State    GlobalState
+	Orders   []OrderResult
+	Stage    Stage
+	Replayed bool
 }
+
+// Stage names where the server produces an outcome. It decides whether a
+// failure can be frozen: only the FSM writes the failure audit entry and
+// freezes the key (machine.go recordIdempotencyFailure); an admission
+// rejection never reaches raft, so it is neither audited nor frozen and a later
+// valid body under the same key applies normally. STAGES.md lists, for every
+// reason the model returns, the server location and the stage.
+type Stage uint8
+
+const (
+	// StageAdmission: rejected before raft by admission
+	// (internal/application/admission: the maintenance gate, request
+	// conversion, validateOrder). No audit entry, nothing frozen.
+	StageAdmission Stage = iota + 1
+	// StageFSM: produced by the apply path, including the dedup gate's replays
+	// and IDEMPOTENCY_KEY_CONFLICT, and every success.
+	StageFSM
+)
 
 // LedgerOf returns the request ledger, or empty for cluster-scoped orders.
 func LedgerOf(req *servicepb.Request) string {
@@ -885,43 +923,85 @@ func (g GlobalState) Apply(bulk Bulk) ApplyResult {
 	// The cluster-wide maintenance interceptor rejects non-toggle bulks before
 	// request conversion and structural validation. This ordering matters for a
 	// malformed request observed while maintenance is enabled: the service
-	// reports MAINTENANCE_MODE, not the request's validation error.
+	// reports MAINTENANCE_MODE, not the request's validation error. The gate
+	// is admission's (admission.go prepareAdmission), so it is an
+	// admission-stage rejection.
 	if g.maintenance && !allMaintenanceRequests(bulk.Requests) {
-		return ApplyResult{OK: false, Reason: domain.ErrReasonMaintenanceMode, State: g}
+		return ApplyResult{OK: false, Reason: domain.ErrReasonMaintenanceMode, State: g, Stage: StageAdmission}
 	}
 
 	// Admission validates every order's structure and converts the whole batch
 	// before it reaches the FSM, so a single malformed order rejects the entire
-	// bulk ahead of any per-order FSM outcome. Structural rejections include invalid skippable reasons and
-	// an empty create (no postings, no script → VALIDATION);
-	// model it here so a bulk mixing an empty create with an FSM-rejecting order
-	// reports VALIDATION, matching validateOrderContent rather than the FSM reason
-	// the sequential pass below would reach first.
-	for _, req := range bulk.Requests {
+	// bulk ahead of any per-order FSM outcome. Structural rejections include
+	// invalid skippable reasons, a revert without a target id, an empty create
+	// (no postings, no script → VALIDATION) and a CreateLedger account type
+	// with an empty name; model them here so a bulk mixing one with an
+	// FSM-rejecting order reports the admission reason, matching
+	// requestToOrder/validateOrder rather than the FSM reason the sequential
+	// pass below would reach first. None of them is audited or frozen.
+	if reason := admissionReason(bulk.Requests); reason != "" {
+		return ApplyResult{OK: false, Reason: reason, State: g, Stage: StageAdmission}
+	}
+
+	res := g.applyFSM(bulk)
+	res.Stage = StageFSM
+
+	return res
+}
+
+// admissionReason is the first admission rejection of the batch, in request
+// order and, per request, in the order requestToOrder checks: the skippable
+// opt-in (extractSkippableReasonsFromApply), the revert target id
+// (resolveRevertTarget), then validateOrder (validateOrderContent,
+// validateOrderPreparedQuery, validateOrderAccountType). Empty when admission
+// lets the batch through.
+func admissionReason(reqs []*servicepb.Request) string {
+	for _, req := range reqs {
 		if !validSkippableReasons(req.GetApply()) {
-			return ApplyResult{Reason: domain.ErrReasonValidation, State: g}
+			return domain.ErrReasonValidation
+		}
+		if rt := req.GetApply().GetAction().GetRevertTransaction(); rt != nil && rt.GetTransactionId() == 0 {
+			// domain.ErrTransactionTargetMissing (VALIDATION) from
+			// resolveRevertTarget, before the order exists.
+			return domain.ErrReasonValidation
 		}
 		if ct := req.GetApply().GetAction().GetCreateTransaction(); ct != nil && len(ct.GetPostings()) == 0 {
-			return ApplyResult{OK: false, Reason: domain.ErrReasonValidation, State: g}
+			return domain.ErrReasonValidation
 		}
 		if reason := preparedQueryAdmissionReason(req); reason != "" {
-			return ApplyResult{OK: false, Reason: reason, State: g}
+			return reason
+		}
+		if _, ok := req.GetCreateLedger().GetAccountTypes()[""]; ok {
+			// validateOrderAccountType: a nameless account type is an
+			// INVALID_PATTERN at admission (the FSM repeats the check).
+			return domain.ErrReasonInvalidPattern
 		}
 	}
 
+	return ""
+}
+
+// applyFSM is the apply path past admission: the dedup gate, then the orders,
+// then the end-of-bulk checks. Every outcome it returns is FSM-stage.
+func (g GlobalState) applyFSM(bulk Bulk) ApplyResult {
 	// Per-batch idempotency, checked after admission's structural and maintenance
-	// gates and before any other FSM outcome — mirroring the server,
-	// where the dedup runs in the apply path ahead of ProcessOrders. Only
-	// successes are frozen (see the commit return below), so a hit is always a
-	// committed outcome: same body replays it verbatim with no new state; a
-	// different body under the same key is a conflict.
+	// gates and before any other FSM outcome — mirroring the server, where the
+	// dedup runs in the apply path ahead of ProcessOrders (machine.go). A hit
+	// with the same body replays the frozen outcome with no new state: a frozen
+	// success returns its orders verbatim, a frozen failure (RecordFailure)
+	// returns its reason as a ReplayedFailure. A different body under the same
+	// key is a conflict, whatever was frozen.
 	if bulk.IdempotencyKey != "" {
 		if fo, ok := g.idempotency.Get(bulk.IdempotencyKey); ok {
 			if !RequestsEqual(fo.requests, bulk.Requests) {
 				return ApplyResult{OK: false, Reason: domain.ErrReasonIdempotencyKeyConflict, State: g}
 			}
 
-			return ApplyResult{OK: true, State: g, Orders: fo.orders}
+			if fo.failure != "" {
+				return ApplyResult{OK: false, Reason: fo.failure, State: g, Replayed: true}
+			}
+
+			return ApplyResult{OK: true, State: g, Orders: fo.orders, Replayed: true}
 		}
 	}
 
@@ -1069,9 +1149,11 @@ func (g GlobalState) Apply(bulk Bulk) ApplyResult {
 		delete(next.ledgers, name)
 	}
 
-	// Freeze the committed outcome so a later bulk with this key replays it. Only
-	// the success path records an entry; a rejected keyed bulk leaves no frozen
-	// outcome (the driver never replays a key whose bulk did not commit).
+	// Freeze the committed outcome so a later bulk with this key replays it.
+	// Apply freezes only successes: a rejected bulk returns State == g, because
+	// callers (the candidate search) fork on Apply and only the checker knows
+	// whether a failure really happened. Failures are frozen explicitly by
+	// RecordFailure once the caller has decided the failure occurred.
 	if bulk.IdempotencyKey != "" {
 		next.idempotency = next.idempotency.Set(bulk.IdempotencyKey, &frozenOutcome{
 			requests: bulk.Requests,
@@ -1080,6 +1162,51 @@ func (g GlobalState) Apply(bulk Bulk) ApplyResult {
 	}
 
 	return ApplyResult{OK: true, State: next, Orders: orders}
+}
+
+// RecordFailure freezes a definitive business failure of bulk under its key, the
+// way recordIdempotencyFailure does: only when the key is non-empty, the failure was
+// produced at the FSM stage by evaluating the bulk (not by replaying a frozen
+// outcome), the reason's kind is freezable, and no live outcome exists for the key.
+// It returns g unchanged otherwise.
+//
+// Mirrors internal/infra/state/machine.go recordIdempotencyFailure and the
+// apply path around it:
+//   - no key → no-op;
+//   - a ReplayedFailure → no-op (res.Replayed);
+//   - a kind that is not domain.IsFreezableFailure → no-op (decided by the
+//     server's own KindForReason, so the rule cannot drift);
+//   - a live entry exists → no-op, which is why IDEMPOTENCY_KEY_CONFLICT is
+//     never frozen;
+//   - an admission rejection never reaches the FSM → no-op (res.Stage);
+//   - a domain.UncommittedFailure is returned before the audit write and the
+//     freeze (machine.go, the AsType[UncommittedFailure] returns) → no-op for
+//     every reason in UncommittedReasons.
+//
+// res is the result that explains the failure (normally g.Apply(bulk), or the
+// explaining candidate's result in the checker). RecordFailure trusts
+// res.Reason, res.Stage and res.Replayed and does not re-evaluate the bulk.
+// Like Apply it never mutates g in place.
+func (g GlobalState) RecordFailure(bulk Bulk, res ApplyResult) GlobalState {
+	switch {
+	case bulk.IdempotencyKey == "",
+		res.OK,
+		res.Reason == "",
+		res.Replayed,
+		res.Stage != StageFSM,
+		res.Reason == domain.ErrReasonIdempotencyKeyConflict,
+		UncommittedReasons[res.Reason],
+		!domain.IsFreezableFailure(domain.KindForReason(domain.ReasonCode(res.Reason))),
+		g.idempotency.Has(bulk.IdempotencyKey):
+		return g
+	}
+
+	g.idempotency = g.idempotency.Set(bulk.IdempotencyKey, &frozenOutcome{
+		requests: bulk.Requests,
+		failure:  res.Reason,
+	})
+
+	return g
 }
 
 // RequestsEqual compares the modeled business intent of request slices. Chart
@@ -1588,6 +1715,7 @@ func (s *LedgerState) applyRevert(
 ) OrderResult {
 	id := rt.GetTransactionId()
 	if id == 0 || id > uint64(s.txs.Len()) {
+		// id == 0 never gets here: admission rejects it (admissionReason).
 		// Unknown id (past the log frontier); the server rejects with
 		// TRANSACTION_NOT_FOUND. The generator targets committed transactions, so
 		// in commit order this is unreachable, but a candidate-base ordering may
@@ -1643,8 +1771,10 @@ func (s *LedgerState) applyRevert(
 	// timestamp (processor_revert_transaction.go), which the model knows iff the
 	// original carried a user-supplied one; otherwise it too is a server date (nil).
 	var revertTS *commonpb.Timestamp
+	revertTSLearned := false
 	if rt.GetAtEffectiveDate() {
 		revertTS = orig.timestamp
+		revertTSLearned = orig.timestampLearned
 	}
 
 	revertID := uint64(s.txs.Len()) + 1
@@ -1657,6 +1787,7 @@ func (s *LedgerState) applyRevert(
 	reverted.reverted = true
 	reverted.revertedBy = revertID
 	reverted.revertedAt = revertTS
+	reverted.revertedAtLearned = revertTSLearned
 	s.txs = s.txs.Set(int(id-1), &reverted)
 
 	s.txs = s.txs.Append(&txRecord{
@@ -1664,6 +1795,7 @@ func (s *LedgerState) applyRevert(
 		postings:           reversed,
 		metadata:           rt.GetMetadata(),
 		timestamp:          revertTS,
+		timestampLearned:   revertTSLearned,
 		revertsTransaction: orig.id,
 		pcv:                pcv,
 	})
@@ -1892,7 +2024,12 @@ func (s *LedgerState) applyAddAccountMetadata(addr string, md map[string]*common
 // applyAddTxMetadata sets transaction metadata last-writer-wins on a transaction
 // addressed by id. An unknown id rejects with TRANSACTION_NOT_FOUND.
 func (s *LedgerState) applyAddTxMetadata(id uint64, md map[string]*commonpb.MetadataValue) OrderResult {
-	if id == 0 || id > uint64(s.txs.Len()) {
+	if id == 0 {
+		// validateTransactionTarget: ErrTransactionTargetMissing (VALIDATION),
+		// raised in the FSM — admission does not check metadata targets.
+		return OrderResult{Reason: domain.ErrReasonValidation}
+	}
+	if id > uint64(s.txs.Len()) {
 		return OrderResult{Reason: domain.ErrReasonTransactionNotFound}
 	}
 
@@ -1925,7 +2062,11 @@ func (s *LedgerState) applyDeleteMetadata(cmd *commonpb.DeleteMetadataCommand) O
 		return OrderResult{OK: true}
 	case *commonpb.Target_TransactionId:
 		id := t.TransactionId
-		if id == 0 || id > uint64(s.txs.Len()) {
+		if id == 0 {
+			// validateTransactionTarget, as for AddMetadata.
+			return OrderResult{Reason: domain.ErrReasonValidation}
+		}
+		if id > uint64(s.txs.Len()) {
 			return OrderResult{Reason: domain.ErrReasonTransactionNotFound}
 		}
 

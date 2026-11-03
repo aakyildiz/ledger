@@ -12,6 +12,9 @@
 //   - --submits: fold every bulk in dispatch-ticket order and compare each
 //     bulk's model outcome to the server's. Valid only for a single-worker run,
 //     where dispatch order IS the serialization; the first mismatch is the bug.
+//     A failure the server also reported is frozen under the bulk's key
+//     (GlobalState.RecordFailure), as the server freezes it, so a later replay
+//     of that key is predicted as the frozen failure.
 //
 // Usage: replay <dump-file> [target-ledger] [--submits]
 package main
@@ -20,6 +23,7 @@ import (
 	"bufio"
 	"encoding/base64"
 	"fmt"
+	"io"
 	"os"
 	"sort"
 	"strconv"
@@ -60,17 +64,18 @@ func main() {
 	}
 
 	if submitsMode {
-		replaySubmits(batches, target)
+		replaySubmits(os.Stdout, batches, target)
 	} else {
 		replayCommitted(batches, target)
 	}
 }
 
 // replaySubmits folds the submitted stream through a fresh oracle in dispatch
-// order and reports every bulk whose model outcome differs from the server's.
-func replaySubmits(submits []batch, target string) {
+// order, reports every bulk whose model outcome differs from the server's and
+// returns the mismatch count.
+func replaySubmits(w io.Writer, submits []batch, target string) int {
 	sort.SliceStable(submits, func(i, j int) bool { return submits[i].ticket < submits[j].ticket })
-	fmt.Printf("parsed %d submitted bulks (trace ledger=%q)\n\n", len(submits), target)
+	_, _ = fmt.Fprintf(w, "parsed %d submitted bulks (trace ledger=%q)\n\n", len(submits), target)
 
 	gs := oracle.NewGlobalState()
 	mismatches := 0
@@ -102,23 +107,33 @@ func replaySubmits(submits []batch, target string) {
 
 		if model != b.outcome {
 			mismatches++
-			fmt.Printf("ticket=%-6d MISMATCH server=%s model=%s\n", b.ticket, b.outcome, model)
-			fmt.Printf("            postings=%s\n", renderPostings(bulk))
-			fmt.Printf("            kinds=%s\n", renderKinds(bulk))
-			fmt.Printf("            modelTypes=%s\n\n", renderTypes(gs, bulk))
+			_, _ = fmt.Fprintf(w, "ticket=%-6d MISMATCH server=%s model=%s\n", b.ticket, b.outcome, model)
+			_, _ = fmt.Fprintf(w, "            postings=%s\n", renderPostings(bulk))
+			_, _ = fmt.Fprintf(w, "            kinds=%s\n", renderKinds(bulk))
+			_, _ = fmt.Fprintf(w, "            modelTypes=%s\n\n", renderTypes(gs, bulk))
 		}
 
-		if res.OK {
+		switch {
+		case res.OK:
 			gs = res.State
+		case b.outcome != "OK":
+			// The server rejected the bulk too, so the failure happened: freeze
+			// it the way recordIdempotencyFailure does (a no-op for unkeyed,
+			// admission-stage, replayed, non-freezable and uncommitted
+			// failures). A model failure the server committed is a mismatch
+			// already reported above; freezing it would invent server state.
+			gs = gs.RecordFailure(bulk, res)
 		}
 
 		if target != "" && touchesTarget {
-			fmt.Printf("  trace ticket=%-6d srv=%-22s mdl=%-22s kinds=%-26s typesAfter=%-14s postings=%s\n",
+			_, _ = fmt.Fprintf(w, "  trace ticket=%-6d srv=%-22s mdl=%-22s kinds=%-26s typesAfter=%-14s postings=%s\n",
 				b.ticket, b.outcome, model, renderKinds(bulk), typeNames(gs, target), renderPostings(bulk))
 		}
 	}
 
-	fmt.Printf("\n%d submitted bulks, %d model/server mismatches\n", len(submits), mismatches)
+	_, _ = fmt.Fprintf(w, "\n%d submitted bulks, %d model/server mismatches\n", len(submits), mismatches)
+
+	return mismatches
 }
 
 func typeNames(gs oracle.GlobalState, ledger string) string {
