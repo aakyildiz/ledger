@@ -11,7 +11,7 @@ import (
 // are Reachable and reached by the prepared_write, prepared_execute and
 // projection_probe rules (tests/antithesis/hegel/porting/08-prepared-queries.md).
 func init() {
-	registerAsserter(preparedcheck.EvListingOutsideModel, func(_ bool, d map[string]any) {
+	registerAsserter(preparedcheck.EvPreparedListingOutsideModel, func(_ bool, d map[string]any) {
 		assert.Unreachable("oracle: prepared query listing outside model", d)
 	})
 	registerAsserter(preparedcheck.EvPageOutsideModel, func(_ bool, d map[string]any) {
@@ -29,7 +29,7 @@ func init() {
 	registerAsserter(preparedcheck.EvReverseAggregateNotRejected, func(_ bool, d map[string]any) {
 		assert.Unreachable("oracle: reverse aggregate on a prepared query not rejected", d)
 	})
-	registerAsserter(preparedcheck.EvListUnexpectedError, func(_ bool, d map[string]any) {
+	registerAsserter(preparedcheck.EvPreparedListUnexpectedError, func(_ bool, d map[string]any) {
 		assert.Unreachable("oracle: ListPreparedQueries returned unexpected error", d)
 	})
 	registerAsserter(preparedcheck.EvReverseAggregateRejected, func(_ bool, d map[string]any) {

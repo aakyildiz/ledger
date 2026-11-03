@@ -16,7 +16,7 @@ import (
 func ValidateListPreparedQueries(c *oc.ReadCtx) []oc.Event {
 	var req servicepb.ListPreparedQueriesRequest
 	if err := decode(c.Request, &req); err != nil {
-		return []oc.Event{oc.Violation(EvListingOutsideModel, map[string]any{"error": "undecodable request: " + err.Error()})}
+		return []oc.Event{oc.Violation(EvPreparedListingOutsideModel, map[string]any{"error": "undecodable request: " + err.Error()})}
 	}
 	ledger := req.GetLedger()
 
@@ -28,12 +28,12 @@ func ValidateListPreparedQueries(c *oc.ReadCtx) []oc.Event {
 		d := outcomeDetails(c.Outcome)
 		d["ledger"] = ledger
 
-		return []oc.Event{oc.Violation(EvListUnexpectedError, d)}
+		return []oc.Event{oc.Violation(EvPreparedListUnexpectedError, d)}
 	}
 
 	var resp servicepb.ListPreparedQueriesResponse
 	if err := decode(c.Outcome.Response, &resp); err != nil {
-		return []oc.Event{oc.Violation(EvListingOutsideModel, map[string]any{"ledger": ledger, "error": "undecodable response: " + err.Error()})}
+		return []oc.Event{oc.Violation(EvPreparedListingOutsideModel, map[string]any{"ledger": ledger, "error": "undecodable response: " + err.Error()})}
 	}
 	served := resp.GetQueries()
 	if c.Matches(func(base oracle.GlobalState) bool {
@@ -44,7 +44,7 @@ func ValidateListPreparedQueries(c *oc.ReadCtx) []oc.Event {
 		return nil
 	}
 
-	return []oc.Event{oc.Violation(EvListingOutsideModel, map[string]any{
+	return []oc.Event{oc.Violation(EvPreparedListingOutsideModel, map[string]any{
 		"ledger":       ledger,
 		"rows":         len(served),
 		"serverQuery":  describePreparedQueries(served),

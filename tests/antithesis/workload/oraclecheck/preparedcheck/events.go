@@ -32,13 +32,13 @@ import oc "github.com/formancehq/ledger/v3/tests/antithesis/workload/oraclecheck
 
 // Findings (Unreachable). Ported literals: "oracle: " + the M/ suffix.
 const (
-	EvListingOutsideModel         oc.EventID = "oracle: prepared query listing outside model"
+	EvPreparedListingOutsideModel oc.EventID = "oracle: prepared query listing outside model"
 	EvPageOutsideModel            oc.EventID = "oracle: prepared query page outside model"
 	EvAggregateOutsideModel       oc.EventID = "oracle: prepared query aggregate outside model"
 	EvExecUnexpectedError         oc.EventID = "oracle: prepared query execution returned unexpected error"
 	EvCursorPageSizeMismatch      oc.EventID = "oracle: prepared query cursor page size mismatch"
 	EvReverseAggregateNotRejected oc.EventID = "oracle: reverse aggregate on a prepared query not rejected"
-	EvListUnexpectedError         oc.EventID = "oracle: ListPreparedQueries returned unexpected error"
+	EvPreparedListUnexpectedError oc.EventID = "oracle: ListPreparedQueries returned unexpected error"
 )
 
 // Coverage (Reachable), reached by task 08's rules.

@@ -386,8 +386,8 @@ func TestListPreparedQueries(t *testing.T) {
 	mutated := proto.Clone(served[0]).(*commonpb.PreparedQuery)
 	mutated.Filter = prefix("zzz")
 	bad := append([]*commonpb.PreparedQuery{mutated}, served[1:]...)
-	requireFinding(t, validateAt(t, s, pc.KindListPreparedQueries, req, okOut(t, &servicepb.ListPreparedQueriesResponse{Queries: bad}), nil).evs, pc.EvListingOutsideModel)
-	requireFinding(t, validateAt(t, s, pc.KindListPreparedQueries, req, okOut(t, &servicepb.ListPreparedQueriesResponse{Queries: served[1:]}), nil).evs, pc.EvListingOutsideModel)
+	requireFinding(t, validateAt(t, s, pc.KindListPreparedQueries, req, okOut(t, &servicepb.ListPreparedQueriesResponse{Queries: bad}), nil).evs, pc.EvPreparedListingOutsideModel)
+	requireFinding(t, validateAt(t, s, pc.KindListPreparedQueries, req, okOut(t, &servicepb.ListPreparedQueriesResponse{Queries: served[1:]}), nil).evs, pc.EvPreparedListingOutsideModel)
 
 	// A concurrent delete makes both listings legal.
 	tk := s.Begin(false, deletePQ(l1, "q-3"))
@@ -402,7 +402,7 @@ func TestListPreparedQueries(t *testing.T) {
 	_, evs := s.End(tk)
 	require.Empty(t, testutil.Findings(evs))
 
-	requireFinding(t, validateAt(t, s, pc.KindListPreparedQueries, req, errOut("Internal", ""), nil).evs, pc.EvListUnexpectedError)
+	requireFinding(t, validateAt(t, s, pc.KindListPreparedQueries, req, errOut("Internal", ""), nil).evs, pc.EvPreparedListUnexpectedError)
 	requireFinding(t, validateAt(t, s, pc.KindListPreparedQueries, req, errOut("NotFound", "LEDGER_NOT_FOUND"), nil).evs, oc.EvLedgerNotFoundUnexplained)
 	requireClean(t, validateAt(t, s, pc.KindListPreparedQueries, &servicepb.ListPreparedQueriesRequest{Ledger: "o-test-absent-1"}, errOut("NotFound", "LEDGER_NOT_FOUND"), nil).evs)
 }
