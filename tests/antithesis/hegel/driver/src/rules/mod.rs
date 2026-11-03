@@ -14,6 +14,8 @@ pub mod smoke;
 // ==== 05-point-reads mods ====
 // ==== end 05-point-reads mods ====
 // ==== 06-list-queries mods ====
+pub mod filters;
+pub mod lists;
 // ==== end 06-list-queries mods ====
 // ==== 07-indexes-typed-metadata mods ====
 // ==== end 07-indexes-typed-metadata mods ====
@@ -52,6 +54,7 @@ pub fn rules() -> Vec<ConcurrentRule<Driver>> {
     // ==== 05-point-reads rules ====
     // ==== end 05-point-reads rules ====
     // ==== 06-list-queries rules ====
+    v.extend(lists::rules());
     // ==== end 06-list-queries rules ====
     // ==== 07-indexes-typed-metadata rules ====
     // ==== end 07-indexes-typed-metadata rules ====

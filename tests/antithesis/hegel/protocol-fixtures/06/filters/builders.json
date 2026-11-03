@@ -1,0 +1,710 @@
+{
+  "cases": [
+    {
+      "filter": {
+        "address": {
+          "hardcodedPrefix": "t-3:",
+          "role": "ADDRESS_ROLE_SOURCE"
+        }
+      },
+      "name": "addr-prefix-role",
+      "refused": false,
+      "target": "ACCOUNTS"
+    },
+    {
+      "filter": {
+        "address": {
+          "hardcodedExact": "world",
+          "role": "ADDRESS_ROLE_DESTINATION"
+        }
+      },
+      "name": "addr-exact",
+      "refused": false,
+      "target": "TRANSACTIONS"
+    },
+    {
+      "filter": {
+        "reference": {
+          "cond": {
+            "hardcoded": "o-test-ref1"
+          }
+        }
+      },
+      "name": "reference",
+      "refused": false,
+      "target": "TRANSACTIONS"
+    },
+    {
+      "filter": {
+        "reverted": {
+          "value": true
+        }
+      },
+      "name": "reverted-on-accounts",
+      "refused": true,
+      "target": "ACCOUNTS"
+    },
+    {
+      "filter": {
+        "builtinUint": {
+          "cond": {
+            "max": "255",
+            "min": "0"
+          },
+          "field": "TX_BUILTIN_INDEX_ID"
+        }
+      },
+      "name": "tx-id-range",
+      "refused": false,
+      "target": "TRANSACTIONS"
+    },
+    {
+      "filter": {
+        "builtinUint": {
+          "cond": {
+            "max": "18446744073709551615",
+            "min": "0"
+          },
+          "field": "TX_BUILTIN_INDEX_TIMESTAMP"
+        }
+      },
+      "name": "date-extremum",
+      "refused": false,
+      "target": "TRANSACTIONS"
+    },
+    {
+      "filter": {
+        "accountHasAsset": {
+          "assetBase": "USD",
+          "precision": 300
+        }
+      },
+      "name": "has-asset-overflow",
+      "refused": true,
+      "target": "ACCOUNTS"
+    },
+    {
+      "filter": {
+        "field": {
+          "existsCond": {
+            "includeNull": true
+          },
+          "field": {
+            "metadata": "undeclared-k1"
+          }
+        }
+      },
+      "name": "meta-exists",
+      "refused": false,
+      "target": "ACCOUNTS"
+    },
+    {
+      "filter": {
+        "and": {
+          "filters": [
+            {
+              "field": {
+                "field": {
+                  "metadata": "k1"
+                },
+                "intCond": {
+                  "min": "-9223372036854775808",
+                  "minExclusive": true
+                }
+              }
+            },
+            {
+              "field": {
+                "field": {
+                  "metadata": "k1"
+                },
+                "intCond": {
+                  "max": "9223372036854775807",
+                  "maxExclusive": true
+                }
+              }
+            }
+          ]
+        }
+      },
+      "name": "field-int-split",
+      "refused": false,
+      "target": "TRANSACTIONS"
+    },
+    {
+      "filter": {
+        "field": {
+          "boolCond": {
+            "hardcoded": false
+          },
+          "field": {
+            "metadata": "k2"
+          }
+        }
+      },
+      "name": "field-bool",
+      "refused": false,
+      "target": "ACCOUNTS"
+    },
+    {
+      "filter": {
+        "or": {
+          "filters": [
+            {
+              "and": {
+                "filters": []
+              }
+            },
+            {
+              "not": {
+                "filter": {
+                  "reverted": {
+                    "value": false
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      "name": "empty-or-and-not",
+      "refused": false,
+      "target": "TRANSACTIONS"
+    },
+    {
+      "filter": {
+        "and": {
+          "filters": [
+            {
+              "ledger": {
+                "cond": {
+                  "hardcoded": "no-such-ledger"
+                }
+              }
+            },
+            {
+              "logId": {
+                "cond": {
+                  "max": "9",
+                  "min": "3",
+                  "minExclusive": true
+                }
+              }
+            },
+            {
+              "logBuiltinUint": {
+                "cond": {},
+                "field": "LOG_BUILTIN_INDEX_DATE"
+              }
+            }
+          ]
+        }
+      },
+      "name": "log-leaves",
+      "refused": false,
+      "target": "LOGS"
+    },
+    {
+      "filter": {
+        "and": {
+          "filters": [
+            {},
+            {
+              "address": {
+                "hardcodedPrefix": "t-",
+                "role": "ADDRESS_ROLE_ANY"
+              }
+            }
+          ]
+        }
+      },
+      "name": "unset-node",
+      "refused": true,
+      "target": "ACCOUNTS"
+    },
+    {
+      "filter": {
+        "reference": {
+          "cond": {
+            "param": "p0"
+          }
+        }
+      },
+      "name": "param-ref",
+      "refused": true,
+      "target": "TRANSACTIONS"
+    },
+    {
+      "filter": {
+        "address": {
+          "hardcodedPrefix": "t-",
+          "role": 2147483647
+        }
+      },
+      "name": "role-out-of-range",
+      "refused": false,
+      "target": "ACCOUNTS"
+    },
+    {
+      "filter": {
+        "builtinUint": {
+          "cond": {
+            "min": "1"
+          },
+          "field": 8
+        }
+      },
+      "name": "builtin-out-of-range",
+      "refused": true,
+      "target": "TRANSACTIONS"
+    },
+    {
+      "filter": {
+        "audit": {
+          "field": "AUDIT_FIELD_LEDGER",
+          "stringPrefix": "\u0000"
+        }
+      },
+      "name": "audit-on-logs",
+      "refused": true,
+      "target": "LOGS"
+    },
+    {
+      "filter": {
+        "not": {}
+      },
+      "name": "not-without-child",
+      "refused": false,
+      "target": "LOGS"
+    },
+    {
+      "filter": {
+        "not": {
+          "filter": {
+            "not": {
+              "filter": {
+                "not": {
+                  "filter": {
+                    "not": {
+                      "filter": {
+                        "not": {
+                          "filter": {
+                            "not": {
+                              "filter": {
+                                "not": {
+                                  "filter": {
+                                    "not": {
+                                      "filter": {
+                                        "not": {
+                                          "filter": {
+                                            "not": {
+                                              "filter": {
+                                                "not": {
+                                                  "filter": {
+                                                    "not": {
+                                                      "filter": {
+                                                        "not": {
+                                                          "filter": {
+                                                            "not": {
+                                                              "filter": {
+                                                                "not": {
+                                                                  "filter": {
+                                                                    "not": {
+                                                                      "filter": {
+                                                                        "not": {
+                                                                          "filter": {
+                                                                            "not": {
+                                                                              "filter": {
+                                                                                "not": {
+                                                                                  "filter": {
+                                                                                    "not": {
+                                                                                      "filter": {
+                                                                                        "not": {
+                                                                                          "filter": {
+                                                                                            "not": {
+                                                                                              "filter": {
+                                                                                                "not": {
+                                                                                                  "filter": {
+                                                                                                    "not": {
+                                                                                                      "filter": {
+                                                                                                        "not": {
+                                                                                                          "filter": {
+                                                                                                            "not": {
+                                                                                                              "filter": {
+                                                                                                                "not": {
+                                                                                                                  "filter": {
+                                                                                                                    "not": {
+                                                                                                                      "filter": {
+                                                                                                                        "not": {
+                                                                                                                          "filter": {
+                                                                                                                            "not": {
+                                                                                                                              "filter": {
+                                                                                                                                "not": {
+                                                                                                                                  "filter": {
+                                                                                                                                    "not": {
+                                                                                                                                      "filter": {
+                                                                                                                                        "not": {
+                                                                                                                                          "filter": {
+                                                                                                                                            "not": {
+                                                                                                                                              "filter": {
+                                                                                                                                                "not": {
+                                                                                                                                                  "filter": {
+                                                                                                                                                    "not": {
+                                                                                                                                                      "filter": {
+                                                                                                                                                        "not": {
+                                                                                                                                                          "filter": {
+                                                                                                                                                            "not": {
+                                                                                                                                                              "filter": {
+                                                                                                                                                                "not": {
+                                                                                                                                                                  "filter": {
+                                                                                                                                                                    "not": {
+                                                                                                                                                                      "filter": {
+                                                                                                                                                                        "not": {
+                                                                                                                                                                          "filter": {
+                                                                                                                                                                            "not": {
+                                                                                                                                                                              "filter": {
+                                                                                                                                                                                "not": {
+                                                                                                                                                                                  "filter": {
+                                                                                                                                                                                    "not": {
+                                                                                                                                                                                      "filter": {
+                                                                                                                                                                                        "not": {
+                                                                                                                                                                                          "filter": {
+                                                                                                                                                                                            "not": {
+                                                                                                                                                                                              "filter": {
+                                                                                                                                                                                                "not": {
+                                                                                                                                                                                                  "filter": {
+                                                                                                                                                                                                    "not": {
+                                                                                                                                                                                                      "filter": {
+                                                                                                                                                                                                        "not": {
+                                                                                                                                                                                                          "filter": {
+                                                                                                                                                                                                            "not": {
+                                                                                                                                                                                                              "filter": {
+                                                                                                                                                                                                                "not": {
+                                                                                                                                                                                                                  "filter": {
+                                                                                                                                                                                                                    "not": {
+                                                                                                                                                                                                                      "filter": {
+                                                                                                                                                                                                                        "not": {
+                                                                                                                                                                                                                          "filter": {
+                                                                                                                                                                                                                            "not": {
+                                                                                                                                                                                                                              "filter": {
+                                                                                                                                                                                                                                "not": {
+                                                                                                                                                                                                                                  "filter": {
+                                                                                                                                                                                                                                    "not": {
+                                                                                                                                                                                                                                      "filter": {
+                                                                                                                                                                                                                                        "not": {
+                                                                                                                                                                                                                                          "filter": {
+                                                                                                                                                                                                                                            "not": {
+                                                                                                                                                                                                                                              "filter": {
+                                                                                                                                                                                                                                                "not": {
+                                                                                                                                                                                                                                                  "filter": {
+                                                                                                                                                                                                                                                    "not": {
+                                                                                                                                                                                                                                                      "filter": {
+                                                                                                                                                                                                                                                        "not": {
+                                                                                                                                                                                                                                                          "filter": {
+                                                                                                                                                                                                                                                            "not": {
+                                                                                                                                                                                                                                                              "filter": {
+                                                                                                                                                                                                                                                                "not": {
+                                                                                                                                                                                                                                                                  "filter": {
+                                                                                                                                                                                                                                                                    "not": {
+                                                                                                                                                                                                                                                                      "filter": {
+                                                                                                                                                                                                                                                                        "not": {
+                                                                                                                                                                                                                                                                          "filter": {
+                                                                                                                                                                                                                                                                            "not": {
+                                                                                                                                                                                                                                                                              "filter": {
+                                                                                                                                                                                                                                                                                "not": {
+                                                                                                                                                                                                                                                                                  "filter": {
+                                                                                                                                                                                                                                                                                    "not": {
+                                                                                                                                                                                                                                                                                      "filter": {
+                                                                                                                                                                                                                                                                                        "not": {
+                                                                                                                                                                                                                                                                                          "filter": {
+                                                                                                                                                                                                                                                                                            "not": {
+                                                                                                                                                                                                                                                                                              "filter": {
+                                                                                                                                                                                                                                                                                                "not": {
+                                                                                                                                                                                                                                                                                                  "filter": {
+                                                                                                                                                                                                                                                                                                    "not": {
+                                                                                                                                                                                                                                                                                                      "filter": {
+                                                                                                                                                                                                                                                                                                        "not": {
+                                                                                                                                                                                                                                                                                                          "filter": {
+                                                                                                                                                                                                                                                                                                            "not": {
+                                                                                                                                                                                                                                                                                                              "filter": {
+                                                                                                                                                                                                                                                                                                                "not": {
+                                                                                                                                                                                                                                                                                                                  "filter": {
+                                                                                                                                                                                                                                                                                                                    "not": {
+                                                                                                                                                                                                                                                                                                                      "filter": {
+                                                                                                                                                                                                                                                                                                                        "not": {
+                                                                                                                                                                                                                                                                                                                          "filter": {
+                                                                                                                                                                                                                                                                                                                            "not": {
+                                                                                                                                                                                                                                                                                                                              "filter": {
+                                                                                                                                                                                                                                                                                                                                "not": {
+                                                                                                                                                                                                                                                                                                                                  "filter": {
+                                                                                                                                                                                                                                                                                                                                    "not": {
+                                                                                                                                                                                                                                                                                                                                      "filter": {
+                                                                                                                                                                                                                                                                                                                                        "not": {
+                                                                                                                                                                                                                                                                                                                                          "filter": {
+                                                                                                                                                                                                                                                                                                                                            "not": {
+                                                                                                                                                                                                                                                                                                                                              "filter": {
+                                                                                                                                                                                                                                                                                                                                                "not": {
+                                                                                                                                                                                                                                                                                                                                                  "filter": {
+                                                                                                                                                                                                                                                                                                                                                    "not": {
+                                                                                                                                                                                                                                                                                                                                                      "filter": {
+                                                                                                                                                                                                                                                                                                                                                        "not": {
+                                                                                                                                                                                                                                                                                                                                                          "filter": {
+                                                                                                                                                                                                                                                                                                                                                            "not": {
+                                                                                                                                                                                                                                                                                                                                                              "filter": {
+                                                                                                                                                                                                                                                                                                                                                                "not": {
+                                                                                                                                                                                                                                                                                                                                                                  "filter": {
+                                                                                                                                                                                                                                                                                                                                                                    "not": {
+                                                                                                                                                                                                                                                                                                                                                                      "filter": {
+                                                                                                                                                                                                                                                                                                                                                                        "not": {
+                                                                                                                                                                                                                                                                                                                                                                          "filter": {
+                                                                                                                                                                                                                                                                                                                                                                            "not": {
+                                                                                                                                                                                                                                                                                                                                                                              "filter": {
+                                                                                                                                                                                                                                                                                                                                                                                "not": {
+                                                                                                                                                                                                                                                                                                                                                                                  "filter": {
+                                                                                                                                                                                                                                                                                                                                                                                    "not": {
+                                                                                                                                                                                                                                                                                                                                                                                      "filter": {
+                                                                                                                                                                                                                                                                                                                                                                                        "not": {
+                                                                                                                                                                                                                                                                                                                                                                                          "filter": {
+                                                                                                                                                                                                                                                                                                                                                                                            "not": {
+                                                                                                                                                                                                                                                                                                                                                                                              "filter": {
+                                                                                                                                                                                                                                                                                                                                                                                                "not": {
+                                                                                                                                                                                                                                                                                                                                                                                                  "filter": {
+                                                                                                                                                                                                                                                                                                                                                                                                    "not": {
+                                                                                                                                                                                                                                                                                                                                                                                                      "filter": {
+                                                                                                                                                                                                                                                                                                                                                                                                        "not": {
+                                                                                                                                                                                                                                                                                                                                                                                                          "filter": {
+                                                                                                                                                                                                                                                                                                                                                                                                            "not": {
+                                                                                                                                                                                                                                                                                                                                                                                                              "filter": {
+                                                                                                                                                                                                                                                                                                                                                                                                                "not": {
+                                                                                                                                                                                                                                                                                                                                                                                                                  "filter": {
+                                                                                                                                                                                                                                                                                                                                                                                                                    "not": {
+                                                                                                                                                                                                                                                                                                                                                                                                                      "filter": {
+                                                                                                                                                                                                                                                                                                                                                                                                                        "not": {
+                                                                                                                                                                                                                                                                                                                                                                                                                          "filter": {
+                                                                                                                                                                                                                                                                                                                                                                                                                            "address": {
+                                                                                                                                                                                                                                                                                                                                                                                                                              "hardcodedPrefix": "t-0:",
+                                                                                                                                                                                                                                                                                                                                                                                                                              "role": "ADDRESS_ROLE_ANY"
+                                                                                                                                                                                                                                                                                                                                                                                                                            }
+                                                                                                                                                                                                                                                                                                                                                                                                                          }
+                                                                                                                                                                                                                                                                                                                                                                                                                        }
+                                                                                                                                                                                                                                                                                                                                                                                                                      }
+                                                                                                                                                                                                                                                                                                                                                                                                                    }
+                                                                                                                                                                                                                                                                                                                                                                                                                  }
+                                                                                                                                                                                                                                                                                                                                                                                                                }
+                                                                                                                                                                                                                                                                                                                                                                                                              }
+                                                                                                                                                                                                                                                                                                                                                                                                            }
+                                                                                                                                                                                                                                                                                                                                                                                                          }
+                                                                                                                                                                                                                                                                                                                                                                                                        }
+                                                                                                                                                                                                                                                                                                                                                                                                      }
+                                                                                                                                                                                                                                                                                                                                                                                                    }
+                                                                                                                                                                                                                                                                                                                                                                                                  }
+                                                                                                                                                                                                                                                                                                                                                                                                }
+                                                                                                                                                                                                                                                                                                                                                                                              }
+                                                                                                                                                                                                                                                                                                                                                                                            }
+                                                                                                                                                                                                                                                                                                                                                                                          }
+                                                                                                                                                                                                                                                                                                                                                                                        }
+                                                                                                                                                                                                                                                                                                                                                                                      }
+                                                                                                                                                                                                                                                                                                                                                                                    }
+                                                                                                                                                                                                                                                                                                                                                                                  }
+                                                                                                                                                                                                                                                                                                                                                                                }
+                                                                                                                                                                                                                                                                                                                                                                              }
+                                                                                                                                                                                                                                                                                                                                                                            }
+                                                                                                                                                                                                                                                                                                                                                                          }
+                                                                                                                                                                                                                                                                                                                                                                        }
+                                                                                                                                                                                                                                                                                                                                                                      }
+                                                                                                                                                                                                                                                                                                                                                                    }
+                                                                                                                                                                                                                                                                                                                                                                  }
+                                                                                                                                                                                                                                                                                                                                                                }
+                                                                                                                                                                                                                                                                                                                                                              }
+                                                                                                                                                                                                                                                                                                                                                            }
+                                                                                                                                                                                                                                                                                                                                                          }
+                                                                                                                                                                                                                                                                                                                                                        }
+                                                                                                                                                                                                                                                                                                                                                      }
+                                                                                                                                                                                                                                                                                                                                                    }
+                                                                                                                                                                                                                                                                                                                                                  }
+                                                                                                                                                                                                                                                                                                                                                }
+                                                                                                                                                                                                                                                                                                                                              }
+                                                                                                                                                                                                                                                                                                                                            }
+                                                                                                                                                                                                                                                                                                                                          }
+                                                                                                                                                                                                                                                                                                                                        }
+                                                                                                                                                                                                                                                                                                                                      }
+                                                                                                                                                                                                                                                                                                                                    }
+                                                                                                                                                                                                                                                                                                                                  }
+                                                                                                                                                                                                                                                                                                                                }
+                                                                                                                                                                                                                                                                                                                              }
+                                                                                                                                                                                                                                                                                                                            }
+                                                                                                                                                                                                                                                                                                                          }
+                                                                                                                                                                                                                                                                                                                        }
+                                                                                                                                                                                                                                                                                                                      }
+                                                                                                                                                                                                                                                                                                                    }
+                                                                                                                                                                                                                                                                                                                  }
+                                                                                                                                                                                                                                                                                                                }
+                                                                                                                                                                                                                                                                                                              }
+                                                                                                                                                                                                                                                                                                            }
+                                                                                                                                                                                                                                                                                                          }
+                                                                                                                                                                                                                                                                                                        }
+                                                                                                                                                                                                                                                                                                      }
+                                                                                                                                                                                                                                                                                                    }
+                                                                                                                                                                                                                                                                                                  }
+                                                                                                                                                                                                                                                                                                }
+                                                                                                                                                                                                                                                                                              }
+                                                                                                                                                                                                                                                                                            }
+                                                                                                                                                                                                                                                                                          }
+                                                                                                                                                                                                                                                                                        }
+                                                                                                                                                                                                                                                                                      }
+                                                                                                                                                                                                                                                                                    }
+                                                                                                                                                                                                                                                                                  }
+                                                                                                                                                                                                                                                                                }
+                                                                                                                                                                                                                                                                              }
+                                                                                                                                                                                                                                                                            }
+                                                                                                                                                                                                                                                                          }
+                                                                                                                                                                                                                                                                        }
+                                                                                                                                                                                                                                                                      }
+                                                                                                                                                                                                                                                                    }
+                                                                                                                                                                                                                                                                  }
+                                                                                                                                                                                                                                                                }
+                                                                                                                                                                                                                                                              }
+                                                                                                                                                                                                                                                            }
+                                                                                                                                                                                                                                                          }
+                                                                                                                                                                                                                                                        }
+                                                                                                                                                                                                                                                      }
+                                                                                                                                                                                                                                                    }
+                                                                                                                                                                                                                                                  }
+                                                                                                                                                                                                                                                }
+                                                                                                                                                                                                                                              }
+                                                                                                                                                                                                                                            }
+                                                                                                                                                                                                                                          }
+                                                                                                                                                                                                                                        }
+                                                                                                                                                                                                                                      }
+                                                                                                                                                                                                                                    }
+                                                                                                                                                                                                                                  }
+                                                                                                                                                                                                                                }
+                                                                                                                                                                                                                              }
+                                                                                                                                                                                                                            }
+                                                                                                                                                                                                                          }
+                                                                                                                                                                                                                        }
+                                                                                                                                                                                                                      }
+                                                                                                                                                                                                                    }
+                                                                                                                                                                                                                  }
+                                                                                                                                                                                                                }
+                                                                                                                                                                                                              }
+                                                                                                                                                                                                            }
+                                                                                                                                                                                                          }
+                                                                                                                                                                                                        }
+                                                                                                                                                                                                      }
+                                                                                                                                                                                                    }
+                                                                                                                                                                                                  }
+                                                                                                                                                                                                }
+                                                                                                                                                                                              }
+                                                                                                                                                                                            }
+                                                                                                                                                                                          }
+                                                                                                                                                                                        }
+                                                                                                                                                                                      }
+                                                                                                                                                                                    }
+                                                                                                                                                                                  }
+                                                                                                                                                                                }
+                                                                                                                                                                              }
+                                                                                                                                                                            }
+                                                                                                                                                                          }
+                                                                                                                                                                        }
+                                                                                                                                                                      }
+                                                                                                                                                                    }
+                                                                                                                                                                  }
+                                                                                                                                                                }
+                                                                                                                                                              }
+                                                                                                                                                            }
+                                                                                                                                                          }
+                                                                                                                                                        }
+                                                                                                                                                      }
+                                                                                                                                                    }
+                                                                                                                                                  }
+                                                                                                                                                }
+                                                                                                                                              }
+                                                                                                                                            }
+                                                                                                                                          }
+                                                                                                                                        }
+                                                                                                                                      }
+                                                                                                                                    }
+                                                                                                                                  }
+                                                                                                                                }
+                                                                                                                              }
+                                                                                                                            }
+                                                                                                                          }
+                                                                                                                        }
+                                                                                                                      }
+                                                                                                                    }
+                                                                                                                  }
+                                                                                                                }
+                                                                                                              }
+                                                                                                            }
+                                                                                                          }
+                                                                                                        }
+                                                                                                      }
+                                                                                                    }
+                                                                                                  }
+                                                                                                }
+                                                                                              }
+                                                                                            }
+                                                                                          }
+                                                                                        }
+                                                                                      }
+                                                                                    }
+                                                                                  }
+                                                                                }
+                                                                              }
+                                                                            }
+                                                                          }
+                                                                        }
+                                                                      }
+                                                                    }
+                                                                  }
+                                                                }
+                                                              }
+                                                            }
+                                                          }
+                                                        }
+                                                      }
+                                                    }
+                                                  }
+                                                }
+                                              }
+                                            }
+                                          }
+                                        }
+                                      }
+                                    }
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "name": "depth-past-max",
+      "refused": true,
+      "target": "ACCOUNTS"
+    },
+    {
+      "filter": {
+        "builtinUint": {
+          "cond": {
+            "max": "3",
+            "min": "9"
+          },
+          "field": "TX_BUILTIN_INDEX_ID"
+        }
+      },
+      "name": "inverted-range",
+      "refused": false,
+      "target": "TRANSACTIONS"
+    }
+  ]
+}
