@@ -77,6 +77,9 @@ func init() {
 	registerAsserter(ac.EvAuditFailuresUniquePerPropsl, func(_ bool, d map[string]any) {
 		assert.Unreachable("oracle: audit failure entries are unique per proposal", d)
 	})
+	registerAsserter(ac.EvAuditRejectedBulkMissesFailure, func(_ bool, d map[string]any) {
+		assert.Unreachable("oracle: a rejected keyed bulk has a failure audit entry", d)
+	})
 
 	// Must-hit coverage reached by task 10's rules (see HG/porting/10-audit.md).
 	registerAsserter(ac.EvAuditPageValidated, func(_ bool, d map[string]any) {
@@ -90,9 +93,6 @@ func init() {
 	})
 	registerAsserter(ac.EvAuditUnassignedNotFound, func(_ bool, d map[string]any) {
 		assert.Reachable("oracle: audit entry read on an unassigned sequence returned NotFound", d)
-	})
-	registerAsserter(ac.EvAuditFailureMatchedRejection, func(_ bool, d map[string]any) {
-		assert.Reachable("oracle: audit failure entry matched a model rejection", d)
 	})
 	registerAsserter(ac.EvAuditBatchKeyMatched, func(_ bool, d map[string]any) {
 		assert.Reachable("oracle: audit entry batch key matched the model", d)
@@ -123,5 +123,18 @@ func init() {
 	})
 	registerAsserter(ac.EvAuditMalformedCursorRejected, func(_ bool, d map[string]any) {
 		assert.Reachable("oracle: malformed audit cursor rejected", d)
+	})
+
+	// Must-hit coverage task 10 cannot reach alone (Requests to 99 in
+	// HG/porting/10-audit.md): tracked rejections come from tasks 02/03, and a
+	// retryable FSM-stage failure needs faults.
+	registerAsserter(ac.EvAuditFailureMatchedRejection, func(_ bool, d map[string]any) {
+		assert.Reachable("oracle: audit failure entry matched a model rejection", d)
+	})
+	registerAsserter(ac.EvAuditRetryableFailureUnjudged, func(_ bool, d map[string]any) {
+		assert.Reachable("oracle: audit failure entry with a retryable reason left unjudged", d)
+	})
+	registerAsserter(ac.EvAuditFailureOwedChecked, func(_ bool, d map[string]any) {
+		assert.Reachable("oracle: rejected keyed bulk checked for its failure audit entry", d)
 	})
 }

@@ -33,6 +33,13 @@ type Model struct {
 	// FrozenRejected reports a key whose only write (no conflict body, no
 	// other writer) ended in a definitive-frozen rejection at the FSM stage.
 	FrozenRejected func(key string) bool
+	// FrozenObservedAt is, for a FrozenRejected key, the ticket counter when
+	// its rejection was observed (WriteRecord.ObserveTicket); 0 otherwise. A
+	// linearizable read with a greater ticket began after the rejection, so
+	// its failure audit entry was already written. Nil means unknown.
+	FrozenObservedAt func(key string) uint64
+	// Registered reports a key the oracle registered at least one write for.
+	Registered func(key string) bool
 }
 
 // Tracked reports whether e is the record of a tracked bulk: its key carries
@@ -129,6 +136,15 @@ func ModelOf(t *oc.Tracker, maxTicket uint64) Model {
 			return false
 		},
 		FrozenRejected: func(key string) bool { return frozenRejected(t.WritesByKey(key)) },
+		FrozenObservedAt: func(key string) uint64 {
+			recs := t.WritesByKey(key)
+			if !frozenRejected(recs) {
+				return 0
+			}
+
+			return recs[0].ObserveTicket
+		},
+		Registered: func(key string) bool { return len(t.WritesByKey(key)) > 0 },
 	}
 }
 

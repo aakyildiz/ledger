@@ -487,6 +487,10 @@ func TestListRefusalsAndErrors(t *testing.T) {
 	require.Equal(t, []oc.EventID{EvAuditPageContract}, testutil.IDs(readList(t, s, listReq(nil, 1, "", false), oc.Outcome{OK: true, Complete: true, Items: []json.RawMessage{entryJSON(t, e), entryJSON(t, e2)}})))
 	// An incomplete page is not judged.
 	require.Empty(t, readList(t, s, listReq(nil, 1, "", false), oc.Outcome{OK: true, Items: []json.RawMessage{entryJSON(t, e), entryJSON(t, e2)}}))
+	// ...but an OK answer to a malformed cursor or a refused probe is reported
+	// even when the client stopped at its item cap.
+	require.Equal(t, []oc.EventID{EvAuditMalformedCursorResults}, testutil.IDs(readList(t, s, listReq(nil, 1, "1.0", false), oc.Outcome{OK: true, Items: []json.RawMessage{entryJSON(t, e)}})))
+	require.Equal(t, []oc.EventID{EvAuditUnsupportedFilterPage}, testutil.IDs(readList(t, s, listReq(not, 1, "", false), oc.Outcome{OK: true, Items: []json.RawMessage{entryJSON(t, e)}})))
 }
 
 // failureEntry renders the audit entry the server writes for a rejected bulk.
@@ -533,6 +537,11 @@ func TestBulkAtomicityPerKey(t *testing.T) {
 	evs = readList(t, s, listReq(keyFilter, 10, "", false), oc.Outcome{OK: true, Complete: true, Items: []json.RawMessage{entryJSON(t, fail)}})
 	require.Empty(t, testutil.Findings(evs), "%v", evs)
 	require.True(t, hasEvent(evs, EvAuditFailureMatchedRejection))
+	require.True(t, hasEvent(evs, EvAuditFailureOwedChecked))
+
+	// A whole page of the rejected key's filter with no failure entry.
+	evs = readList(t, s, listReq(keyFilter, 10, "", false), oc.Outcome{OK: true, Complete: true})
+	require.Equal(t, []oc.EventID{EvAuditRejectedBulkMissesFailure}, testutil.IDs(testutil.Findings(evs)))
 
 	// A success entry under the rejected key is a violation.
 	succ := &auditpb.AuditEntry{Sequence: 3, ProposalId: 8, Ledgers: []string{l}, OrderCount: 1, Idempotency: &commonpb.Idempotency{Key: rec.Key},
@@ -569,4 +578,103 @@ func TestBulkAtomicityPerKey(t *testing.T) {
 	evs = readList(t, s, listReq(match.FilterAuditString(commonpb.AuditField_AUDIT_FIELD_IDEMPOTENCY_KEY, orig.Key), 10, "", false),
 		oc.Outcome{OK: true, Complete: true, Items: []json.RawMessage{entryJSON(t, origEntry), entryJSON(t, c1), entryJSON(t, c2)}})
 	require.Empty(t, testutil.Findings(evs), "%v", evs)
+}
+
+// A retryable FSM-stage failure whose error is not an UncommittedFailure is
+// audited but not frozen (machine.go recordIdempotencyFailure); the driver
+// retries the key, which then commits. The audited failure has no recorded
+// rejection, and once the key settles it must be left unjudged rather than
+// reported unexplained. (BALANCE_NOT_PRELOADED and the other
+// UncommittedReasons are never audited and stay findings.)
+func TestRetryableFailureThenSuccessUnderOneKey(t *testing.T) {
+	t.Parallel()
+	m := testModel([]uint64{42}, []uint64{42})
+	key := tKey + "9"
+	m.Registered = func(k string) bool { return k == key }
+	retry := match.AuditEntry{Seq: 3, ProposalID: 5, IdemKey: key, Ledgers: []string{tLedger}, OrderCount: 1, Failed: true, Reason: "INDEX_INCONSISTENT"}
+	require.False(t, oc.IsDefinitiveReason(retry.Reason))
+	require.False(t, oc.UncommittedReason(retry.Reason))
+	success := ok(4, 42)
+	success.IdemKey = key
+	v := ValidatePage(m, nil, page([]match.AuditEntry{retry, success}, nil, false, 50, 0, ""))
+	require.Nil(t, v.Finding, "%+v", v.Finding)
+	require.Equal(t, 1, v.Unjudged)
+	require.Zero(t, v.Rejections)
+
+	// A definitive reason with no recorded rejection is still unexplained.
+	def := retry
+	def.Reason = "INSUFFICIENT_FUNDS"
+	require.True(t, oc.IsDefinitiveReason(def.Reason))
+	require.Equal(t, EvAuditFailureUnexplained, findingID(ValidatePage(m, nil, page([]match.AuditEntry{def, success}, nil, false, 50, 0, ""))))
+
+	// A reason the server never audits stays a finding, registered or not.
+	never := retry
+	never.Reason = "BALANCE_NOT_PRELOADED"
+	require.Equal(t, EvAuditFailureUnexplained, findingID(ValidatePage(m, nil, page([]match.AuditEntry{never, success}, nil, false, 50, 0, ""))))
+
+	// A retryable reason under a key the oracle never registered is judged.
+	m.Registered = func(string) bool { return false }
+	require.Equal(t, EvAuditFailureUnexplained, findingID(ValidatePage(m, nil, page([]match.AuditEntry{retry}, nil, false, 50, 0, ""))))
+}
+
+// The failure half of the old bulk-atomicity driver: a whole first page of an
+// exact key filter, read after the key's frozen rejection was observed, holds
+// a failure entry under the key.
+func TestRejectedKeyOwesAFailureEntry(t *testing.T) {
+	t.Parallel()
+	m := testModel(nil, nil)
+	key := tKey + "7"
+	m.FrozenRejected = func(k string) bool { return k == key }
+	m.FrozenObservedAt = func(k string) uint64 {
+		if k == key {
+			return 10
+		}
+
+		return 0
+	}
+	filter := match.FilterAuditString(commonpb.AuditField_AUDIT_FIELD_IDEMPOTENCY_KEY, key)
+	fail := match.AuditEntry{Seq: 4, ProposalID: 11, IdemKey: key, Ledgers: []string{tLedger}, OrderCount: 1, Failed: true, Reason: "INSUFFICIENT_FUNDS"}
+	m.Rejections = map[oc.RejectedBulk]struct{}{{Ledgers: tLedger, Orders: 1, Reason: "INSUFFICIENT_FUNDS"}: {}}
+	withTicket := func(p Page, tk uint64) Page { p.ReadTicket = tk; return p }
+
+	v := ValidatePage(m, nil, withTicket(page([]match.AuditEntry{fail}, filter, false, 10, 0, ""), 11))
+	require.Nil(t, v.Finding)
+	require.True(t, v.FailureOwedChecked)
+
+	v = ValidatePage(m, nil, withTicket(page(nil, filter, false, 10, 0, ""), 11))
+	require.Equal(t, EvAuditRejectedBulkMissesFailure, findingID(v))
+
+	// Not judged: a read that began before the observation, a resumed page,
+	// a full page, a prefix filter, a key not rejected for good.
+	for name, p := range map[string]Page{
+		"read before":  withTicket(page(nil, filter, false, 10, 0, ""), 10),
+		"no ticket":    page(nil, filter, false, 10, 0, ""),
+		"resumed page": withTicket(page(nil, filter, false, 10, 3, ""), 11),
+		"prefix":       withTicket(page(nil, &commonpb.QueryFilter{Filter: &commonpb.QueryFilter_Audit{Audit: &commonpb.AuditCondition{Field: commonpb.AuditField_AUDIT_FIELD_IDEMPOTENCY_KEY, Condition: &commonpb.AuditCondition_StringPrefix{StringPrefix: key}}}}, false, 10, 0, ""), 11),
+		"other key":    withTicket(page(nil, match.FilterAuditString(commonpb.AuditField_AUDIT_FIELD_IDEMPOTENCY_KEY, tKey+"8"), false, 10, 0, ""), 11),
+	} {
+		v := ValidatePage(m, nil, p)
+		require.Nil(t, v.Finding, name)
+		require.False(t, v.FailureOwedChecked, name)
+	}
+	full := withTicket(page([]match.AuditEntry{ok(5, 0)}, filter, false, 1, 0, ""), 11)
+	full.Entries[0].IdemKey = "r-foreign"
+	full.Entries[0].Ledgers = []string{"default"}
+	require.False(t, ValidatePage(m, nil, full).FailureOwedChecked, "a full page")
+}
+
+// At most SamplesPerPage entries of a page become samples, spread over it.
+func TestSamplesSpreadOverThePage(t *testing.T) {
+	t.Parallel()
+	s := &state{known: map[uint64]knownEntry{}}
+	var entries []match.AuditEntry
+	for i := range uint64(20) {
+		entries = append(entries, match.AuditEntry{Seq: i + 1})
+	}
+	s.noteSamples(entries, nil)
+	require.Len(t, s.samples, SamplesPerPage)
+	require.Equal(t, uint64(1), s.samples[0].Seq)
+	require.Equal(t, uint64(20), s.samples[SamplesPerPage-1].Seq)
+	s.noteSamples(entries[:2], nil)
+	require.Len(t, s.samples, SamplesPerPage+2)
 }

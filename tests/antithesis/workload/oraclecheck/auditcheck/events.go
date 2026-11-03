@@ -50,9 +50,14 @@ const (
 	EvAuditForeignTouchedTracked   oc.EventID = "oracle: a foreign proposal touched a tracked ledger"
 	EvAuditRejectedBulkHasSuccess  oc.EventID = "oracle: a rejected keyed bulk has no success audit entry"
 	EvAuditFailuresUniquePerPropsl oc.EventID = "oracle: audit failure entries are unique per proposal"
+	// The failure half of the old driver's "failure audit entry observed for
+	// failed atomic bulk", restricted to keys rejected for good at the FSM
+	// stage and observed before the read began.
+	EvAuditRejectedBulkMissesFailure oc.EventID = "oracle: a rejected keyed bulk has a failure audit entry"
 
 	// Must-hit coverage (Reachable), reached by task 10's rules without faults
-	// (EvAuditFailureMatchedRejection needs tracked FSM rejections: tasks 02/03).
+	// (EvAuditFailureMatchedRejection needs tracked FSM rejections from tasks
+	// 02/03 and is listed under "Requests to 99" in HG/porting/10-audit.md).
 	EvAuditPageValidated           oc.EventID = "oracle: audit page validated"
 	EvAuditEntryReadValidated      oc.EventID = "oracle: audit entry read validated"
 	EvAuditEntryCarriedItems       oc.EventID = "oracle: audit entry carried its per-order items"
@@ -68,4 +73,11 @@ const (
 	EvAuditNulPrefixRejected       oc.EventID = "oracle: idempotency-key prefix containing NUL rejected"
 	EvAuditNotRejected             oc.EventID = "oracle: audit not filter rejected"
 	EvAuditMalformedCursorRejected oc.EventID = "oracle: malformed audit cursor rejected"
+
+	// Coverage that needs faults (a retryable FSM-stage failure audited under
+	// a tracked key) or task 02/03's rejection generators; listed under
+	// "Requests to 99" in HG/porting/10-audit.md and excluded from task 10's
+	// acceptance.
+	EvAuditRetryableFailureUnjudged oc.EventID = "oracle: audit failure entry with a retryable reason left unjudged"
+	EvAuditFailureOwedChecked       oc.EventID = "oracle: rejected keyed bulk checked for its failure audit entry"
 )

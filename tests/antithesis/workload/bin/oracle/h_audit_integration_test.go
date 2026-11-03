@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"strconv"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -145,6 +146,13 @@ func TestIntegration_AuditReads(t *testing.T) {
 		}
 	}
 
+	// Every tracked key on its own: the doomed overdraft's key is rejected
+	// for good, so its whole first page must hold its failure entry (checked
+	// against the real server's key index).
+	for i := 1; i <= 6; i++ {
+		list(&commonpb.ListOptions{PageSize: 10, Filter: match.FilterAuditString(commonpb.AuditField_AUDIT_FIELD_IDEMPOTENCY_KEY, c.Prefix+"k"+strconv.Itoa(i))})
+	}
+
 	// Refused probes and malformed cursors.
 	nul := &commonpb.QueryFilter{Filter: &commonpb.QueryFilter_Audit{Audit: &commonpb.AuditCondition{Field: commonpb.AuditField_AUDIT_FIELD_IDEMPOTENCY_KEY,
 		Condition: &commonpb.AuditCondition_StringPrefix{StringPrefix: "o-\x00bad"}}}}
@@ -179,6 +187,7 @@ func TestIntegration_AuditReads(t *testing.T) {
 		ac.EvAuditFailureMatchedRejection, ac.EvAuditBatchKeyMatched, ac.EvAuditJudgedAgainstKnown, ac.EvAuditCursorCorroborated,
 		ac.EvAuditSeqInOrRejected, ac.EvAuditUnspecifiedRejected, ac.EvAuditTypeMismatchRejected, ac.EvAuditKeyParamRejected,
 		ac.EvAuditNulPrefixRejected, ac.EvAuditNotRejected, ac.EvAuditMalformedCursorRejected,
+		ac.EvAuditFailureOwedChecked,
 	} {
 		require.Positive(t, coverage[string(id)], "%s not reached", id)
 	}

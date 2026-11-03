@@ -89,11 +89,6 @@ func ValidateListAuditEntries(c *oc.ReadCtx) []oc.Event {
 			"filter": filter, "cursor": req.Cursor, "malformed": malformed, "error": errText(o),
 		})}
 	}
-	if !o.Complete {
-		// The client stopped at its item cap: the page is not whole.
-		return nil
-	}
-
 	entries := make([]match.AuditEntry, 0, len(o.Items))
 	for i, raw := range o.Items {
 		e, err := decodeEntry(raw)
@@ -107,6 +102,12 @@ func ValidateListAuditEntries(c *oc.ReadCtx) []oc.Event {
 	}
 	if probe != ProbeNone {
 		return []oc.Event{oc.Violation(EvAuditUnsupportedFilterPage, map[string]any{"filter": filter, "rows": len(entries)})}
+	}
+	if !o.Complete {
+		// The client stopped at its item cap: the page is not whole, so the
+		// page contract and the model checks have nothing to judge. The
+		// refusals above hold for any OK answer, whole or not.
+		return nil
 	}
 
 	m := ModelOf(c.T, c.MaxTicket)
@@ -126,7 +127,7 @@ func ValidateListAuditEntries(c *oc.ReadCtx) []oc.Event {
 	}
 
 	known := st.knownBefore(c.Ticket)
-	v := ValidatePage(m, known, Page{Entries: entries, Filter: req.Filter, Reverse: req.Reverse, PageSize: req.PageSize, AfterSeq: afterSeq, Next: next})
+	v := ValidatePage(m, known, Page{Entries: entries, Filter: req.Filter, Reverse: req.Reverse, PageSize: req.PageSize, AfterSeq: afterSeq, Next: next, ReadTicket: c.Ticket})
 	if v.Finding != nil {
 		return []oc.Event{findingEvent(v.Finding, d)}
 	}
@@ -147,6 +148,12 @@ func ValidateListAuditEntries(c *oc.ReadCtx) []oc.Event {
 	evs = append(evs, oc.Reached(EvAuditPageValidated, map[string]any{"filter": filter, "rows": len(entries)}))
 	if v.Rejections > 0 {
 		evs = append(evs, oc.Reached(EvAuditFailureMatchedRejection, map[string]any{"rejections": v.Rejections}))
+	}
+	if v.Unjudged > 0 {
+		evs = append(evs, oc.Reached(EvAuditRetryableFailureUnjudged, map[string]any{"unjudged": v.Unjudged}))
+	}
+	if v.FailureOwedChecked {
+		evs = append(evs, oc.Reached(EvAuditFailureOwedChecked, map[string]any{"filter": filter}))
 	}
 	if v.KnownCertified > 0 {
 		evs = append(evs, oc.Reached(EvAuditJudgedAgainstKnown, map[string]any{"certified": v.KnownCertified}))
@@ -189,7 +196,8 @@ func ValidateGetAuditEntry(c *oc.ReadCtx) []oc.Event {
 
 	m := ModelOf(c.T, c.MaxTicket)
 	d := map[string]any{"sequence": seq, "maxTicket": c.MaxTicket}
-	if f, _ := checkEntry(m, e, nil); f != nil {
+	f, ev := checkEntry(m, e, nil)
+	if f != nil {
 		return []oc.Event{findingEvent(f, d)}
 	}
 	st := stateOf(c.T)
@@ -199,6 +207,9 @@ func ValidateGetAuditEntry(c *oc.ReadCtx) []oc.Event {
 	st.rememberKnown([]match.AuditEntry{e}, c.T.ReadFrontier())
 
 	evs := []oc.Event{oc.Reached(EvAuditEntryReadValidated, map[string]any{})}
+	if ev == entryUnjudged {
+		evs = append(evs, oc.Reached(EvAuditRetryableFailureUnjudged, map[string]any{"unjudged": 1}))
+	}
 	if len(e.ItemSeqs) > 0 {
 		evs = append(evs, oc.Reached(EvAuditEntryCarriedItems, map[string]any{"orders": len(e.ItemSeqs)}))
 	}

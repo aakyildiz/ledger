@@ -92,6 +92,8 @@ pub struct Sample {
     pub failed: bool,
     pub min_log: u64,
     pub max_log: u64,
+    /// The order types the oracle's model committed under this entry.
+    pub order_types: Vec<String>,
 }
 
 fn num(v: &Value, k: &str) -> u64 {
@@ -121,6 +123,7 @@ pub fn parse_samples(v: &Value) -> Vec<Sample> {
                     failed: s["outcome"] == "failure",
                     min_log: num(s, "minLog"),
                     max_log: num(s, "maxLog"),
+                    order_types: strs(&s["orderTypes"]),
                 })
                 .collect()
         })
@@ -328,8 +331,17 @@ pub fn gen_leaf(tc: &TestCase, g: &GenCtx, indexed: bool) -> Value {
         }
         7 => key_leaf(tc, g),
         _ => {
-            let token = if chance(tc, 1.0 / 8.0) { "no_such_order" } else { one_of(tc, &ORDER_TYPES) };
-            audit_string("AUDIT_FIELD_ORDER_TYPE", token)
+            // Aimed at an order type the sample's bulk committed most of the
+            // time, so the order-type scope check and the known-entry
+            // certification see selective filters that match.
+            let token: String = if chance(tc, 1.0 / 8.0) {
+                "no_such_order".to_string()
+            } else if !g.sample.order_types.is_empty() && chance(tc, 0.75) {
+                one_of(tc, &g.sample.order_types).clone()
+            } else {
+                one_of(tc, &ORDER_TYPES).to_string()
+            };
+            audit_string("AUDIT_FIELD_ORDER_TYPE", &token)
         }
     }
 }
@@ -529,6 +541,26 @@ mod tests {
         assert_eq!(s[0].min_log, 5);
         assert!(s[1].failed);
         assert_eq!(s[1].subject, "svc");
+        assert_eq!(s[0].order_types, vec!["create_transaction".to_string()]);
+        assert!(s[1].order_types.is_empty());
+    }
+
+    #[test]
+    fn order_type_leaves_aim_at_the_sample() {
+        let samples = parse_samples(&sample_view());
+        let aimed = std::sync::atomic::AtomicUsize::new(0);
+        testkit::with_tc_n(400, |tc| {
+            let g = GenCtx { sample: samples[0].clone(), ledgers: vec![], key_prefix: "o-test-k".into(), log_seq: 5 };
+            let leaf = gen_leaf(tc, &g, false);
+            if leaf["audit"]["field"] == "AUDIT_FIELD_ORDER_TYPE" {
+                let token = leaf["audit"]["stringCond"]["hardcoded"].as_str().unwrap().to_string();
+                assert!(token == "no_such_order" || ORDER_TYPES.contains(&token.as_str()), "{token}");
+                if token == "create_transaction" {
+                    aimed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        });
+        assert!(aimed.load(std::sync::atomic::Ordering::Relaxed) > 0);
     }
 
     /// The fixed builder shapes (one per generator arm and every refused

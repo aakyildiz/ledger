@@ -26,6 +26,14 @@ type Verdict struct {
 	// Rejections counts the tracked failure entries a recorded rejection
 	// explained.
 	Rejections int
+	// Unjudged counts tracked failure entries with a non-definitive
+	// (retryable) reason under a key the oracle registered: the server audits
+	// them without freezing them, the driver retries the key, and the model
+	// records no rejection for them, so no verdict is possible.
+	Unjudged int
+	// FailureOwedChecked marks a key-filtered page that was held to the
+	// bulk-atomicity "a rejected keyed bulk has a failure audit entry" rule.
+	FailureOwedChecked bool
 	// KnownCertified counts the remembered entries the filter certainly
 	// selects; CursorCorroborated marks a page whose resume cursor one of them
 	// proved was owed.
@@ -41,27 +49,39 @@ type Page struct {
 	PageSize int    // effective
 	AfterSeq uint64 // decoded cursor, 0 for the first page
 	Next     string // the next cursor's key ("" when none)
+	// ReadTicket is the read's ticket (0 when unknown: the rules that need
+	// the read to have begun after an observation are skipped).
+	ReadTicket uint64
 }
+
+// entryVerdict is checkEntry's classification of an entry that holds.
+type entryVerdict int
+
+const (
+	entryHolds entryVerdict = iota
+	entryExplained
+	entryUnjudged
+)
 
 // checkEntry holds one entry to the per-entry rules (M/audit.go
 // validateAuditPage's loop body and validateAuditEntry), with foreign
 // tolerance: a foreign entry must only stay out of the tracked ledgers; a
 // tracked one is the model's own record of a bulk. explained is set for a
 // tracked failure a recorded rejection explained.
-func checkEntry(m Model, e match.AuditEntry, filter *commonpb.QueryFilter) (f *Finding, explained bool) {
+func checkEntry(m Model, e match.AuditEntry, filter *commonpb.QueryFilter) (*Finding, entryVerdict) {
 	if !m.Tracked(e) {
 		if l, touched := m.trackedLedger(e); touched {
 			return &Finding{ID: EvAuditForeignTouchedTracked, Entry: match.DescribeAuditEntry(e),
-				Why: "foreign key " + strconv.Quote(e.IdemKey) + " names tracked ledger " + l}, false
+				Why: "foreign key " + strconv.Quote(e.IdemKey) + " names tracked ledger " + l}, entryHolds
 		}
 
-		return nil, false
+		return nil, entryHolds
 	}
 
 	// System-scoped orders (query checkpoints, maintenance mode) touch no
 	// ledger and are not judged here, as in the singleton.
 	if len(e.Ledgers) == 0 {
-		return nil, false
+		return nil, entryHolds
 	}
 
 	if e.Failed {
@@ -69,37 +89,46 @@ func checkEntry(m Model, e match.AuditEntry, filter *commonpb.QueryFilter) (f *F
 		// (machine.go), so no tracked entry may carry one of those reasons.
 		if oc.UncommittedReason(e.Reason) {
 			return &Finding{ID: EvAuditFailureUnexplained, Entry: match.DescribeAuditEntry(e),
-				Why: "the server never audits a failure with reason " + e.Reason}, false
+				Why: "the server never audits a failure with reason " + e.Reason}, entryHolds
 		}
 		if m.rejectionExplains(e) {
-			return nil, true
+			return nil, entryExplained
 		}
 		if m.Outstanding(e.IdemKey) {
-			return nil, false
+			return nil, entryHolds
+		}
+		// A retryable failure (reason outside D) is audited but not frozen
+		// (machine.go recordIdempotencyFailure); the client saw it as
+		// non-definitive and the driver retried the key, which may since have
+		// committed or failed for another reason. The model records only
+		// definitive rejections, so such an entry under a registered key is
+		// left unjudged.
+		if !oc.IsDefinitiveReason(e.Reason) && m.Registered != nil && m.Registered(e.IdemKey) {
+			return nil, entryUnjudged
 		}
 
 		return &Finding{ID: EvAuditFailureUnexplained, Entry: match.DescribeAuditEntry(e),
-			Why: "no recorded rejection with these ledgers, order count and reason"}, false
+			Why: "no recorded rejection with these ledgers, order count and reason"}, entryHolds
 	}
 
 	// Bulk atomicity (MD/parallel_driver_bulk_atomicity, audit half): the only
 	// write under this key was rejected for good, so nothing under it commits.
 	if m.FrozenRejected != nil && m.FrozenRejected(e.IdemKey) {
 		return &Finding{ID: EvAuditRejectedBulkHasSuccess, Entry: match.DescribeAuditEntry(e),
-			Why: "the only write under key " + e.IdemKey + " was definitively rejected at the FSM stage"}, false
+			Why: "the only write under key " + e.IdemKey + " was definitively rejected at the FSM stage"}, entryHolds
 	}
 
 	if e.MinLog > m.CommittedMax {
 		if m.Outstanding(e.IdemKey) {
-			return nil, false
+			return nil, entryHolds
 		}
 
 		return &Finding{ID: EvAuditNamesUncommittedLogs, Entry: match.DescribeAuditEntry(e),
-			Why: "committed frontier is " + u(m.CommittedMax), Missing: e.MinLog}, false
+			Why: "committed frontier is " + u(m.CommittedMax), Missing: e.MinLog}, entryHolds
 	}
 
 	if why, missing := match.AuditSuccessMismatch(e, m.Logs, m.Bulks, m.CommittedMax); why != "" {
-		return &Finding{ID: EvAuditOutsideModel, Entry: match.DescribeAuditEntry(e), Why: why, Missing: missing}, false
+		return &Finding{ID: EvAuditOutsideModel, Entry: match.DescribeAuditEntry(e), Why: why, Missing: missing}, entryHolds
 	}
 
 	// The order types the model committed under this entry's logs are the only
@@ -109,11 +138,11 @@ func checkEntry(m Model, e match.AuditEntry, filter *commonpb.QueryFilter) (f *F
 		types := match.CommittedOrderTypes(e, m.Logs)
 		if !match.AuditEntryMatches(filter, e, types) {
 			return &Finding{ID: EvAuditOutsideOrderType, Entry: match.DescribeAuditEntry(e),
-				Why: "model committed " + strings.Join(slices.Sorted(maps.Keys(types)), ",")}, false
+				Why: "model committed " + strings.Join(slices.Sorted(maps.Keys(types)), ",")}, entryHolds
 		}
 	}
 
-	return nil, false
+	return nil, entryHolds
 }
 
 // ValidatePage checks a served page against the model and the remembered
@@ -124,12 +153,32 @@ func checkEntry(m Model, e match.AuditEntry, filter *commonpb.QueryFilter) (f *F
 func ValidatePage(m Model, known []match.AuditEntry, p Page) Verdict {
 	var v Verdict
 	for _, e := range p.Entries {
-		f, explained := checkEntry(m, e, p.Filter)
+		f, ev := checkEntry(m, e, p.Filter)
 		if f != nil {
 			return Verdict{Finding: f}
 		}
-		if explained {
+		switch ev {
+		case entryExplained:
 			v.Rejections++
+		case entryUnjudged:
+			v.Unjudged++
+		}
+	}
+
+	// Bulk atomicity, failure half (MD/parallel_driver_bulk_atomicity
+	// "failure audit entry observed for failed atomic bulk"): a whole page of
+	// an exact key filter, read after the key's only write was rejected for
+	// good at the FSM stage, holds at least one failure entry under it. The
+	// FSM writes the failure entry in the batch that freezes the outcome.
+	if key, ok := exactKeyFilter(p.Filter); ok && p.AfterSeq == 0 && len(p.Entries) < p.PageSize &&
+		m.FrozenRejected != nil && m.FrozenRejected(key) && m.FrozenObservedAt != nil && p.ReadTicket != 0 {
+		if at := m.FrozenObservedAt(key); at != 0 && at < p.ReadTicket {
+			v.FailureOwedChecked = true
+			if !slices.ContainsFunc(p.Entries, func(e match.AuditEntry) bool { return e.Failed && e.IdemKey == key }) {
+				return Verdict{Finding: &Finding{ID: EvAuditRejectedBulkMissesFailure, Entry: "key " + key,
+					Why: "the key's only write was rejected for good at the FSM stage (observed at ticket " + u(at) +
+						") but a whole page of its key filter holds no failure entry"}}
+			}
 		}
 	}
 
@@ -156,6 +205,25 @@ func ValidatePage(m Model, known []match.AuditEntry, p Page) Verdict {
 	v.KnownCertified, v.CursorCorroborated = k.KnownCertified, k.CursorCorroborated
 
 	return v
+}
+
+// exactKeyFilter returns the key when filter is exactly one hardcoded
+// AUDIT_FIELD_IDEMPOTENCY_KEY equality leaf.
+func exactKeyFilter(filter *commonpb.QueryFilter) (string, bool) {
+	a := filter.GetAudit()
+	if a == nil || a.GetField() != commonpb.AuditField_AUDIT_FIELD_IDEMPOTENCY_KEY {
+		return "", false
+	}
+	sc := a.GetStringCond()
+	if sc == nil {
+		return "", false
+	}
+	h, ok := sc.GetValue().(*commonpb.StringCondition_Hardcoded)
+	if !ok {
+		return "", false
+	}
+
+	return h.Hardcoded, true
 }
 
 // knownMatchViolation judges a page against the entries the trail already
@@ -233,10 +301,6 @@ func DuplicateProposalViolation(m Model, known, entries []match.AuditEntry) *Fin
 	if m.FrozenRejected == nil {
 		return nil
 	}
-	type seen struct {
-		seq uint64
-		e   match.AuditEntry
-	}
 	bySeq := map[uint64]match.AuditEntry{}
 	for _, e := range known {
 		bySeq[e.Seq] = e
@@ -256,7 +320,7 @@ func DuplicateProposalViolation(m Model, known, entries []match.AuditEntry) *Fin
 	for k := range keys {
 		qualifies[k] = m.FrozenRejected(k)
 	}
-	first := map[string]map[uint64]seen{}
+	first := map[string]map[uint64]uint64{}
 	for _, seq := range seqs {
 		e := bySeq[seq]
 		if !e.Failed || !qualifies[e.IdemKey] {
@@ -264,14 +328,14 @@ func DuplicateProposalViolation(m Model, known, entries []match.AuditEntry) *Fin
 		}
 		props := first[e.IdemKey]
 		if props == nil {
-			props = map[uint64]seen{}
+			props = map[uint64]uint64{}
 			first[e.IdemKey] = props
 		}
 		if prev, dup := props[e.ProposalID]; dup {
 			return &Finding{ID: EvAuditFailuresUniquePerPropsl, Entry: match.DescribeAuditEntry(e),
-				Why: "proposal " + u(e.ProposalID) + " under key " + e.IdemKey + " is also audited at seq" + u(prev.seq)}
+				Why: "proposal " + u(e.ProposalID) + " under key " + e.IdemKey + " is also audited at seq " + u(prev)}
 		}
-		props[e.ProposalID] = seen{seq: seq, e: e}
+		props[e.ProposalID] = seq
 	}
 
 	return nil

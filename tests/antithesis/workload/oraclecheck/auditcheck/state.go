@@ -20,6 +20,10 @@ const KnownCap = 4096
 // SampleCap bounds the aiming samples the auditSamples view serves.
 const SampleCap = 32
 
+// SamplesPerPage bounds what one served page contributes to the ring, so the
+// samples span many pages instead of being the last page served.
+const SamplesPerPage = 4
+
 // knownEntry is a remembered audit entry and the ticket frontier when the
 // read that served it ended: a read whose ticket is greater began after it
 // and, being linearizable, must see it (the singleton's auditLearnSeq).
@@ -92,10 +96,11 @@ func (s *state) knownBefore(readTicket uint64) []match.AuditEntry {
 	return out
 }
 
-// noteSamples remembers the indexed fields of a served page, replacing the
-// oldest sample once the ring is full.
+// noteSamples remembers the indexed fields of at most SamplesPerPage entries
+// of a served page, spread evenly over it, replacing the oldest sample once
+// the ring is full.
 func (s *state) noteSamples(entries []match.AuditEntry, logs map[uint64]match.CommittedLog) {
-	for _, e := range entries {
+	for _, e := range spread(entries, SamplesPerPage) {
 		smp := Sample{
 			Seq: e.Seq, ProposalID: e.ProposalID, Timestamp: e.Timestamp, Subject: e.Subject, Key: e.IdemKey,
 			Ledgers: slices.Clone(e.Ledgers), Outcome: "success", MinLog: e.MinLog, MaxLog: e.MaxLog,
@@ -120,6 +125,20 @@ func (s *state) noteSamples(entries []match.AuditEntry, logs map[uint64]match.Co
 		s.samples[s.sampleNext] = smp
 		s.sampleNext = (s.sampleNext + 1) % SampleCap
 	}
+}
+
+// spread picks at most n entries spread evenly over entries (all of them when
+// there are no more than n), always including the first and the last.
+func spread(entries []match.AuditEntry, n int) []match.AuditEntry {
+	if len(entries) <= n {
+		return entries
+	}
+	out := make([]match.AuditEntry, 0, n)
+	for i := range n {
+		out = append(out, entries[i*(len(entries)-1)/(n-1)])
+	}
+
+	return out
 }
 
 // SamplesView is the auditSamples view: the sampled served entries, ordered
