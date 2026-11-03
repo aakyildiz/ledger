@@ -26,6 +26,8 @@ pub mod smoke;
 // ==== 11-quiet-exact mods ====
 // ==== end 11-quiet-exact mods ====
 // ==== 12-cluster-ops-signals mods ====
+pub mod cluster_ops;
+pub mod server_signals;
 // ==== end 12-cluster-ops-signals mods ====
 // ==== 13-numscript mods ====
 // ==== end 13-numscript mods ====
@@ -64,6 +66,7 @@ pub fn rules() -> Vec<ConcurrentRule<Driver>> {
     // ==== 11-quiet-exact rules ====
     // ==== end 11-quiet-exact rules ====
     // ==== 12-cluster-ops-signals rules ====
+    v.extend(cluster_ops::rules());
     // ==== end 12-cluster-ops-signals rules ====
     // ==== 13-numscript rules ====
     // ==== end 13-numscript rules ====
@@ -225,6 +228,7 @@ pub fn setup_hooks() -> Vec<crate::setup::SetupHook> {
     // ==== 11-quiet-exact setup_hooks ====
     // ==== end 11-quiet-exact setup_hooks ====
     // ==== 12-cluster-ops-signals setup_hooks ====
+    v.extend(cluster_ops::setup_hooks());
     // ==== end 12-cluster-ops-signals setup_hooks ====
     // ==== 13-numscript setup_hooks ====
     // ==== end 13-numscript setup_hooks ====
@@ -265,6 +269,7 @@ pub fn log_hooks() -> Vec<crate::logs::LogHook> {
     // ==== 11-quiet-exact log_hooks ====
     // ==== end 11-quiet-exact log_hooks ====
     // ==== 12-cluster-ops-signals log_hooks ====
+    v.extend(server_signals::log_hooks());
     // ==== end 12-cluster-ops-signals log_hooks ====
     // ==== 13-numscript log_hooks ====
     // ==== end 13-numscript log_hooks ====
