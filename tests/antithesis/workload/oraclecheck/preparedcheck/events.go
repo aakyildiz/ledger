@@ -14,10 +14,13 @@
 //     the request carries "owned": true);
 //   - the begin hook prepared-serialize, which refuses (`409 serialized`) a
 //     bulk touching a prepared query (ledger, name) that an outstanding bulk
-//     already touches, so the FSM-stage FILTER_COMPILATION_ERROR of an update
-//     (definitive-unfrozen, DESIGN §4.5) repeats on every attempt;
+//     already touches, an update mixed with other orders, an update racing
+//     a deletion of its ledger, and, after an update failed uncommitted, a
+//     create or delete of its names or ledger until the next quiet period, so
+//     the FSM-stage FILTER_COMPILATION_ERROR of an update (definitive-unfrozen,
+//     DESIGN §4.5) repeats on every attempt;
 //   - the failure hook prepared-failures (coverage of the save-time
-//     rejections).
+//     rejections, and the post-ticket blocks).
 //
 // The stored definition is always re-read from each candidate base, never
 // from a driver-side copy: a concurrent update makes the stored filter

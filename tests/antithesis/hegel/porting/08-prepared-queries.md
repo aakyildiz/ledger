@@ -24,7 +24,7 @@ order gens), `W/oraclecheck/testdata/rejections/08-*.json`, `HG/protocol-fixture
 | M/prepared_queries_read.go:547 | Unreachable: prepared query page outside model | oracle: prepared query page outside model | preparedcheck/execute.go |
 | M/prepared_queries_read.go:849 | Unreachable: prepared query aggregate outside model | oracle: prepared query aggregate outside model | preparedcheck/execute.go |
 | M/prepared_queries_read.go:272 (`dbgf PQPARAM`) | debug trace | dropped: debug only; the spoiled-parameter path is covered by the window check | – |
-| M/validate.go:563 | Reachable: malformed prepared-query filter refused at save | oracle: malformed prepared-query filter refused at save | preparedcheck/serialize.go `FailureCoverage` (any explained FILTER_COMPILATION_ERROR of a bulk that saves a filter) |
+| M/validate.go:563 | Reachable: malformed prepared-query filter refused at save | oracle: malformed prepared-query filter refused at save | preparedcheck/serialize.go `FailureCoverage` (an explained admission-stage FILTER_COMPILATION_ERROR of a bulk that saves a filter, create or update; the FSM-stage update refusal has its own literal below) |
 | MD/parallel_driver_queries/main.go:52 | Unreachable: prepared query creation returned unexpected error | oracle (every definitive write outcome is explained by `validateFailure`, core `oracle: bulk failure not explained by any serialization`; non-definitive outcomes are retried) | (00a) |
 | MD/parallel_driver_queries/main.go:69 | Sometimes: should be able to execute prepared query | oracle: prepared query page validated (new Reachable on a validated successful page) | preparedcheck/execute.go |
 | MD/parallel_driver_queries/main.go:74 | AlwaysOrUnreachable: prepared query should return a response | oracle: prepared query page outside model (a success without a cursor result is `WrongResult`, outside every candidate) | preparedcheck/execute.go |
@@ -40,7 +40,7 @@ order gens), `W/oraclecheck/testdata/rejections/08-*.json`, `HG/protocol-fixture
 | MD/parallel_driver_projection_alignment/main.go:172 | Unreachable: projection-aligned prepared query returned unexpected error | oracle: prepared query execution returned unexpected error / page outside model | preparedcheck/execute.go |
 | MD/parallel_driver_projection_alignment/main.go:178 | Reachable: projection-aligned prepared query succeeded | verbatim | rules/prepared.rs projection_probe (successful execute after both writes succeeded) |
 | MD/parallel_driver_projection_alignment/main.go:182 | Unreachable: projection-aligned prepared query returned no cursor result | oracle: prepared query page outside model (`WrongResult`) | preparedcheck/execute.go |
-| MD/parallel_driver_projection_alignment/main.go:196 | Always: projection-aligned read includes the acknowledged write | oracle: prepared query page outside model (the exact window on every candidate is a superset check: the acknowledged write precedes the read's ticket, so it is in every candidate base; a missing row is outside the window). Not re-asserted verbatim: on the shared `o-<run>-l1` the reserved account need not fall on the first page of 100, so the outcome is not deterministic | preparedcheck/execute.go |
+| MD/parallel_driver_projection_alignment/main.go:196 | Always: projection-aligned read includes the acknowledged write | oracle: prepared query page outside model (the exact window on every candidate is a superset check: the acknowledged write precedes the read's ticket, so it is in every candidate base; a missing row is outside the window). To keep the probe account inside a checked window on the shared `o-<run>-l1`, the probe reads ascending pages of 1000 and follows the server cursor (one ticket per page, `prevTicket`) until a page lists the account or an address after it (at most 4 pages); its drawn branch uses an asset no generator writes (precision 1..255 except 2), so the account is among few matches. Not re-asserted verbatim: on the shared ledger the outcome (index state, traversal length) is not deterministic | preparedcheck/execute.go, rules/prepared.rs projection_probe |
 
 ## New properties
 
@@ -51,9 +51,26 @@ order gens), `W/oraclecheck/testdata/rejections/08-*.json`, `HG/protocol-fixture
 - `oracle: an update with a filter invalid for the stored target is refused` (Reachable):
   failure hook on an explained FSM-stage FILTER_COMPILATION_ERROR of an update (the
   definitive-unfrozen class of DESIGN §4.5).
-- Begin hook `prepared-serialize` (`409 serialized`, not an assertion): a bulk touching a
-  prepared query `(ledger, name)` while another in-flight or pending bulk touches it, or a
-  bulk that creates and updates/deletes the same name.
+- Begin hook `prepared-serialize` (`409 serialized`, not an assertion). It keeps the
+  outcome of an update's FSM-stage FILTER_COMPILATION_ERROR (uncommitted, re-evaluated on
+  every attempt) the same for every attempt, including one that reaches the server after
+  the ticket ended. A prepared-query-only bulk's outcome depends only on whether each named
+  query exists, its stored target and whether its ledger is live. The hook refuses:
+  - a bulk with an update and any order that is not a prepared-query order (its outcome
+    would depend on balances and other state); `pq_update` also `applies` only to
+    single-order bulks, so composed bulks (task 02's `tx_bulk`) never carry one;
+  - a bulk that creates and updates/deletes the same name;
+  - a bulk touching a prepared query `(ledger, name)` while another in-flight or pending
+    bulk touches it;
+  - a bulk updating a prepared query of a ledger an outstanding bulk deletes, and a
+    DeleteLedger of a ledger an outstanding bulk updates a prepared query of;
+  - after a ticket ended with an FSM-stage failure whose reason is in
+    `oracle.UncommittedReasons`, until the next `/quiet/begin` (faults stopped, every
+    client answered a barrier, nothing in flight): a create or delete of a prepared query
+    it names, or a DeleteLedger of its ledger (`blockTable`; updates stay allowed, they
+    never change a target). This closes a hole DESIGN §4.5 leaves open: the hook only
+    serialized for the ticket's life, while a delayed attempt (relative `grpc-timeout`)
+    can still be evaluated after the ticket ended; §4.5 should say so (request to 99).
 - View `preparedQueries`: `{"queries":[{name,target,params:[{name,kind}]}]}`, `own-` names
   hidden unless `"owned": true`.
 
@@ -86,10 +103,24 @@ integration test (`bin/oracle/h_prepared_integration_test.go`), and the Rust lit
   and the driver supplies no model data. A follow-up whose previous page is unknown or whose
   cursor differs is not judged.
 - Targets are ACCOUNTS and TRANSACTIONS only (spec), not LOGS as in `M/`.
+- Draws after `/read/begin` (DESIGN §4.7): `prepared_execute` draws the fallback pool name,
+  the parameter spoil mode and three values per parameter kind before begin; after begin it
+  only draws indices (the query among the stored ones, the spoiled reference, a value per
+  reference).
+- Every malformed shape `malformed_filter` sends (`{"address":{}}`, a field condition
+  without a field reference, `reverted` on ACCOUNTS, has-asset on TRANSACTIONS) is in the
+  protocol fixture `malformed-filters.json` (strict decode + server validators) and in the
+  rejection fixtures `08-pq-{create,update}-*` (stage and freeze against a real server),
+  and goes through the integration test.
 - `own-pq-asset<N>` queries stay on `o-<run>-l1` (one per probe, weight 0.3); they are
   listed by ListPreparedQueries and compared like any other stored query.
 
 ## Requests to 99
+
+- DESIGN §4.5 "definitive-unfrozen": amend to say the serialization holds beyond the
+  ticket's life (until the next quiet period) and also covers ledger deletion and
+  non-prepared-query orders in the same bulk (see the begin hook above). In degraded mode
+  (no `/quiet/begin`) blocked names stay blocked; the oracle is off anyway.
 
 - `projection-aligned prepared query succeeded` needs task 07's `index_bootstrap` (asset
   index on `o-<run>-l1`); excluded from this task's acceptance.

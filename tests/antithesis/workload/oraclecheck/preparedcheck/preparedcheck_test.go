@@ -227,6 +227,116 @@ func TestBeginSerializeSameBulkCreateAndModify(t *testing.T) {
 	require.Nil(t, ref)
 }
 
+func TestBeginSerializeUpdateOnlyWithPreparedQueryOrders(t *testing.T) {
+	t.Parallel()
+	s := testutil.NewSession("")
+	l1 := s.Ledger(1)
+	require.Empty(t, testutil.Findings(s.Write(false, testutil.CreateLedgerReq(l1))))
+	tx := testutil.TxReq(l1, "", "world", "users:1", "COIN", 1)
+	// Nothing outstanding: an update with any other kind of order is refused.
+	for _, other := range []*servicepb.Request{tx, testutil.DeleteLedgerReq(s.Ledger(2)), testutil.AccountMetaReq(l1, "users:1", "k", "v")} {
+		_, _, _, ref := s.T.BeginWrite(s.Record(false, updatePQ(l1, "q-1", nil), other))
+		require.NotNil(t, ref)
+		require.Equal(t, oc.CodeSerialized, ref.Code)
+	}
+	// Creates and deletes may share a bulk with other orders; an update may
+	// share one with other prepared-query orders.
+	for _, reqs := range [][]*servicepb.Request{
+		{createPQ(l1, "q-1", accts, nil), tx},
+		{deletePQ(l1, "q-2"), tx},
+		{updatePQ(l1, "q-3", nil), deletePQ(l1, "q-4"), createPQ(l1, "q-5", txs, nil)},
+	} {
+		tk, _, _, ref := s.T.BeginWrite(s.Record(false, reqs...))
+		require.Nil(t, ref)
+		_, err := s.T.AbandonWrite(tk, 0)
+		require.Nil(t, err)
+	}
+}
+
+func TestBeginSerializeLedgerDelete(t *testing.T) {
+	t.Parallel()
+	s := testutil.NewSession("")
+	l1, l2 := s.Ledger(1), s.Ledger(2)
+	require.Empty(t, testutil.Findings(s.Write(false, testutil.CreateLedgerReq(l1), testutil.CreateLedgerReq(l2))))
+	begin := func(reqs ...*servicepb.Request) (uint64, *oc.Refusal) {
+		tk, _, _, ref := s.T.BeginWrite(s.Record(false, reqs...))
+
+		return tk, ref
+	}
+
+	// An outstanding update serializes the deletion of its ledger only.
+	upd, ref := begin(updatePQ(l1, "q-1", nil))
+	require.Nil(t, ref)
+	_, ref = begin(testutil.DeleteLedgerReq(l1))
+	require.NotNil(t, ref)
+	require.Equal(t, oc.CodeSerialized, ref.Code)
+	del2, ref := begin(testutil.DeleteLedgerReq(l2))
+	require.Nil(t, ref)
+	_, err := s.T.AbandonWrite(upd, 0)
+	require.Nil(t, err)
+
+	// An outstanding ledger deletion serializes updates on that ledger, not
+	// creates or deletes (their failures are frozen).
+	_, ref = begin(updatePQ(l2, "q-1", nil))
+	require.NotNil(t, ref)
+	require.Equal(t, oc.CodeSerialized, ref.Code)
+	for _, r := range []*servicepb.Request{createPQ(l2, "q-1", accts, nil), deletePQ(l2, "q-2"), updatePQ(l1, "q-1", nil)} {
+		tk, ref := begin(r)
+		require.Nil(t, ref)
+		_, err := s.T.AbandonWrite(tk, 0)
+		require.Nil(t, err)
+	}
+	_, err = s.T.AbandonWrite(del2, 0)
+	require.Nil(t, err)
+	_, ref = begin(updatePQ(l2, "q-1", nil))
+	require.Nil(t, ref)
+}
+
+// After an update ticket ends with the FSM-stage FILTER_COMPILATION_ERROR,
+// a late attempt can still be evaluated: a create or delete of its query, or
+// a delete of its ledger, is refused until the next quiet period begins.
+func TestBeginSerializeBlocksAfterUncommittedUpdate(t *testing.T) {
+	t.Parallel()
+	s := fixture(t)
+	l1 := s.Ledger(1)
+	require.Empty(t, pc.Blocked(s.T))
+	evs := s.Write(true, updatePQ(l1, "q-2", hasAsset("USD", 2))) // q-2 is a TRANSACTIONS query
+	require.Empty(t, testutil.Findings(evs), "%+v", evs)
+	require.True(t, reached(evs, pc.EvUpdateInvalidForStoredTarget))
+	require.Equal(t, []pc.PQRef{{Ledger: l1, Name: "q-2"}}, pc.Blocked(s.T))
+
+	// Other failures and successes block nothing.
+	require.Empty(t, testutil.Findings(s.Write(true, updatePQ(l1, "q-77", nil))))
+	require.Empty(t, testutil.Findings(s.Write(true, createPQ(l1, "q-9", accts, &commonpb.QueryFilter{Filter: &commonpb.QueryFilter_Address{Address: &commonpb.AddressMatch{}}}))))
+	require.Len(t, pc.Blocked(s.T), 1)
+
+	begin := func(reqs ...*servicepb.Request) *oc.Refusal {
+		tk, _, _, ref := s.T.BeginWrite(s.Record(false, reqs...))
+		if ref == nil {
+			_, err := s.T.AbandonWrite(tk, 0)
+			require.Nil(t, err)
+		}
+
+		return ref
+	}
+	for _, r := range []*servicepb.Request{deletePQ(l1, "q-2"), createPQ(l1, "q-2", accts, nil), testutil.DeleteLedgerReq(l1)} {
+		ref := begin(r)
+		require.NotNil(t, ref, "%v", r)
+		require.Equal(t, oc.CodeSerialized, ref.Code)
+	}
+	for _, r := range []*servicepb.Request{updatePQ(l1, "q-2", prefix("users:")), deletePQ(l1, "q-1"), createPQ(s.Ledger(2), "q-2", accts, nil), testutil.DeleteLedgerReq(s.Ledger(2))} {
+		require.Nil(t, begin(r), "%v", r)
+	}
+
+	// The next quiet period releases the block.
+	_, ref := s.T.BeginQuiet(1)
+	require.Nil(t, ref)
+	require.True(t, s.T.EndQuiet(1))
+	require.Empty(t, pc.Blocked(s.T))
+	require.Nil(t, begin(deletePQ(l1, "q-2")))
+	require.Nil(t, begin(testutil.DeleteLedgerReq(l1)))
+}
+
 // ---- view ----
 
 func TestPreparedQueriesView(t *testing.T) {
@@ -463,7 +573,7 @@ func TestFailureCoverage(t *testing.T) {
 	evs = s.Write(true, updatePQ(l1, "q-2", hasAsset("USD", 2)))
 	require.Empty(t, testutil.Findings(evs), "%+v", evs)
 	require.True(t, reached(evs, pc.EvUpdateInvalidForStoredTarget))
-	require.True(t, reached(evs, pc.EvMalformedFilterRefused))
+	require.False(t, reached(evs, pc.EvMalformedFilterRefused), "the save-time literal is the admission refusal only")
 	// Never frozen: not replayable.
 	for _, e := range s.T.Replayable() {
 		require.NotEqual(t, "FILTER_COMPILATION_ERROR", e.Reason)

@@ -36,13 +36,21 @@ pub fn rules() -> Vec<ConcurrentRule<Driver>> {
 pub fn order_gens() -> Vec<OrderGen> {
     vec![
         OrderGen { name: "pq_create", weight: 0.3, applies: always, has_opt_in: false, gen: gen_pq_create },
-        OrderGen { name: "pq_update", weight: 0.2, applies: always, has_opt_in: false, gen: gen_pq_update },
+        OrderGen { name: "pq_update", weight: 0.2, applies: alone, has_opt_in: false, gen: gen_pq_update },
         OrderGen { name: "pq_delete", weight: 0.15, applies: always, has_opt_in: false, gen: gen_pq_delete },
     ]
 }
 
 fn always(_: &BulkCtx) -> bool {
     true
+}
+
+/// `pq_update` only in a single-order bulk: the oracle refuses (`serialized`)
+/// an update sharing a bulk with other orders, because its FSM-stage
+/// FILTER_COMPILATION_ERROR is re-evaluated on every attempt and must not
+/// depend on balances or other state (DESIGN §4.5).
+fn alone(ctx: &BulkCtx) -> bool {
+    ctx.len == 1
 }
 
 // ---------------------------------------------------------------- domains
@@ -296,6 +304,10 @@ pub struct ExecPlan {
     pub target_probe: bool,
     /// Draw a pool name instead of a stored one.
     pub pool: Option<String>,
+    /// The pool name executed when nothing is stored.
+    pub fallback: String,
+    /// Parameter values drawn before `/read/begin`; picked by index after.
+    pub values: ParamPool,
     pub page_size: u64,
     pub reverse: bool,
     /// The follow-up page resumes in the opposite direction.
@@ -310,11 +322,13 @@ pub fn plan_exec(d: &Driver, tc: &TestCase) -> ExecPlan {
     let reverse_probe = aggregate && draw::chance(tc, 1.0 / 8.0);
     let target_probe = aggregate && draw::chance(tc, 1.0 / 8.0);
     let pool = if draw::chance(tc, 1.0 / 8.0) { Some(pool_name(tc)) } else { None };
+    let fallback = pool_name(tc);
+    let values = ParamPool::draw(tc);
     let page_size = exec_page_size(tc);
     let reverse = !aggregate && draw::chance(tc, 0.5);
     let flip = draw::chance(tc, 0.25);
     let follow_route = draw::route(tc, &d.s);
-    ExecPlan { pick, route, aggregate, reverse_probe, target_probe, pool, page_size, reverse, flip, follow_route }
+    ExecPlan { pick, route, aggregate, reverse_probe, target_probe, pool, fallback, values, page_size, reverse, flip, follow_route }
 }
 
 /// One stored query of the `preparedQueries` view.
@@ -361,6 +375,44 @@ pub fn param_value(tc: &TestCase, kind: &str) -> Value {
     }
 }
 
+pub const PARAM_KINDS: [&str; 5] = ["address", "string", "uint", "int", "bool"];
+/// Values drawn per kind before `/read/begin`.
+pub const VALUES_PER_KIND: usize = 3;
+
+/// How `draw_params` spoils the parameters.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Spoil {
+    None,
+    Missing,
+    Mistyped,
+}
+
+/// Every value draw of an execution's parameters, made before `/read/begin`
+/// (DESIGN §4.7): `VALUES_PER_KIND` values per kind and the spoil mode. After
+/// begin, only indices into these are drawn.
+#[derive(Clone, Debug)]
+pub struct ParamPool {
+    pub by_kind: Vec<(&'static str, Vec<Value>)>,
+    pub spoil: Spoil,
+}
+
+impl ParamPool {
+    pub fn draw(tc: &TestCase) -> Self {
+        let by_kind = PARAM_KINDS.iter().map(|k| (*k, (0..VALUES_PER_KIND).map(|_| param_value(tc, k)).collect())).collect();
+        let spoil = match draw::int_in(tc, 0, 7) {
+            0 => Spoil::Missing,
+            1 => Spoil::Mistyped,
+            _ => Spoil::None,
+        };
+        ParamPool { by_kind, spoil }
+    }
+
+    fn values(&self, kind: &str) -> &[Value] {
+        let k = if PARAM_KINDS.contains(&kind) { kind } else { "bool" };
+        self.by_kind.iter().find(|(n, _)| *n == k).map(|(_, v)| v.as_slice()).unwrap_or(&[])
+    }
+}
+
 /// A value of a type the kind's condition rejects.
 pub fn mistyped_value(kind: &str) -> Value {
     if kind == "uint" || kind == "int" {
@@ -370,26 +422,30 @@ pub fn mistyped_value(kind: &str) -> Value {
     }
 }
 
-/// Parameters for the stored references: one value per reference; 1/8 one
-/// reference left out, 1/8 one bound with the wrong type.
-pub fn draw_params(tc: &TestCase, params: &[(String, String)]) -> Map<String, Value> {
+/// Parameters for the stored references from the pre-drawn pool (index draws
+/// only): one value per reference; 1/8 one reference left out, 1/8 one bound
+/// with the wrong type.
+pub fn draw_params(tc: &TestCase, pool: &ParamPool, params: &[(String, String)]) -> Map<String, Value> {
     let mut out = Map::new();
     if params.is_empty() {
         return out;
     }
-    let spoil = match draw::int_in(tc, 0, 7) {
-        0 => Some((draw::pick(tc, params.len()), true)),
-        1 => Some((draw::pick(tc, params.len()), false)),
-        _ => None,
+    let spoiled = match pool.spoil {
+        Spoil::None => None,
+        s => Some((draw::pick(tc, params.len()), s)),
     };
     for (i, (name, kind)) in params.iter().enumerate() {
-        match spoil {
-            Some((j, true)) if j == i => continue,
-            Some((j, false)) if j == i => {
+        match spoiled {
+            Some((j, Spoil::Missing)) if j == i => continue,
+            Some((j, Spoil::Mistyped)) if j == i => {
                 out.insert(name.clone(), mistyped_value(kind));
             }
             _ => {
-                out.insert(name.clone(), param_value(tc, kind));
+                let vs = pool.values(kind);
+                if vs.is_empty() {
+                    continue;
+                }
+                out.insert(name.clone(), vs[draw::pick(tc, vs.len())].clone());
             }
         }
     }
@@ -410,7 +466,7 @@ pub fn choose_query(tc: &TestCase, plan: &ExecPlan, stored: &[StoredQuery]) -> S
     };
     let list: Vec<&StoredQuery> = if preferred.is_empty() { stored.iter().collect() } else { preferred };
     if list.is_empty() {
-        return StoredQuery { name: pool_name(tc), target: String::new(), params: vec![] };
+        return StoredQuery { name: plan.fallback.clone(), target: String::new(), params: vec![] };
     }
     list[draw::pick(tc, list.len())].clone()
 }
@@ -475,7 +531,7 @@ pub fn prepared_execute(d: &Driver, tc: TestCase) {
         let ledger = ledger_of(&v)?;
         let stored = parse_queries(&v);
         let q = choose_query(tc, &plan, &stored);
-        let params = draw_params(tc, &q.params);
+        let params = draw_params(tc, &plan.values, &q.params);
         let req = exec_request(&ledger, &q, &params, &plan);
         let opts = CallOpts::linearizable();
         let (_, out) = d.call(&plan.route, "bucket", "ExecutePreparedQuery", req.clone(), &opts);
@@ -500,13 +556,29 @@ pub fn prepared_execute(d: &Driver, tc: TestCase) {
 /// Chain budget for the probe's two writes.
 pub const PROBE_CHAIN_BUDGET: Duration = Duration::from_secs(12);
 
-/// `USD/2` (fixed regression branch, 1/2) or a drawn base and precision
-/// `0..=255` (`domain.MaxHasAssetPrecision`).
+/// Page size of the probe's execution (served unchanged).
+pub const PROBE_PAGE_SIZE: u64 = 1000;
+/// Pages the probe follows through the server cursor until one reaches its
+/// account (one read ticket per page).
+pub const PROBE_MAX_PAGES: usize = 4;
+
+/// `USD/2` (fixed regression branch, 1/2) or a drawn base with a precision in
+/// `1..=255` other than 2 (`domain.MaxHasAssetPrecision`; every such asset is
+/// valid): no other generator writes those assets (`draw::ASSETS`), so the
+/// probe account is among the few matches and on the first page.
 pub fn probe_asset(tc: &TestCase) -> (&'static str, u64) {
     if draw::chance(tc, 0.5) {
         return ("USD", 2);
     }
-    (*draw::one_of(tc, &ASSET_BASES), draw::int_in(tc, 0, 255))
+    let p = draw::int_in(tc, 1, 254);
+    (*draw::one_of(tc, &ASSET_BASES), if p >= 2 { p + 1 } else { p })
+}
+
+/// Whether an ascending ACCOUNTS page reached `addr` (it lists it or an
+/// address after it), so later pages cannot hold it.
+pub fn page_reaches(out: &Outcome, addr: &str) -> bool {
+    let rows = out.response.as_ref().and_then(|r| r.get("cursor")).and_then(|c| c.get("accountData")).and_then(Value::as_array);
+    rows.is_some_and(|rows| rows.iter().filter_map(|a| a.get("address").and_then(Value::as_str)).any(|a| a >= addr))
 }
 
 /// `FormatAsset(base, precision)`: a bare base for precision 0.
@@ -535,10 +607,12 @@ fn run_probe_write(d: &Driver, plan: WritePlan, budget: Duration) -> Option<Writ
 
 /// On `o-<run>-l1` (never deleted): a tracked create of the reserved query
 /// `own-pq-asset<N>` = `accountHasAsset{base, precision}`, a forced unit write
-/// `world → users:own-pq<N>` in that asset, then an execution. The oracle's
-/// window check is the read-your-acknowledged-write membership check; the
-/// asset index comes from task 07 (absent: the oracle gates the INDEX_* error
-/// legally).
+/// `world → users:own-pq<N>` in that asset, then an ascending execution that
+/// follows the server cursor (one ticket per page, at most
+/// `PROBE_MAX_PAGES`) until a page reaches the probe account. The oracle's
+/// window check of each page is the read-your-acknowledged-write membership
+/// check; the asset index comes from task 07 (absent: the oracle gates the
+/// INDEX_* error legally).
 pub fn projection_probe(d: &Driver, tc: TestCase) {
     d.guarded("projection_probe", &tc, |d, tc| {
         if !d.s.oracle_ok() {
@@ -569,13 +643,28 @@ pub fn projection_probe(d: &Driver, tc: TestCase) {
         if !r2.is_success() {
             return Some(());
         }
-        let rt = d.read_begin("ExecutePreparedQuery", &[ViewReq::named("preparedQueries", json!({"ledger": ledger, "owned": true}))], json!({}))?;
-        let req = json!({"ledger": ledger, "queryName": name, "pageSize": 100, "mode": MODE_LIST});
+        let first = json!({"ledger": ledger, "queryName": name, "pageSize": PROBE_PAGE_SIZE, "mode": MODE_LIST});
         let opts = CallOpts::linearizable();
-        let (_, out) = d.call(&route, "bucket", "ExecutePreparedQuery", req.clone(), &opts);
-        rt.end(&req, &out, &route, &opts, json!({"projectionProbe": true}), json!({}));
-        if out.is_ok() {
-            check_reachable!("projection-aligned prepared query succeeded", json!({"ledger": ledger, "queryName": name, "assetBase": base, "precision": precision}));
+        let mut prev: Option<(u64, String)> = None;
+        for page in 0..PROBE_MAX_PAGES {
+            let (req, params, views) = match &prev {
+                None => (first.clone(), json!({}), vec![ViewReq::named("preparedQueries", json!({"ledger": ledger, "owned": true}))]),
+                Some((tk, cursor)) => (follow_request(&first, cursor, false), json!({"prevTicket": tk}), vec![]),
+            };
+            let rt = d.read_begin("ExecutePreparedQuery", &views, json!({}))?;
+            let (_, out) = d.call(&route, "bucket", "ExecutePreparedQuery", req.clone(), &opts);
+            let ticket = rt.ticket();
+            let verdict = rt.end(&req, &out, &route, &opts, json!({"projectionProbe": true, "page": page}), params);
+            if page == 0 && out.is_ok() {
+                check_reachable!("projection-aligned prepared query succeeded", json!({"ledger": ledger, "queryName": name, "assetBase": base, "precision": precision}));
+            }
+            // A page the oracle did not validate is not remembered: its
+            // follow-up could not be judged.
+            if !verdict.is_some_and(|v| v.ok) || page_reaches(&out, &addr) {
+                break;
+            }
+            let Some(cursor) = next_cursor(&out) else { break };
+            prev = Some((ticket, cursor));
         }
         Some(())
     });
@@ -661,7 +750,14 @@ mod tests {
         let refs = vec![("p0".to_string(), "address".to_string()), ("p1".to_string(), "uint".to_string()), ("p2".to_string(), "string".to_string())];
         let (full, missing, mistyped) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
         testkit::with_tc_n(400, |tc| {
-            let p = draw_params(tc, &refs);
+            let pool = ParamPool::draw(tc);
+            let p = draw_params(tc, &pool, &refs);
+            // Well-typed values come from the pool drawn before begin.
+            for (n, k) in &refs {
+                if let Some(v) = p.get(n) {
+                    assert!(pool.values(k).contains(v) || *v == mistyped_value(k), "{n}={v}");
+                }
+            }
             assert!(p.keys().all(|k| refs.iter().any(|(n, _)| n == k)));
             if p.len() < refs.len() {
                 missing.fetch_add(1, Ordering::SeqCst);
@@ -791,7 +887,7 @@ mod tests {
         let ends = fo.calls("/read/end");
         assert_eq!(ends.len(), 1);
         assert_eq!(ends[0]["request"]["queryName"], name);
-        assert_eq!(ends[0]["request"]["pageSize"], 100);
+        assert_eq!(ends[0]["request"]["pageSize"], PROBE_PAGE_SIZE);
         assert!(testkit::fired("projection-aligned prepared query succeeded"));
 
         // A failed create stops the chain.
@@ -808,6 +904,9 @@ mod tests {
         testkit::with_tc_n(200, |tc| {
             let (b, p) = probe_asset(tc);
             assert!(ASSET_BASES.contains(&b) && p <= 255);
+            if b != "USD" || p != 2 {
+                assert!(p >= 1 && p != 2, "drawn precision {p} collides with the generators' assets");
+            }
             if (b, p) == ("USD", 2) {
                 usd2.fetch_add(1, Ordering::SeqCst);
             } else {
@@ -817,6 +916,51 @@ mod tests {
         assert!(usd2.load(Ordering::SeqCst) > 0 && other.load(Ordering::SeqCst) > 0);
         assert_eq!(format_asset("USD", 0), "USD");
         assert_eq!(format_asset("EUR", 2), "EUR/2");
+    }
+
+    #[test]
+    fn pq_update_only_in_a_single_order_bulk() {
+        let lv = json!({"preparedQueries": []});
+        let gens = order_gens();
+        let upd = gens.iter().find(|g| g.name == "pq_update").unwrap();
+        for len in 1..4 {
+            let ctx = BulkCtx { run: "r", ledger: "o-test-l1", ledger_view: &lv, index_in_bulk: 0, len };
+            assert_eq!((upd.applies)(&ctx), len == 1);
+        }
+        assert!(gens.iter().filter(|g| g.name != "pq_update").all(|g| (g.applies)(&BulkCtx { run: "r", ledger: "l", ledger_view: &lv, index_in_bulk: 1, len: 3 })));
+    }
+
+    #[test]
+    fn page_reaches_compares_addresses() {
+        let page = |addrs: &[&str]| ok_outcome(json!({"cursor": {"accountData": addrs.iter().map(|a| json!({"address": a})).collect::<Vec<_>>()}}));
+        assert!(page_reaches(&page(&["t-1:2", "users:own-pq3"]), "users:own-pq3"));
+        assert!(page_reaches(&page(&["users:9", "world"]), "users:own-pq3"));
+        assert!(!page_reaches(&page(&["t-1:2", "users:31"]), "users:own-pq3"));
+        assert!(!page_reaches(&Outcome::default(), "users:own-pq3"));
+    }
+
+    #[test]
+    fn projection_probe_follows_the_cursor_until_its_account() {
+        let (d, ft, fo) = testkit::driver();
+        // Every page lists accounts before the probe's and advertises more.
+        ft.set_default("bucket", "ExecutePreparedQuery", FakeReply::Outcome(ok_outcome(json!({"cursor": {"pageSize": PROBE_PAGE_SIZE, "hasMore": true, "next": "more", "accountData": [{"address": "t-0:1"}]}}))));
+        testkit::run_rule(&d, projection_probe);
+        let ends = fo.calls("/read/end");
+        assert_eq!(ends.len(), PROBE_MAX_PAGES);
+        assert!(ends[0]["request"].get("cursor").is_none());
+        for w in ends.windows(2) {
+            assert_eq!(w[1]["request"]["cursor"], "more");
+            assert!(w[1]["request"].get("reverse").is_none(), "ascending");
+            assert_eq!(w[1]["params"]["prevTicket"], w[0]["ticket"]);
+            assert_eq!(w[1]["request"]["queryName"], w[0]["request"]["queryName"]);
+        }
+
+        // A page that reaches the account ends the traversal.
+        let (d, ft, fo) = testkit::driver();
+        ft.set_default("bucket", "ExecutePreparedQuery", FakeReply::Outcome(ok_outcome(json!({"cursor": {"pageSize": PROBE_PAGE_SIZE, "hasMore": true, "next": "more", "accountData": [{"address": "world"}]}}))));
+        testkit::run_rule(&d, projection_probe);
+        assert_eq!(fo.calls("/read/end").len(), 1);
+        assert!(d.s.registry.snapshot().is_empty());
     }
 
     /// Writes the protocol fixtures (`HG/protocol-fixtures/08/`) the Go side
@@ -832,6 +976,8 @@ mod tests {
             reverse_probe,
             target_probe: false,
             pool: None,
+            fallback: "q-0".into(),
+            values: ParamPool { by_kind: vec![], spoil: Spoil::None },
             page_size: 5,
             reverse,
             flip: false,
@@ -870,6 +1016,17 @@ mod tests {
                 update_pq("o-test-l1", "q-2", None),
                 delete_pq("o-test-l1", "q-3"),
                 forced_unit_tx("o-test-l1", "users:own-pq1", "USD/2"),
+            ]})),
+            // Every malformed shape `malformed_filter` sends, at create and
+            // at update (the Go side decodes them strictly and requires the
+            // server's validators to refuse each).
+            ("malformed-filters.json", json!({"requests": [
+                create_pq("o-test-l1", "q-1", ACCOUNTS, Some(json!({"address": {}}))),
+                create_pq("o-test-l1", "q-2", TRANSACTIONS, Some(json!({"field": {"stringCond": {"hardcoded": "v0"}}}))),
+                create_pq("o-test-l1", "q-3", ACCOUNTS, Some(json!({"reverted": {"value": true}}))),
+                create_pq("o-test-l1", "q-4", TRANSACTIONS, Some(has_asset("USD", 2))),
+                update_pq("o-test-l1", "q-5", Some(json!({"address": {}}))),
+                update_pq("o-test-l1", "q-6", Some(json!({"field": {"stringCond": {"hardcoded": "v0"}}}))),
             ]})),
         ];
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../protocol-fixtures/08");

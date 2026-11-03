@@ -93,6 +93,10 @@ func TestIntegration_PreparedQueries(t *testing.T) {
 	require.True(t, write(true, pqCreate(l1, "q-1", commonpb.QueryTarget_QUERY_TARGET_ACCOUNTS, pqAddr(false, "p0"))).OK)
 	require.True(t, write(true, pqCreate(l1, "q-2", commonpb.QueryTarget_QUERY_TARGET_TRANSACTIONS, pqAddr(true, "users:"))).OK)
 	require.True(t, write(false, pqCreate(l1, "q-3", commonpb.QueryTarget_QUERY_TARGET_ACCOUNTS, nil)).OK)
+	// A parameterised TRANSACTIONS query: AGGREGATE on it, with or without
+	// its parameter, is the aggregate-target refusal (the server checks the
+	// target before compiling the filter).
+	require.True(t, write(true, pqCreate(l1, "q-4", commonpb.QueryTarget_QUERY_TARGET_TRANSACTIONS, pqAddr(false, "p0"))).OK)
 	// Rejections: an existing name, a malformed filter at create, an update
 	// invalid for the stored TRANSACTIONS target (FSM, uncommitted), a missing name.
 	require.False(t, write(true, pqCreate(l1, "q-1", commonpb.QueryTarget_QUERY_TARGET_ACCOUNTS, nil)).OK)
@@ -101,6 +105,21 @@ func TestIntegration_PreparedQueries(t *testing.T) {
 	hasAsset := &commonpb.QueryFilter{Filter: &commonpb.QueryFilter_AccountHasAsset{AccountHasAsset: &commonpb.AccountHasAssetCondition{AssetBase: "USD", Precision: 2}}}
 	require.Equal(t, "FILTER_COMPILATION_ERROR", write(true, pqUpdate(l1, "q-2", hasAsset)).Reason)
 	require.Equal(t, "PREPARED_QUERY_NOT_FOUND", write(true, pqUpdate(l1, "q-77", nil)).Reason)
+	// The driver's other malformed shapes (rules/prepared.rs malformed_filter):
+	// a metadata condition without a field reference, and `reverted` on an
+	// ACCOUNTS query, at create and at update.
+	noRef := &commonpb.QueryFilter{Filter: &commonpb.QueryFilter_Field{Field: &commonpb.FieldCondition{
+		Condition: &commonpb.FieldCondition_StringCond{StringCond: &commonpb.StringCondition{Value: &commonpb.StringCondition_Hardcoded{Hardcoded: "v0"}}},
+	}}}
+	reverted := &commonpb.QueryFilter{Filter: &commonpb.QueryFilter_Reverted{Reverted: &commonpb.RevertedCondition{Value: true}}}
+	for _, r := range []*servicepb.Request{
+		pqCreate(l1, "q-10", commonpb.QueryTarget_QUERY_TARGET_TRANSACTIONS, noRef),
+		pqCreate(l1, "q-11", commonpb.QueryTarget_QUERY_TARGET_ACCOUNTS, reverted),
+		pqUpdate(l1, "q-1", noRef),
+		pqUpdate(l1, "q-1", reverted),
+	} {
+		require.Equal(t, "FILTER_COMPILATION_ERROR", write(true, r).Reason)
+	}
 
 	coverage := map[string]int{}
 	read := func(kind string, params map[string]any, req proto.Message, out oc.Outcome) uint64 {
@@ -139,7 +158,7 @@ func TestIntegration_PreparedQueries(t *testing.T) {
 	}
 	list := commonpb.QueryMode_QUERY_MODE_LIST
 	aggr := commonpb.QueryMode_QUERY_MODE_AGGREGATE_VOLUMES
-	for _, name := range []string{"q-1", "q-2", "q-3", "q-99"} {
+	for _, name := range []string{"q-1", "q-2", "q-3", "q-4", "q-99"} {
 		for _, params := range []map[string]*commonpb.ParameterValue{
 			nil,
 			{"p0": str("users:")},

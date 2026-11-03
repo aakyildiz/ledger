@@ -98,3 +98,36 @@ func TestRustProtocolFixtures(t *testing.T) {
 	require.Equal(t, match.ParamKindAddress, kinds["p0"])
 	require.Equal(t, match.ParamKindString, kinds["p1"])
 }
+
+// TestRustMalformedFilterFixtures decodes every malformed filter shape the
+// driver's malformed_filter sends (strict protojson, as the Go client does)
+// and requires the server's validators to refuse each: a create on its
+// target, an update at admission or against both stored targets. The stage
+// and reason against a real server are in testdata/rejections/08-*.json.
+func TestRustMalformedFilterFixtures(t *testing.T) {
+	t.Parallel()
+	strict := protojson.UnmarshalOptions{}
+	var bulk struct {
+		Requests []json.RawMessage `json:"requests"`
+	}
+	require.NoError(t, json.Unmarshal(readFixture(t, "malformed-filters.json"), &bulk))
+	require.Len(t, bulk.Requests, 6)
+	for _, raw := range bulk.Requests {
+		var r servicepb.Request
+		require.NoError(t, strict.Unmarshal(raw, &r), "%s", raw)
+		switch x := r.GetType().(type) {
+		case *servicepb.Request_CreatePreparedQuery:
+			q := x.CreatePreparedQuery.GetQuery()
+			require.NotNil(t, q.GetFilter().GetFilter(), "%s decoded to an empty filter", raw)
+			require.Error(t, domain.ValidateFilterForTarget(q.GetFilter(), q.GetTarget()), "%s", raw)
+		case *servicepb.Request_UpdatePreparedQuery:
+			f := x.UpdatePreparedQuery.GetFilter()
+			require.NotNil(t, f.GetFilter(), "%s decoded to an empty filter", raw)
+			for _, target := range []commonpb.QueryTarget{commonpb.QueryTarget_QUERY_TARGET_ACCOUNTS, commonpb.QueryTarget_QUERY_TARGET_TRANSACTIONS} {
+				require.Error(t, domain.ValidateFilterForTarget(f, target), "%s on %s", raw, target)
+			}
+		default:
+			t.Fatalf("unexpected request %s", raw)
+		}
+	}
+}
