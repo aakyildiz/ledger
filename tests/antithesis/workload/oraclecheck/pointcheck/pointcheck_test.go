@@ -3,6 +3,7 @@ package pointcheck_test
 import (
 	"encoding/json"
 	"slices"
+	"strconv"
 	"testing"
 
 	"github.com/holiman/uint256"
@@ -528,6 +529,32 @@ func TestGetLog(t *testing.T) {
 	})
 	t.Run("unexpected error", func(t *testing.T) {
 		requireFinding(t, validate(t, s, pc.KindGetLog, req(seqs[0]), oc.Outcome{Code: "Internal"}), pc.EvGetLogUnexpectedError)
+	})
+	t.Run("the begin logSeqs view supplies the learned maximum", func(t *testing.T) {
+		k, ok := oc.LookupReadKind(pc.KindGetLog)
+		require.True(t, ok)
+		withViews := func(seq uint64, out oc.Outcome, views []json.RawMessage) []oc.Event {
+			tk := s.Read(pc.KindGetLog)
+			defer s.T.FinishRead(tk)
+
+			return k.Validate(&oc.ReadCtx{T: s.T, Ticket: tk, MaxTicket: s.T.ReadFrontier(), Snapshot: s.T.Model(),
+				Views: views, Kind: pc.KindGetLog, Request: pj(t, req(seq)), Outcome: out})
+		}
+		begun, err := s.T.ComputeViews(s.T.Model(), []json.RawMessage{
+			json.RawMessage(`{"name":"ledger","ledgerPick":0}`), json.RawMessage(`{"name":"logSeqs"}`),
+		})
+		require.NoError(t, err)
+		un := maxSeq + pc.UnassignedSeqSlack
+		// The view computed on the read's snapshot agrees with the walk.
+		requireReached(t, withViews(un, notFound, begun), pc.EvGetLogUnassignedNotFound)
+		requireFinding(t, withViews(un, okOut(t, render(seqs[0])), begun), pc.EvGetLogServedUnassigned)
+		requireClean(t, withViews(un-1, okOut(t, render(seqs[0])), begun))
+		// It is read rather than recomputed: a view naming a higher maximum
+		// moves the boundary (only the oracle builds views, so this cannot
+		// happen in a run).
+		fake := []json.RawMessage{json.RawMessage(`{"seqs":[],"maxLearnedSeq":"` + strconv.FormatUint(maxSeq+1, 10) + `"}`)}
+		requireNotReached(t, withViews(un, notFound, fake), pc.EvGetLogUnassignedNotFound)
+		requireReached(t, withViews(un+1, notFound, fake), pc.EvGetLogUnassignedNotFound)
 	})
 }
 

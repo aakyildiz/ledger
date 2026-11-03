@@ -52,7 +52,7 @@ fn draw_target(d: &Driver, tc: &TestCase, pick: u32) -> (bool, LedgerSel) {
     }
 }
 
-/// A `ledger`/`stamps` view over `live ++ deleted` when aimed by pick.
+/// A `ledger` view over `live ++ deleted` when aimed by pick.
 fn including_deleted(mut v: ViewReq, sel: &LedgerSel) -> ViewReq {
     if matches!(sel, LedgerSel::Pick(_)) {
         v.0["includeDeleted"] = json!(true);
@@ -87,13 +87,36 @@ fn check_balances(address: &str, out: &Outcome) {
     }
 }
 
-/// The account a GetAccount reads: the probe itself for the model-absent
-/// probe or when the seek found nothing, else the seek entry's address.
-fn account_target(view: &Value, probe: &str, model_absent: bool) -> String {
-    if model_absent {
-        return probe.to_string();
-    }
+/// The account a GetAccount reads: the seek entry's address, or the probe
+/// itself when the seek found nothing.
+fn account_target(view: &Value, probe: &str) -> String {
     view.pointer("/entry/address").and_then(Value::as_str).filter(|_| view["found"] == json!(true)).unwrap_or(probe).to_string()
+}
+
+/// How many pool addresses the model-absent probe tries (M/reads.go
+/// pickAbsentAccount).
+const ABSENT_TRIES: usize = 8;
+
+/// Whether a `seek` on `addr` landed on `addr` itself: the model holds a
+/// volume cell (volumes table) or metadata (accountMeta table) for it.
+fn seek_hits(view: &Value, addr: &str) -> bool {
+    view["found"] == json!(true) && view.pointer("/entry/address").and_then(Value::as_str) == Some(addr)
+}
+
+/// The model-absent probe's target: the first candidate neither of its two
+/// seeks (`views[2i]` volumes, `views[2i+1]` accountMeta) shows the model
+/// knows (M/reads.go modelKnowsAccount), else the first candidate — an
+/// ordinary known-account read, as the old fallback to pickCell was.
+fn model_absent_target(cands: &[String], views: &[Value]) -> String {
+    cands
+        .iter()
+        .enumerate()
+        .find(|(i, c)| match (views.get(2 * i), views.get(2 * i + 1)) {
+            (Some(vol), Some(meta)) => !seek_hits(vol, c) && !seek_hits(meta, c),
+            _ => false,
+        })
+        .map_or(&cands[0], |(_, c)| c)
+        .clone()
 }
 
 pub fn get_account(d: &Driver, tc: TestCase) {
@@ -107,13 +130,20 @@ pub fn get_account(d: &Driver, tc: TestCase) {
         let model_absent = !absent && draw::chance(tc, 0.05);
         let meta_only = !absent && !model_absent && draw::chance(tc, 0.25);
         let collapse = draw::chance(tc, 1.0 / 3.0);
-        let probe = if model_absent { draw::pool_address(tc) } else { draw::address(tc) };
         let table = if meta_only { "accountMeta" } else { "volumes" };
+        // The model-absent probe pre-draws ABSENT_TRIES pool addresses and
+        // seeks each in both tables; the target is picked from those views.
+        let probes: Vec<String> = if model_absent { (0..ABSENT_TRIES).map(|_| draw::pool_address(tc)).collect() } else { vec![draw::address(tc)] };
+        let views: Vec<ViewReq> = if model_absent {
+            probes.iter().flat_map(|p| [ViewReq::seek(sel.clone(), "volumes", p, None), ViewReq::seek(sel.clone(), "accountMeta", p, None)]).collect()
+        } else {
+            vec![ViewReq::seek(sel, table, &probes[0], None)]
+        };
 
-        let rt = d.read_begin("GetAccount", &[ViewReq::seek(sel, table, &probe, None)], json!({}))?;
+        let rt = d.read_begin("GetAccount", &views, json!({}))?;
         let view = rt.views().first()?.clone();
         let ledger = resolved_ledger(&view)?;
-        let address = account_target(&view, &probe, model_absent);
+        let address = if model_absent { model_absent_target(&probes, rt.views()) } else { account_target(&view, &probes[0]) };
         let req = json!({"ledger": ledger, "address": address, "collapseColors": collapse});
         let opts = CallOpts::linearizable();
         let (_, out) = d.call(&route, "bucket", "GetAccount", req.clone(), &opts);
@@ -131,6 +161,12 @@ pub fn transaction_id(tx_count: u64, offset: u32) -> u64 {
     1 + offset as u64 % (tx_count + 8)
 }
 
+/// The probed id on a ledger outside the fleet: `1..=64`, as M/reads.go
+/// pickTransactionID drew it (any id must be NotFound there).
+pub fn absent_ledger_transaction_id(offset: u32) -> u64 {
+    1 + offset as u64 % 64
+}
+
 pub fn get_transaction(d: &Driver, tc: TestCase) {
     d.guarded("get_transaction", &tc, |d, tc| {
         if !d.s.oracle_ok() {
@@ -144,7 +180,7 @@ pub fn get_transaction(d: &Driver, tc: TestCase) {
         let rt = d.read_begin("GetTransaction", &[ViewReq::ledger(sel)], json!({}))?;
         let view = rt.views().first()?.clone();
         let ledger = resolved_ledger(&view)?;
-        let id = transaction_id(view.get("txCount").and_then(Value::as_u64).unwrap_or(0), offset);
+        let id = if absent { absent_ledger_transaction_id(offset) } else { transaction_id(view.get("txCount").and_then(Value::as_u64).unwrap_or(0), offset) };
         let req = json!({"ledger": ledger, "transactionId": id.to_string()});
         let opts = CallOpts::linearizable();
         let (_, out) = d.call(&route, "bucket", "GetTransaction", req.clone(), &opts);
@@ -262,8 +298,10 @@ pub fn aggregate(d: &Driver, tc: TestCase) {
         let max_precision = draw::chance(tc, 0.25);
         let prefixes = if draw::chance(tc, 0.25) { gen_group_prefixes(tc) } else { vec![] };
 
-        let views = [including_deleted(ViewReq::ledger(sel.clone()), &sel), including_deleted(ViewReq::stamps(sel.clone()), &sel)];
-        let rt = d.read_begin("AggregateVolumes", &views, json!({}))?;
+        // Only the ledger view: accounts filters have no date leaves, so the
+        // spec's `stamps` view would go unread (06's leaf builder adds it back
+        // if its leaves need it).
+        let rt = d.read_begin("AggregateVolumes", &[including_deleted(ViewReq::ledger(sel.clone()), &sel)], json!({}))?;
         let view = rt.views().first()?.clone();
         let ledger = resolved_ledger(&view)?;
         let keys = account_field_keys(&view);
@@ -381,12 +419,31 @@ mod tests {
     }
 
     #[test]
+    fn model_absent_probe_skips_known_candidates() {
+        let cands: Vec<String> = ["t-1:1", "t-1:2", "t-1:3"].iter().map(|s| s.to_string()).collect();
+        let hit = |a: &str| json!({"ledger": "o-test-l1", "found": true, "wrapped": false, "entry": {"address": a}});
+        let miss = json!({"ledger": "o-test-l1", "found": false, "wrapped": false, "entry": null});
+        // t-1:1 has a cell, t-1:2 has metadata only, t-1:3 is unknown.
+        let views = vec![hit("t-1:1"), hit("t-1:5"), hit("t-1:3"), hit("t-1:2"), hit("t-1:30"), miss.clone()];
+        assert_eq!(model_absent_target(&cands, &views), "t-1:3");
+        // Every candidate known: fall back to the first.
+        let views = vec![hit("t-1:1"), miss.clone(), miss.clone(), hit("t-1:2"), hit("t-1:3"), miss.clone()];
+        assert_eq!(model_absent_target(&cands, &views), "t-1:1");
+        // A seek that wrapped onto another address does not count as known.
+        assert_eq!(model_absent_target(&cands[..1], &[hit("t-0:9"), miss]), "t-1:1");
+        assert_eq!(account_target(&hit("t-2:2"), "t-2:1"), "t-2:2");
+    }
+
+    #[test]
     fn transaction_ids_cover_committed_and_slack() {
         assert_eq!(transaction_id(0, 0), 1);
         assert_eq!(transaction_id(0, 7), 8);
         assert_eq!(transaction_id(0, 8), 1);
         assert_eq!(transaction_id(10, 17), 18);
         assert_eq!(transaction_id(10, u32::MAX), 1 + u32::MAX as u64 % 18);
+        assert_eq!(absent_ledger_transaction_id(0), 1);
+        assert_eq!(absent_ledger_transaction_id(63), 64);
+        assert_eq!(absent_ledger_transaction_id(64), 1);
     }
 
     fn walk(f: &Value, visit: &mut impl FnMut(&Value)) {
@@ -461,10 +518,14 @@ mod tests {
             }
         }
         let acct = &ends[0]["request"];
-        assert!(acct["address"].as_str().unwrap().len() > 0);
+        assert!(!acct["address"].as_str().unwrap().is_empty());
         let tx = &ends[1]["request"];
         let id: u64 = tx["transactionId"].as_str().unwrap().parse().unwrap();
         assert!((1..=11).contains(&id), "{id}");
+        // AggregateVolumes asks for the ledger view only (no unread `stamps`).
+        let agg_begin = fo.calls("/read/begin").into_iter().find(|b| b["kind"] == "AggregateVolumes").unwrap();
+        let names: Vec<&str> = agg_begin["views"].as_array().unwrap().iter().map(|v| v["name"].as_str().unwrap()).collect();
+        assert_eq!(names, ["ledger"], "{agg_begin}");
         let seq = ends[4]["request"]["sequence"].as_str().unwrap().to_string();
         assert!(seq == "3" || seq == "9" || seq == (9u64 + (1 << 40)).to_string(), "{seq}");
         assert!(d.s.registry.snapshot().is_empty());

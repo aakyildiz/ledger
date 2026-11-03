@@ -31,6 +31,31 @@ func learnedSeqs(snap oracle.GlobalState) []uint64 {
 	return out
 }
 
+// maxLearnedSeq is the read snapshot's highest learned global sequence (0
+// when none). The logSeqs view the oracle computed at /read/begin on this very
+// snapshot already holds it (Views are oracle-computed, never driver-supplied),
+// so it is reused; without that view the snapshot's stream is walked.
+func maxLearnedSeq(c *oc.ReadCtx) uint64 {
+	for _, raw := range c.Views {
+		var v struct {
+			Seqs          *[]string `json:"seqs"`
+			MaxLearnedSeq *string   `json:"maxLearnedSeq"`
+		}
+		if json.Unmarshal(raw, &v) != nil || v.Seqs == nil || v.MaxLearnedSeq == nil {
+			continue
+		}
+		if n, err := strconv.ParseUint(*v.MaxLearnedSeq, 10, 64); err == nil {
+			return n
+		}
+	}
+	var maxSeq uint64
+	for seq := range c.Snapshot.Logs() {
+		maxSeq = seq // ascending: the last one is the maximum
+	}
+
+	return maxSeq
+}
+
 // SampleSeqs keeps the newest LogSeqsNewest sequences plus every ⌈n/32⌉-th
 // older one (deterministic, ascending, at most oc.ViewCap).
 func SampleSeqs(all []uint64) []uint64 {
@@ -76,11 +101,15 @@ func ValidateGetLog(c *oc.ReadCtx) []oc.Event {
 	}
 	seq := req.GetSequence()
 	entry, learned := c.Snapshot.Log(seq)
+	// Only an unlearned sequence at or past the slack can be unassigned
+	// (seq >= maxSeq + slack needs seq >= slack), so the learned maximum is
+	// looked up only then: the GetLog rule's learned draws never pay for it.
 	var maxSeq uint64
-	if all := learnedSeqs(c.Snapshot); len(all) > 0 {
-		maxSeq = all[len(all)-1]
+	unassigned := false
+	if !learned && seq >= UnassignedSeqSlack {
+		maxSeq = maxLearnedSeq(c)
+		unassigned = seq-UnassignedSeqSlack >= maxSeq
 	}
-	unassigned := !learned && seq >= maxSeq+UnassignedSeqSlack
 
 	switch {
 	case c.Outcome.IsNotFound():

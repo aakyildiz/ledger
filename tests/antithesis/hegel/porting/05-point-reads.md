@@ -8,15 +8,31 @@ read ticket, linearizable, on a drawn route:
 
 | Rule | Weight | Kind | Views |
 |---|---|---|---|
-| `get_account` | 4 | `GetAccount` | `seek(volumes \| accountMeta)` |
+| `get_account` | 4 | `GetAccount` | `seek(volumes \| accountMeta)`; the model-absent probe seeks 8 pool candidates in both tables |
 | `get_transaction` | 3 | `GetTransaction` | `ledger` |
-| `aggregate` | 1.5 | `AggregateVolumes` | `ledger`, `stamps` (both `includeDeleted`) |
+| `aggregate` | 1.5 | `AggregateVolumes` | `ledger` (`includeDeleted`) |
 | `ledger_stats` | 1 | `GetLedgerStats` | `ledger` (`includeDeleted`) |
 | `get_log` | 1 | `GetLog` | `logSeqs` (registered here) |
 
 Generator intent (absent ledger, colour collapse, model-absent account,
 learned/unassigned sequence) is recomputed by the validators from the request
 and the read's snapshot; the hint is coverage-only.
+
+Deviations from the spec's rule table:
+
+- `aggregate` requests no `stamps` view: accounts filters have no date
+  leaves, so it would go unread. 06's leaf builder adds it back if needed.
+- `get_account`'s model-absent probe pre-draws 8 pool addresses and seeks
+  each in `volumes` and `accountMeta`; after `/read/begin` it reads the first
+  one neither seek lands on (M/reads.go pickAbsentAccount/modelKnowsAccount),
+  else the first candidate. A single blind pool draw would turn into an
+  ordinary known-account read once a long-lived ledger has touched it.
+- `get_transaction` on an absent ledger probes ids `1..=64`, as M/reads.go
+  pickTransactionID did (the ledger view of an absent name has no txCount).
+- `ValidateGetLog` looks up the learned maximum only for an unlearned
+  sequence at or past `2^40`, and takes it from the `logSeqs` view the oracle
+  computed at `/read/begin` on the same snapshot (walking the stream only when
+  that view is absent).
 
 | Old source | Old assertion (kind: literal) | New | Where |
 |---|---|---|---|
@@ -85,7 +101,7 @@ and the read's snapshot; the hint is coverage-only.
 | Assertion | Rule / draw | Needs |
 |---|---|---|
 | `oracle: GetAccount probing an absent ledger` | get_account, absent 2% | no faults |
-| `oracle: GetAccount probing a model-absent account` | get_account, pool probe 5% (and empty-seek reads) | no faults |
+| `oracle: GetAccount probing a model-absent account` | get_account, pool probe 5% (first of 8 candidates the model does not know), and empty-seek reads | no faults |
 | `oracle: colour-collapsed account read validated` | get_account, collapse 1/3, any served volume (smoke_tx's writes suffice) | no faults |
 | `oracle: GetTransaction probing an absent ledger` | get_transaction, absent 2% | no faults |
 | `oracle: aggregate volumes validated` | aggregate, flat | no faults |
@@ -101,7 +117,11 @@ and the read's snapshot; the hint is coverage-only.
 
 The in-process integration test `bin/oracle/h_point_integration_test.go`
 (`TestIntegration_PointReads`, real single-node server) reaches every oracle
-must-hit above with zero findings.
+must-hit above with zero findings. It is also the only real-server evidence for
+`oracle: aggregate gated on a missing index` and for the deleted-ledger and
+liveness-guard paths (it deletes a ledger, then runs every read kind on it):
+the 180 s native run used only the point reads and `smoke_tx`, so it created
+no index and deleted no ledger, and none of them ran with a delete in flight.
 
 ## Rejection fixtures
 
@@ -115,6 +135,23 @@ None: the five rules only read; they produce no write rejection shape.
 - The local minimal accounts-filter builder in `point_reads.rs` (address
   prefix/exact, metadata exists, and/or/not) duplicates part of task 06's
   generator; 99 may replace it with 06's builders.
+- Missing coverage until then: the indexed class only builds `metadata exists`
+  leaves. M/aggregates.go genAccountFilterIndexed (sampleAccountFieldSeeds,
+  model-reads §4.5) also drew typed comparisons on declared keys, 1/12
+  kind-mismatched leaves and the 1/8 `undeclared-…` probe. So `aggregate` never
+  reaches the `FILTER_COMPILATION_ERROR` arm of `IndexedQueryOutcomeLegal`, and
+  served results only test presence, never value-encoding windows (retype,
+  EN-1724). The aggregate path has old-equivalent strength only once 06's
+  typed and kind-mismatch leaves feed it.
+- The `logSeqs` view still walks the whole global log stream (O(n) in learned
+  sequences, deleted ledgers included) once per GetLog read, under the
+  service mutex: `oracle.GlobalState` exposes only an ascending `Logs()` over
+  its persistent map. Ask for O(log n) accessors in `tests/oracle` (outside
+  05's ownership), for example `LastLogSequence()` plus a `LogsFrom(seq)` seek,
+  so the view can sample by seeking random sequences between the first and last.
+- Re-check the deleted-ledger and liveness-guard paths of `aggregate` and
+  `ledger_stats` with task 04 (lifecycle) and 07 (indexes) merged: so far only
+  the single-node integration test exercises them, never with a delete in flight.
 - `matchtest.Render*` (00b) return model-owned slices and pointers (postings,
   timestamps, metadata): a test that mutates a rendered response in place
   mutates the model. `pointcheck` tests clone before mutating; other read
