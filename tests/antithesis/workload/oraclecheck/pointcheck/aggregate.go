@@ -63,6 +63,21 @@ func ValidateAggregateVolumes(c *oc.ReadCtx) []oc.Event {
 		return nil
 	}
 
+	// AGGREGATE_OVERFLOW: the fold exceeds 256 bits on the server (a
+	// useMaxPrecision rescale over high-precision cells, task 08's probe
+	// writes USD/<1..255>); legal iff some candidate base overflows.
+	if rerr.Code == codes.FailedPrecondition && rerr.HasReason("AGGREGATE_OVERFLOW") {
+		if c.Matches(func(b oracle.GlobalState) bool {
+			return match.LedgerIsLive(b, ledger) && match.AggregateOverflows(b.Ledger(ledger), filter, opts)
+		}) {
+			return nil
+		}
+		d := outcomeDetails(c.Outcome)
+		d["ledger"], d["filter"] = ledger, match.DescribeFilter(filter)
+
+		return []oc.Event{oc.Violation(EvAggregateVolumesUnexpected, d)}
+	}
+
 	if !c.Outcome.OK && len(needed) == 0 {
 		d := outcomeDetails(c.Outcome)
 		d["ledger"], d["absent"], d["filter"] = ledger, absent, match.DescribeFilter(filter)

@@ -326,7 +326,10 @@ fn list_all(d: &Driver, route: &Route, method: &str, mut req: Value, opts: &Call
         } else {
             req["options"]["cursor"] = json!(cursor);
         }
-        let o = call_retry(d, route, "bucket", method, &req, &opts.clone().max_items(PAGE), deadline)?;
+        // One item past the page: the client stops reading at maxItems and
+        // reports such a page incomplete (task 99: every full 1000-row page
+        // made the stats observation fail).
+        let o = call_retry(d, route, "bucket", method, &req, &opts.clone().max_items(PAGE + 1), deadline)?;
         if !o.is_ok() || !o.complete {
             return Err(Fail::Other(format!("{method} page: {}", describe(&o))));
         }

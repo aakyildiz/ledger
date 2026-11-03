@@ -15,7 +15,7 @@ WORKDIR /src
 RUN find /src -name '*_test.go' -delete && rm -rf /src/oraclecheck/testdata \
  && go build -cover -covermode=atomic \
       -coverpkg=github.com/formancehq/ledger/v3/tests/antithesis/workload/...,github.com/formancehq/ledger/v3/tests/oracle/... \
-      -o /oracle ./bin/oracle
+      -tags enable_antithesis_sdk -o /oracle ./bin/oracle
 
 FROM debian:trixie
 RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*

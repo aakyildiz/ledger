@@ -73,7 +73,7 @@ impl Probe<'_> {
     }
 
     fn list(&self, method: &str, req: Value) -> Option<Vec<Value>> {
-        let out = self.cx.call(Some(self.node), "bucket", method, req, &CallOpts::linearizable().max_items(1000));
+        let out = self.cx.call(Some(self.node), "bucket", method, req, &CallOpts::linearizable().max_items(1001)); // one past the 1000-row page, so a full page completes
         (out.is_ok() && out.complete && out.next_cursor.is_empty()).then(|| out.items.unwrap_or_default())
     }
 }

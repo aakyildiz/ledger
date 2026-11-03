@@ -239,6 +239,13 @@ func checkpointArm(c *oc.ReadCtx, arm string) (res armResult, id uint64, ok bool
 		agg := &commonpb.AggregateResult{}
 		served := out.OK && decode(out.Response, agg) == nil
 		res.frozenMatches, res.concrete = match.CheckpointAggregateMatches(frozen.Ledger(res.ledger), opts, agg, served && match.LedgerIsLive(frozen, res.ledger))
+		if !out.OK && out.Code == "FailedPrecondition" && out.Reason == "AGGREGATE_OVERFLOW" {
+			// The server refuses a fold past 256 bits (a useMaxPrecision
+			// rescale over high-precision cells); legal iff the frozen fold
+			// overflows (task 99, stack finding).
+			res.frozenMatches = match.LedgerIsLive(frozen, res.ledger) && match.AggregateOverflows(frozen.Ledger(res.ledger), nil, opts)
+			res.concrete = false
+		}
 		res.details["prefixes"] = req.GetGroupByPrefixes()
 		if served {
 			res.details["returned"] = match.DescribeCheckpointAggregate(opts, agg)

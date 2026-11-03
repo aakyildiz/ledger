@@ -11,7 +11,7 @@ COPY tests/antithesis/workload/go.mod tests/antithesis/workload/go.sum /src/
 COPY tests/antithesis/workload/internal /src/internal
 COPY tests/antithesis/workload/bin/client /src/bin/client
 WORKDIR /src
-RUN go build -cover -covermode=atomic -coverpkg=github.com/formancehq/ledger/v3/... -o /client ./bin/client
+RUN go build -cover -covermode=atomic -coverpkg=github.com/formancehq/ledger/v3/... -tags enable_antithesis_sdk -o /client ./bin/client
 
 FROM rust:1-trixie AS log-forward
 RUN rustup target add x86_64-unknown-linux-musl
