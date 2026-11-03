@@ -44,7 +44,7 @@ func TestDrain_HeadWaitsForEarlierWrite(t *testing.T) {
 func TestDrain_HeadWaitsForEarlierRead(t *testing.T) {
 	t.Parallel()
 	s := newLedgerSession(t)
-	r := s.Read("Smoke")
+	r := s.Read("GetAccount")
 	b := s.Begin(false, tx(s, "", 2))
 	s.End(b)
 	require.EqualValues(t, 1, s.T.Version(), "b must wait for the earlier-ticketed read")
@@ -61,7 +61,7 @@ func TestDrain_DrainsUnderLaterRead(t *testing.T) {
 	outA := s.Execute(a)
 	_, _, ref := s.T.EndWrite(b, outB)
 	require.Nil(t, ref)
-	r := s.Read("Smoke")
+	r := s.Read("GetAccount")
 	_, evs, ref := s.T.EndWrite(a, outA)
 	require.Nil(t, ref)
 	require.Empty(t, testutil.Findings(evs))
@@ -213,7 +213,7 @@ func TestSettleHooksRunAfterEveryKindOfCall(t *testing.T) {
 	require.Nil(t, ref)
 	require.Equal(t, 1, calls)
 
-	r := s.Read("Smoke")
+	r := s.Read("GetAccount")
 	calls = 0
 	s.T.FinishRead(r)
 	require.Equal(t, 1, calls)

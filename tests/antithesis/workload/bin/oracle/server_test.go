@@ -13,6 +13,7 @@ import (
 	"github.com/formancehq/ledger/v3/internal/proto/servicepb"
 	"github.com/formancehq/ledger/v3/tests/antithesis/workload/bin/oracle/servicetest"
 	oc "github.com/formancehq/ledger/v3/tests/antithesis/workload/oraclecheck"
+	"github.com/formancehq/ledger/v3/tests/antithesis/workload/oraclecheck/pointcheck"
 	"github.com/formancehq/ledger/v3/tests/antithesis/workload/oraclecheck/testutil"
 	"github.com/formancehq/ledger/v3/tests/oracle"
 )
@@ -86,26 +87,28 @@ func TestServer_FullFlows(t *testing.T) {
 	okv, viol := servicetest.Verdict(m)
 	require.True(t, okv, "%v", viol)
 
-	// A Smoke read that matches the model, then one that does not.
-	rb := c.BeginRead("Smoke", map[string]any{"name": "seek", "ledgerPick": 0, "table": "volumes", "probe": "t-1:0"})
+	// A GetAccount read that matches the model, then one that does not.
+	rb := c.BeginRead("GetAccount", map[string]any{"name": "seek", "ledgerPick": 0, "table": "volumes", "probe": "t-1:0"})
 	views := rb["views"].([]any)
 	require.Equal(t, l1, views[0].(map[string]any)["ledger"])
 	tk := uint64(rb["ticket"].(float64))
-	m = c.EndRead(tk, "Smoke", smokeRequest(l1, "t-1:1"), oc.Outcome{OK: true, Response: renderAccount(c, l1, "t-1:1")})
+	m = c.EndRead(tk, "GetAccount", smokeRequest(l1, "t-1:1"), oc.Outcome{OK: true, Response: renderAccount(c, l1, "t-1:1")})
 	okv, viol = servicetest.Verdict(m)
 	require.True(t, okv, "%v", viol)
-	require.Equal(t, []any{string(oc.EvModelOutcomeVerified)}, m["coverage"])
+	// (task 05's GetAccount kind reports coverage only for collapsed or
+	// absent-probe reads; the smoke kind it replaces reported "model outcome
+	// verified", which drained writes still report.)
 
-	rb = c.BeginRead("Smoke")
+	rb = c.BeginRead("GetAccount")
 	tk = uint64(rb["ticket"].(float64))
-	m = c.EndRead(tk, "Smoke", smokeRequest(l1, "t-1:1"), oc.Outcome{OK: true, Response: renderAccount(c, l1, "t-1:2")})
+	m = c.EndRead(tk, "GetAccount", smokeRequest(l1, "t-1:1"), oc.Outcome{OK: true, Response: renderAccount(c, l1, "t-1:2")})
 	okv, viol = servicetest.Verdict(m)
 	require.False(t, okv)
-	require.Equal(t, []string{string(EvSmokeReadOutsideModel)}, viol)
+	require.Equal(t, []string{string(pointcheck.EvAccountReadOutsideModel)}, viol)
 
 	// A transient read is skipped.
-	rb = c.BeginRead("Smoke")
-	m = c.EndRead(uint64(rb["ticket"].(float64)), "Smoke", smokeRequest(l1, "t-1:1"), oc.Outcome{Unknown: "timeout"})
+	rb = c.BeginRead("GetAccount")
+	m = c.EndRead(uint64(rb["ticket"].(float64)), "GetAccount", smokeRequest(l1, "t-1:1"), oc.Outcome{Unknown: "timeout"})
 	require.Equal(t, true, m["verdict"].(map[string]any)["skipped"])
 
 	// The replayable view lists the committed flagged bulk.
@@ -143,7 +146,7 @@ func TestServer_ErrorCodes(t *testing.T) {
 	status, m = c.Do("POST", "/write/end", map[string]any{"ticket": 9999, "outcome": map[string]any{"ok": false, "code": "NotFound", "reason": "LEDGER_NOT_FOUND"}, "attempts": 1, "via": map[string]any{}})
 	require.Equal(t, http.StatusNotFound, status)
 	require.Equal(t, oc.CodeUnknownTicket, errCode(m))
-	status, m = c.Do("POST", "/read/end", map[string]any{"ticket": 9999, "kind": "Smoke", "outcome": map[string]any{"unknown": "timeout"}})
+	status, m = c.Do("POST", "/read/end", map[string]any{"ticket": 9999, "kind": "GetAccount", "outcome": map[string]any{"unknown": "timeout"}})
 	require.Equal(t, http.StatusNotFound, status)
 	require.Equal(t, oc.CodeUnknownTicket, errCode(m))
 
@@ -259,7 +262,7 @@ func TestServer_IdempotentRepeats(t *testing.T) {
 	_, e2 := c.DoRaw("POST", "/write/end", end)
 	require.Equal(t, e1, e2)
 
-	rid := map[string]any{"rid": "r77", "kind": "Smoke", "views": []any{map[string]any{"name": "ledgers"}}, "params": map[string]any{}}
+	rid := map[string]any{"rid": "r77", "kind": "GetAccount", "views": []any{map[string]any{"name": "ledgers"}}, "params": map[string]any{}}
 	_, b1 := c.DoRaw("POST", "/read/begin", rid)
 	_, b2 := c.DoRaw("POST", "/read/begin", rid)
 	require.Equal(t, b1, b2)

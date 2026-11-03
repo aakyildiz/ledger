@@ -1,10 +1,9 @@
 //! The rule registries (DESIGN §6.2). Every family adds lines **only**
 //! between its own marker pairs (typically `pub mod <fam>;` and
 //! `v.extend(<fam>::rules());`); marker lines never change, so family hunks
-//! merge cleanly. `smoke` is registered outside the marker blocks.
+//! merge cleanly. (The foundation's `smoke` rules were removed by task 99.)
 use crate::machine::Driver;
 use hegel::stateful::ConcurrentRule;
-pub mod smoke;
 // ==== 02-tx-writes mods ====
 pub mod tx;
 // ==== end 02-tx-writes mods ====
@@ -65,7 +64,6 @@ pub mod restore;
 
 pub fn rules() -> Vec<ConcurrentRule<Driver>> {
     let mut v = Vec::new();
-    v.extend(smoke::rules());
     // ==== 02-tx-writes rules ====
     v.extend(tx::rules());
     // ==== end 02-tx-writes rules ====
@@ -387,7 +385,7 @@ mod tests {
         assert_eq!(markers, expected);
         // Each section's markers sit inside the right registry function.
         let fns = ["pub fn rules()", "pub fn order_gens()", "pub fn quiet_hooks()", "pub fn exclusive_actions()", "pub fn setup_hooks()", "pub fn log_hooks()"];
-        let mut pos = src.find("pub mod smoke;").unwrap();
+        let mut pos = src.find("use hegel::stateful::ConcurrentRule;").unwrap();
         for (i, s) in SECTIONS.iter().enumerate() {
             if i > 0 {
                 let f = src.find(fns[i - 1]).unwrap();
@@ -404,19 +402,24 @@ mod tests {
     }
 
     #[test]
-    fn smoke_rules_are_registered() {
+    fn family_rules_are_registered() {
         let names: Vec<String> = super::rules().into_iter().map(|r| r.name).collect();
-        assert!(names.contains(&"smoke_tx".to_string()));
-        assert!(names.contains(&"smoke_get_account".to_string()));
+        assert!(names.contains(&"tx_bulk".to_string()));
+        assert!(names.contains(&"get_account".to_string()));
+        assert!(!names.iter().any(|n| n.starts_with("smoke_")), "the smoke rules are gone: {names:?}");
+        let mut sorted = names.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), names.len(), "rule names are unique");
     }
 
     #[test]
     fn rules_filter_keeps_only_named_rules() {
-        let all = || super::smoke::rules();
+        let all = || super::tx::rules();
         let n = all().len();
         assert_eq!(super::keep_named(all(), None).len(), n);
         assert_eq!(super::keep_named(all(), Some("  ")).len(), n);
-        let kept = super::keep_named(all(), Some("smoke_tx, nope"));
-        assert_eq!(kept.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(), vec!["smoke_tx"]);
+        let kept = super::keep_named(all(), Some("tx_bulk, nope"));
+        assert_eq!(kept.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(), vec!["tx_bulk"]);
     }
 }

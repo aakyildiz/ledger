@@ -168,18 +168,18 @@ func TestContract_DriverStructs(t *testing.T) {
 	c.OK("POST", "/view", map[string]any{"views": anyViews})
 
 	// Reads: validated, transient (skipped), abandoned, repeated begin.
-	rb := c.OK("POST", "/read/begin", map[string]any{"rid": "r1", "kind": "Smoke", "views": anyViews, "params": map[string]any{}})
-	c.OK("POST", "/read/begin", map[string]any{"rid": "r1", "kind": "Smoke", "views": anyViews, "params": map[string]any{}})
+	rb := c.OK("POST", "/read/begin", map[string]any{"rid": "r1", "kind": "GetAccount", "views": anyViews, "params": map[string]any{}})
+	c.OK("POST", "/read/begin", map[string]any{"rid": "r1", "kind": "GetAccount", "views": anyViews, "params": map[string]any{}})
 	readEnd := func(tk any, out oc.Outcome) map[string]any {
-		return c.OK("POST", "/read/end", map[string]any{"ticket": tk, "kind": "Smoke", "request": smokeRequest(l1, "t-1:1"),
+		return c.OK("POST", "/read/end", map[string]any{"ticket": tk, "kind": "GetAccount", "request": smokeRequest(l1, "t-1:1"),
 			"outcome": out, "route": readRoute(), "hint": map[string]any{"collapsed": false}, "params": map[string]any{}})
 	}
 	m = readEnd(rb["ticket"], oc.Outcome{OK: true, Response: renderAccount(c, l1, "t-1:1"), Peer: "ledger-0:8888", ElapsedMs: 3})
 	okv, viol := servicetest.Verdict(m)
 	require.True(t, okv, "%v", viol)
-	rb = c.OK("POST", "/read/begin", map[string]any{"rid": "r2", "kind": "Smoke", "views": []any{}, "params": map[string]any{}})
+	rb = c.OK("POST", "/read/begin", map[string]any{"rid": "r2", "kind": "GetAccount", "views": []any{}, "params": map[string]any{}})
 	readEnd(rb["ticket"], oc.Outcome{Unknown: "timeout"})
-	rb = c.OK("POST", "/read/begin", map[string]any{"rid": "r3", "kind": "Smoke", "views": []any{map[string]any{"name": "ledger", "ledgerPick": 0}}, "params": map[string]any{}})
+	rb = c.OK("POST", "/read/begin", map[string]any{"rid": "r3", "kind": "GetAccount", "views": []any{map[string]any{"name": "ledger", "ledgerPick": 0}}, "params": map[string]any{}})
 	c.OK("GET", "/tickets", nil)
 	c.OK("GET", "/quiet/status", nil)
 	c.OK("POST", "/read/abandon", map[string]any{"ticket": rb["ticket"]})

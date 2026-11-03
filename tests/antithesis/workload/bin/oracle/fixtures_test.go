@@ -340,7 +340,7 @@ func TestFixtures_ResponseShapes(t *testing.T) {
 	oc.RegisterReadKind(oc.ReadKind{Name: "zz-fixture-panic", Validate: func(*oc.ReadCtx) []oc.Event { panic("index out of range") }})
 	t.Cleanup(func() { oc.TestingUnregister("zz-fixture-checkpoint", "zz-fixture-section", "zz-fixture-panic") })
 
-	smoke := map[string]any{"kind": "Smoke"}
+	smoke := map[string]any{"kind": "GetAccount"}
 	for _, f := range loadFixtures(t) {
 		if f.Endpoint == "outcome" {
 			continue
@@ -357,7 +357,7 @@ func TestFixtures_ResponseShapes(t *testing.T) {
 				status, body = r.send(f, nil)
 			case "read-begin.empty-live":
 				r := newFixtureRun(t, false)
-				status, body = r.send(f, map[string]any{"kind": "Smoke"})
+				status, body = r.send(f, map[string]any{"kind": "GetAccount"})
 			default:
 				r := newFixtureRun(t, true)
 				status, body = r.script(f, smoke)
@@ -381,7 +381,7 @@ func (r *fixtureRun) script(f fixture, smoke map[string]any) (int, []byte) {
 		"write-begin", "write-begin.unmodeled", "write-begin.too-many-requests", "write-end.unknown-ticket":
 		if f.Name == "tickets" || f.Name == "dump" {
 			r.beginFixtureWrite()
-			c.BeginRead("Smoke")
+			c.BeginRead("GetAccount")
 		}
 		if strings.HasPrefix(f.Name, "read-begin") {
 			return r.send(f, smoke)
@@ -445,7 +445,7 @@ func (r *fixtureRun) script(f fixture, smoke map[string]any) (int, []byte) {
 
 		return r.send(f, map[string]any{"ticket": tk})
 	case "read-end", "read-end.skipped", "read-end.violation", "read-abandon", "panic":
-		kind := "Smoke"
+		kind := "GetAccount"
 		if f.Name == "panic" {
 			kind = "zz-fixture-panic"
 		}

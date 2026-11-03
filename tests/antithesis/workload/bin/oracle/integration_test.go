@@ -179,8 +179,8 @@ func TestIntegration_RealServer(t *testing.T) {
 		send(ws, rng.Perm(len(ws)))
 		sent += fan
 
-		// A Smoke read between rounds.
-		rb := c.BeginRead("Smoke")
+		// A GetAccount read between rounds.
+		rb := c.BeginRead("GetAccount")
 		a := addr()
 		ledger := l[rng.IntN(2)]
 		acct, err := client.GetAccount(ctx, &servicepb.GetAccountRequest{Ledger: ledger, Address: a})
@@ -191,7 +191,7 @@ func TestIntegration_RealServer(t *testing.T) {
 		} else {
 			out = outcomeOf(nil, err)
 		}
-		m := c.EndRead(uint64(rb["ticket"].(float64)), "Smoke", map[string]any{"ledger": ledger, "address": a}, out)
+		m := c.EndRead(uint64(rb["ticket"].(float64)), "GetAccount", map[string]any{"ledger": ledger, "address": a}, out)
 		ok, viol := servicetest.Verdict(m)
 		require.True(t, ok, "%v", viol)
 	}
