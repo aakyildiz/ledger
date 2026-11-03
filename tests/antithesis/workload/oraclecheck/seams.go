@@ -24,6 +24,11 @@ var uncommittedReasons = map[string]bool{"FILTER_COMPILATION_ERROR": true, "CLUS
 // TODO(00d): res.Stage == oracle.StageAdmission
 func isAdmissionStage(res oracle.ApplyResult) bool { return false }
 
+// StageSeamWired reports whether the seams above are the real task-01
+// functions; the stage/freeze conformance test is strict only then.
+// TODO(00d): true
+const StageSeamWired = false
+
 // UncommittedReason reports whether a reason is one the server never freezes.
 func UncommittedReason(reason string) bool { return uncommittedReasons[reason] }
 

@@ -1,0 +1,6 @@
+{
+  "name": "empty create (admission VALIDATION)",
+  "setup": [{"createLedger": {"name": "o-rej-l1"}}],
+  "requests": [{"apply": {"ledger": "o-rej-l1", "action": {"createTransaction": {}}}}],
+  "expectReason": "VALIDATION"
+}

@@ -122,6 +122,8 @@ type Tracker struct {
 	resync        bool
 
 	ext map[string]any
+
+	auditCursor string
 }
 
 // NewTracker returns a Tracker on an empty model configured with the query
@@ -875,3 +877,17 @@ func (t *Tracker) ResyncNeeded() bool { return t.resync }
 
 // ClearResync acknowledges a resync.
 func (t *Tracker) ClearResync() { t.resync = false }
+
+// AuditCursor is the last audit sequence the incremental replay consumed
+// ("0" before any), reported by /quiet/begin. Task 11's audit section
+// advances it with SetAuditCursor.
+func (t *Tracker) AuditCursor() string {
+	if t.auditCursor == "" {
+		return "0"
+	}
+
+	return t.auditCursor
+}
+
+// SetAuditCursor records the audit replay's cursor.
+func (t *Tracker) SetAuditCursor(c string) { t.auditCursor = c }
