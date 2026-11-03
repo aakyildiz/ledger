@@ -292,15 +292,18 @@ pub fn index_op(d: &Driver, tc: TestCase) {
 
 // ---------------------------------------------------------------- typed_metadata_cycle
 
-/// Cycles run so far; the first few keep their uncoercible key's index so
-/// `inspect_index` can summarise a key holding unconvertible values.
+/// Cycles started so far; the first one creates the index of the shared
+/// uncoercible key `own-bad`, which every cycle writes a distinct
+/// unconvertible text to, so `inspect_index` can summarise (and page through)
+/// a key holding unconvertible values.
 #[derive(Default)]
 pub struct TypedMeta {
     pub cycles: AtomicU64,
 }
 
-/// How many cycles keep their uncoercible key (declared INT64, indexed).
-pub const KEPT_BAD_KEYS: u64 = 3;
+/// The reserved key every cycle writes its uncoercible value under (declared
+/// INT64, indexed once, never removed).
+pub const BAD_KEY: &str = "own-bad";
 
 /// The deterministic assertion a cycle step re-asserts on its outcome.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -312,9 +315,9 @@ pub enum StepCheck {
 }
 
 /// The steps of one typed-metadata cycle on reserved entities (pure).
-pub fn cycle_steps(ledger: &str, n: u64, value: u64, retypes: &[&str], keep_bad: bool) -> Vec<(Value, StepCheck)> {
+pub fn cycle_steps(ledger: &str, n: u64, value: u64, retypes: &[&str], index_bad: bool) -> Vec<(Value, StepCheck)> {
     let key = format!("own-score{n}");
-    let bad = format!("own-score{n}-bad");
+    let bad = BAD_KEY;
     let addr = format!("users:own-score{n}");
     let acct = "TARGET_TYPE_ACCOUNT";
     let mut s = vec![
@@ -326,16 +329,13 @@ pub fn cycle_steps(ledger: &str, n: u64, value: u64, retypes: &[&str], keep_bad:
         s.push((set_field_type(ledger, acct, &key, t), StepCheck::Retype));
     }
     s.push((remove_field_type(ledger, acct, &key), StepCheck::None));
-    s.push((account_string_meta(ledger, &addr, &bad, "not-a-number"), StepCheck::None));
-    s.push((set_field_type(ledger, acct, &bad, "METADATA_TYPE_INT64"), StepCheck::Int64OverUncoercible));
-    if keep_bad {
-        s.push((create_index(ledger, metadata_index_id(acct, &bad)), StepCheck::None));
+    s.push((account_string_meta(ledger, &addr, bad, &format!("not-a-number-{value}")), StepCheck::None));
+    s.push((set_field_type(ledger, acct, bad, "METADATA_TYPE_INT64"), StepCheck::Int64OverUncoercible));
+    if index_bad {
+        s.push((create_index(ledger, metadata_index_id(acct, bad)), StepCheck::None));
     }
     s.push((set_field_type(ledger, acct, &key, "METADATA_TYPE_BOOL"), StepCheck::BoolOverNumeric));
     s.push((remove_field_type(ledger, acct, &key), StepCheck::None));
-    if !keep_bad {
-        s.push((remove_field_type(ledger, acct, &bad), StepCheck::None));
-    }
     s
 }
 
@@ -367,10 +367,10 @@ pub fn typed_metadata_cycle(d: &Driver, tc: TestCase) {
         let kinds = ["METADATA_TYPE_STRING", "METADATA_TYPE_BOOL", "METADATA_TYPE_INT64"];
         let retypes: Vec<&str> = (0..3).map(|_| *draw::one_of(tc, &kinds)).collect();
         let st = d.s.ext::<TypedMeta>();
-        let keep_bad = st.cycles.fetch_add(1, Ordering::SeqCst) < KEPT_BAD_KEYS;
+        let index_bad = st.cycles.fetch_add(1, Ordering::SeqCst) == 0;
         let n = d.s.next_own();
         let ledger = format!("{}l1", d.s.tracked_prefix());
-        let steps = cycle_steps(&ledger, n, value, &retypes, keep_bad);
+        let steps = cycle_steps(&ledger, n, value, &retypes, index_bad);
         let plans: Vec<(WritePlan, StepCheck)> = steps
             .into_iter()
             .enumerate()
@@ -454,8 +454,9 @@ pub fn index_introspect(d: &Driver, tc: TestCase) {
         if !d.s.oracle_ok() {
             return None;
         }
-        // 0 list ledger, 1 list all, 2 list bucket, 3 GetIndex, 4 GetIndexStatus.
-        let arm = draw::weighted(tc, &[1.0, 0.5, 0.5, 1.0, 1.0])?;
+        // 0 list ledger, 1 list all, 2 list bucket, 3 GetIndex, 4 GetIndexStatus
+        // (weights 2:1:1:2:2, as a uniform index into a list).
+        let arm = *draw::one_of(tc, &[0usize, 0, 1, 2, 3, 3, 4, 4]);
         let absent = draw::chance(tc, 0.02);
         let absent_name = if absent { Some(absent_ledger(d, tc)) } else { None };
         let pick = draw::ledger_pick(tc);
@@ -768,7 +769,7 @@ mod tests {
         let steps = cycle_steps("o-test-l1", 7, 42, &["METADATA_TYPE_STRING", "METADATA_TYPE_BOOL", "METADATA_TYPE_INT64"], true);
         for (req, _) in &steps {
             let s = req.to_string();
-            assert!(s.contains("own-score7"), "{s}");
+            assert!(s.contains("own-score7") || s.contains("\"own-bad\""), "{s}");
             assert!(s.contains("\"o-test-l1\""));
         }
         let checks: Vec<StepCheck> = steps.iter().map(|(_, c)| *c).collect();
@@ -777,6 +778,10 @@ mod tests {
         assert!(checks.contains(&StepCheck::BoolOverNumeric));
         assert_eq!(steps[2].0["apply"]["action"]["addMetadata"]["metadata"]["own-score7"]["stringValue"], "42");
         assert_eq!(steps[2].0["apply"]["action"]["addMetadata"]["target"]["account"]["addr"], "users:own-score7");
+        assert!(steps.iter().any(|(r, _)| r["apply"]["action"]["addMetadata"]["metadata"]["own-bad"]["stringValue"] == "not-a-number-42"));
+        assert!(steps.iter().any(|(r, _)| r["createIndex"]["id"]["metadata"]["key"] == "own-bad"));
+        let later = cycle_steps("o-test-l1", 8, 1, &["METADATA_TYPE_STRING"], false);
+        assert!(!later.iter().any(|(r, _)| r.get("createIndex").is_some_and(|c| c["id"]["metadata"]["key"] == "own-bad")));
     }
 
     #[test]

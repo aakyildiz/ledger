@@ -111,7 +111,7 @@ Fixtures: `W/oraclecheck/testdata/rejections/07-*.json`.
 | oracle: index listing / lookup on an absent ledger returned NotFound | `index_introspect` absent 2 % | no faults |
 | oracle: index inspection validated / gated / resumed / on an absent ledger | `inspect_index` | no faults |
 | oracle: index inspection summary matched the model / a populated index | `inspect_index` SUMMARY on an indexed key | no faults |
-| oracle: index inspection summary counted unconvertible values | `typed_metadata_cycle` keeps `own-score<N>-bad` (INT64 over "not-a-number", indexed) for its first 3 cycles; `inspect_index` inspects l1 with the owned view 1/4 | no faults |
+| oracle: index inspection summary counted unconvertible values | `typed_metadata_cycle` writes `own-bad = "not-a-number-<v>"` (declared INT64, indexed by the first cycle); `inspect_index` inspects l1 with the owned view 1/4 | no faults |
 | oracle: index inspection served from a checkpoint | `inspect_index` with `HEGEL_HAVE_CHECKPOINTS=1` | needs task 09 |
 | oracle: metadata field not in schema rejection exercised | `index_op` 1/16 probe | no faults |
 | a write attempt is refused while an index builds | any family write attempt answered `INDEX_BUILDING` | faults (99 removes it if the server never returns it on writes) |
@@ -127,11 +127,14 @@ Fixtures: `W/oraclecheck/testdata/rejections/07-*.json`.
   `index status validated` covered); the ledger-wide `GetIndexStatus` RPC is the stale poll.
 - `index demoted to ambiguous` fires on every not-ready observation (the old one only on an
   active→ambiguous flip), so it is reached right after creates without faults.
-- `typed_metadata_cycle` also creates an index on its uncoercible key for its first 3
-  cycles (kept, so `inspect_index` can reach `summary counted unconvertible values`), and
-  cleans up its declarations otherwise (removes the score key; removes the bad key when not
-  kept). `inspect_index` reads `o-<run>-l1` with the owned `ledger` view 1/4 of the time
-  (reads cannot disturb rule-owned entities).
+- `typed_metadata_cycle` writes its uncoercible value under one shared reserved key
+  `own-bad` as `"not-a-number-<v>"` (the old driver used a fresh key and the fixed text
+  `"not-a-number"`); the first cycle also indexes `own-bad`, which is never removed. So the
+  index holds many distinct unconvertible values: `inspect_index` reaches `summary counted
+  unconvertible values` and `resumed from its cursor` on it. Each cycle ends by removing
+  its score key's declaration (keeps l1's schema small). `inspect_index` reads
+  `o-<run>-l1` with the owned `ledger` view 1/4 of the time (reads cannot disturb
+  rule-owned entities).
 - `inspect_index` probes an absent ledger 1/20 (the spec lists the must-hit, not the rate).
 - Rejection fixture "drop of an absent index": not a rejection. The server tombstones the
   key and logs a `DroppedIndexLog` (`processDropIndex`), the model predicts success
