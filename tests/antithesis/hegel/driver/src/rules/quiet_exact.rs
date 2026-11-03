@@ -42,12 +42,19 @@ pub fn quiet_hooks() -> Vec<QuietHook> {
     vec![QuietHook { name: "exact", budget: BUDGET, needs_oracle: true, weight: exact_weight, plan, run }]
 }
 
-/// 4, or 50 once 3 quiet periods passed without a completed exact check.
+/// The weight while `exact` is overdue (the other flavours weigh about 11
+/// together): before the first completed check of the process, and once
+/// `OVERDUE_AFTER` quiet periods passed without one.
+pub const OVERDUE_WEIGHT: f64 = 50.0;
+/// The weight otherwise.
+pub const BASE_WEIGHT: f64 = 10.0;
+pub const OVERDUE_AFTER: u64 = 3;
+
 pub fn exact_weight(s: &Shared) -> f64 {
-    if s.quiets_since_exact() >= 3 {
-        50.0
+    if !s.exact_completed() || s.quiets_since_exact() >= OVERDUE_AFTER {
+        OVERDUE_WEIGHT
     } else {
-        4.0
+        BASE_WEIGHT
     }
 }
 
@@ -364,6 +371,7 @@ pub fn run(d: &Driver, ctx: &mut QuietCtx, plan: &HookPlan) {
     );
     if completed {
         d.s.quiets_since_exact.store(0, Ordering::SeqCst);
+        d.s.exact_completed.store(true, Ordering::SeqCst);
     }
     check_sometimes!(completed, "the full state check completes in a quiet period", json!({"audit": format!("{audit:?}"), "linearizable": format!("{lin:?}"), "node": format!("{node:?}")}));
     if completed || cut {
@@ -401,12 +409,22 @@ mod tests {
     }
 
     #[test]
-    fn weight_rises_after_three_quiet_periods_without_exact() {
+    fn weight_dominates_until_exact_completes_and_when_overdue() {
         let (d, _, _) = testkit::driver();
-        for (n, w) in [(0, 4.0), (2, 4.0), (3, 50.0), (9, 50.0)] {
+        // No completed check yet: dominant from the first quiet period.
+        for n in [0, 1, 2, 3] {
+            d.s.quiets_since_exact.store(n, Ordering::SeqCst);
+            assert_eq!(exact_weight(&d.s), 50.0, "{n}");
+        }
+        d.s.exact_completed.store(true, Ordering::SeqCst);
+        for (n, w) in [(0, 10.0), (2, 10.0), (3, 50.0), (9, 50.0)] {
             d.s.quiets_since_exact.store(n, Ordering::SeqCst);
             assert_eq!(exact_weight(&d.s), w, "{n}");
         }
+        // Dominant over every other registered flavour at its largest weight.
+        d.s.exact_completed.store(false, Ordering::SeqCst);
+        let others: f64 = crate::rules::quiet_hooks().iter().filter(|h| h.name != "exact").map(|h| (h.weight)(&d.s).max(if h.name == "restore_cut" { 6.0 } else { 0.0 })).sum();
+        assert!(exact_weight(&d.s) > 4.0 * others, "others weigh {others}");
         let h = quiet_hooks().remove(0);
         assert_eq!((h.name, h.budget, h.needs_oracle), ("exact", Duration::from_secs(150), true));
     }
@@ -444,7 +462,7 @@ mod tests {
 
     /// A full run: audit chunks (with the head), every part of every live
     /// ledger linearizably, then the drawn node's stale reads; it completes
-    /// and resets the exact counter. `run` takes no TestCase: it cannot draw.
+    /// and resets the exact counter (and marks exact completed). `run` takes no TestCase: it cannot draw.
     #[test]
     fn a_full_run_posts_every_section_and_completes() {
         let (d, ft, fo) = testkit::driver();
@@ -494,6 +512,8 @@ mod tests {
             assert!(a.iter().any(|x| x.message == m && x.cond), "{m}");
         }
         assert_eq!(d.s.quiets_since_exact(), 0);
+        assert!(d.s.exact_completed());
+        assert_eq!(exact_weight(&d.s), BASE_WEIGHT);
     }
 
     #[test]
@@ -508,6 +528,7 @@ mod tests {
         assert!(a.iter().any(|x| x.message == "the full state check completes in a quiet period" && !x.cond));
         assert!(!a.iter().any(|x| x.message == "the full state check completes in a quiet period" && x.cond));
         assert_eq!(d.s.quiets_since_exact(), 2, "not reset: the run did not complete");
+        assert!(!d.s.exact_completed());
     }
 
     /// A page the client cut at max_items (complete:false, no cursor) is not

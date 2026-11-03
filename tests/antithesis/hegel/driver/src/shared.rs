@@ -232,6 +232,14 @@ pub struct Shared {
     pub quiet_open: AtomicBool,
     pub last_exclusive_end: Mutex<Instant>,
     pub quiets_since_exact: AtomicU64,
+    /// An `exact` quiet check has completed in this process (set by task
+    /// 11's hook). Until then `exact` dominates the flavour draw and the
+    /// first quiet periods use the shorter trigger gaps.
+    pub exact_completed: AtomicBool,
+    /// When the last fault pause issued by a quiet period runs out (`None`
+    /// before the first one, or without the pause command). The trigger
+    /// counts its gap from the later of this and `last_quiet_end`.
+    pub fault_pause_until: Mutex<Option<Instant>>,
 
     /// Max log `sequence` of every successful Apply response seen.
     pub acked_seq_high_water: Arc<AtomicU64>,
@@ -275,6 +283,8 @@ impl Shared {
             quiet_open: AtomicBool::new(false),
             last_exclusive_end: Mutex::new(Instant::now()),
             quiets_since_exact: AtomicU64::new(0),
+            exact_completed: AtomicBool::new(false),
+            fault_pause_until: Mutex::new(None),
             acked_seq_high_water: acked,
             track_keys_flagged: AtomicU64::new(0),
             flagged: Mutex::new(VecDeque::new()),
@@ -334,6 +344,10 @@ impl Shared {
 
     pub fn reset_quiets_since_exact(&self) {
         self.quiets_since_exact.store(0, Ordering::SeqCst);
+    }
+
+    pub fn exact_completed(&self) -> bool {
+        self.exact_completed.load(Ordering::SeqCst)
     }
 
     /// Queued plus running quiet-blocking jobs (DESIGN §4.13).

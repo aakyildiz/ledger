@@ -48,15 +48,21 @@ the old drivers to its new home.
    restore, delayed follow-ups) is drawn in a rule and run on a job thread.
    Jobs that send tracked writes hold quiet periods back.
 4. **Quiet periods.** An `always_run` invariant draws a quiet period with a
-   probability that rises with the time since the last one (1/5000 below
-   150 s, up to 1/10 at 480 s): about one every 3–8 minutes of timeline. It
+   probability that rises with the time since the last one, or since the end
+   of its fault pause when that is later (1/5000 below 60 s, up to 1/10 at
+   240 s): about one every 1.5–4 minutes of timeline. The first two quiet
+   periods of a process, while no `exact` check has completed, use 30 s and
+   120 s, so that an Antithesis timeline of a few minutes can finish one. It
    stops faults with `$ANTITHESIS_STOP_FAULTS 100`, waits for every client
    (Q1), for maintenance to be closed, no signature window and no blocking job
    (Q2), for every resolver ticket to settle and the oracle to be idle, with a
    ticket audit before and after (Q3), opens the oracle's quiet epoch (Q4),
    re-issues the pause for the drawn check's budget and runs **one** drawn
    flavour (Q5), and closes the epoch (Q6). Flavours: `exact` (incremental
-   audit replay, exact per-ledger state linearizable and per node; 150 s),
+   audit replay, exact per-ledger state linearizable and per node; 150 s;
+   weight 50, against about 11 for all the others together, until one
+   completes in the process and again after 3 quiet periods without one,
+   10 otherwise; it is the only flavour that feeds the oracle's quiet checks),
    `cross_node_identity` (90 s), `stats_convergence` (70 s),
    `cluster_config_convergence` (20 s), `eventually_correct` (90 s),
    `quiesce_and_absence` (45 s), `numscript_state` (30 s), `restore_cut`
@@ -120,16 +126,23 @@ again (the second pass is cached), or build one service per image
 
 Validate (`snouty validate tests/antithesis/hegel`), then launch with the
 `basic_test` launcher, faults excluded from the driver and the oracle (both
-hold in-memory state the verdicts depend on). Iterate on 12-hour runs first;
-use 24 hours for the final run:
+hold in-memory state the verdicts depend on).
+
+`--max-compute-hours` is a budget of compute hours (one core for one hour),
+not of wall-clock hours: the run fuzzes for compute hours ÷ cores, after
+setup, and the standard tier has 48 cores. The minimum, 12 compute hours, is
+about **15 minutes** of fuzzing: timelines of a few minutes, enough to check
+the deployment and the fault pause but too short for most quiet-period
+coverage. Iterate on 192 compute hours (about 4 hours of fuzzing); use the
+maximum, 1000 (about 21 hours), for the final run:
 
 ```sh
 snouty launch --launcher basic_test --config tests/antithesis/hegel \
   --fault-tolerance high_availability --fault-exclusions '^driver$|^oracle$' \
-  --max-compute-hours 12
+  --max-compute-hours 192
 ```
 
-The first short run should be checked with `snouty runs events`: no kill,
+The first short run (`--max-compute-hours 12`) should be checked with `snouty runs events`: no kill,
 stop, partition or CPU fault may target `driver` or `oracle`, and `the fault
 pause command exists in Antithesis` / `the fault pause command succeeds` must
 be hit.

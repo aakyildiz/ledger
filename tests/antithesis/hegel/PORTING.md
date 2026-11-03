@@ -3209,6 +3209,15 @@ lists no `workload/internal` path, so the service does not link
   made the block test fail about one run in six.
 - A frozen `AGGREGATE_OVERFLOW` is explained before task 09's outcome matcher
   (which accepts only success and NotFound).
+- Quiet-period timing for short Antithesis timelines (run
+  `3d8b6ff117f4ff08f7b9b40db1b5e083-67-0`: 12 compute hours, timelines up to
+  about 8 minutes, `exact` drawn once and never finished, so none of the
+  oracle's quiet checks fired). The trigger gaps are 60 s/240 s instead of
+  150 s/480 s (DESIGN §4.10), the first two quiet periods of a process use
+  30 s/120 s while no `exact` check has completed, and a gap counts from the
+  end of the previous period's fault pause when that is later. `exact` weighs
+  50 until it completes once in the process (and again after 3 quiet periods
+  without a completion), 10 otherwise, instead of 4 (50 after 3).
 
 ## Server findings reported by task 99 (not masked in the checks)
 

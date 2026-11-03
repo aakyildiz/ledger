@@ -19,8 +19,14 @@ use std::time::{Duration, Instant};
 pub const P_LOW: f64 = 1.0 / 5000.0;
 /// Trigger probability from `QUIET_MAX_GAP` on.
 pub const P_HIGH: f64 = 1.0 / 10.0;
-pub const QUIET_MIN_GAP: Duration = Duration::from_secs(150);
-pub const QUIET_MAX_GAP: Duration = Duration::from_secs(480);
+pub const QUIET_MIN_GAP: Duration = Duration::from_secs(60);
+pub const QUIET_MAX_GAP: Duration = Duration::from_secs(240);
+/// The gaps of the first `FIRST_QUIETS` quiet periods of a process while no
+/// `exact` check has completed: an Antithesis timeline is often only a few
+/// minutes long, and `exact` needs Q1–Q4 plus up to its 150 s budget.
+pub const FIRST_MIN_GAP: Duration = Duration::from_secs(30);
+pub const FIRST_MAX_GAP: Duration = Duration::from_secs(120);
+pub const FIRST_QUIETS: u64 = 2;
 /// The head pause at Q0 (covers Q1–Q4).
 pub const Q0_PAUSE_SECS: u64 = 100;
 pub const Q1_DEADLINE: Duration = Duration::from_secs(45);
@@ -103,9 +109,30 @@ pub fn elapsed_probability(elapsed: Duration, min_gap: Duration, max_gap: Durati
     P_LOW + f * (P_HIGH - P_LOW)
 }
 
+/// The trigger gaps: the short ones for the first `FIRST_QUIETS` quiet
+/// periods while no `exact` check has completed, the normal ones after.
+pub fn trigger_gaps(s: &Shared) -> (Duration, Duration) {
+    let started = s.next_epoch.load(std::sync::atomic::Ordering::SeqCst).saturating_sub(1);
+    if !s.exact_completed() && started < FIRST_QUIETS {
+        (FIRST_MIN_GAP, FIRST_MAX_GAP)
+    } else {
+        (QUIET_MIN_GAP, QUIET_MAX_GAP)
+    }
+}
+
+/// The time the trigger's gap counts from: the end of the last quiet period,
+/// or the end of its fault pause when that is later (a pause outlives a
+/// check that finishes early), so faults get a gap between two periods.
+pub fn gap_start(s: &Shared) -> Instant {
+    let end = *s.last_quiet_end.lock().unwrap_or_else(|e| e.into_inner());
+    let pause = *s.fault_pause_until.lock().unwrap_or_else(|e| e.into_inner());
+    pause.map_or(end, |p| p.max(end))
+}
+
 /// Runs the fault pause command for `secs` seconds (no-op without it).
-pub fn pause_faults(secs: u64) {
+pub fn pause_faults(s: &Shared, secs: u64) {
     let Some(bin) = std::env::var_os("ANTITHESIS_STOP_FAULTS") else { return };
+    *s.fault_pause_until.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now() + Duration::from_secs(secs));
     let status = std::process::Command::new(&bin).arg(secs.to_string()).status();
     if std::env::var_os("ANTITHESIS_OUTPUT_DIR").is_some() {
         let ok = status.as_ref().is_ok_and(|s| s.success());
@@ -126,8 +153,8 @@ pub fn quiet_period(d: &Driver, tc: TestCase) {
         return;
     }
     let p = s.cfg.quiet_probability.unwrap_or_else(|| {
-        let last = *s.last_quiet_end.lock().unwrap_or_else(|e| e.into_inner());
-        elapsed_probability(last.elapsed(), QUIET_MIN_GAP, QUIET_MAX_GAP)
+        let (min_gap, max_gap) = trigger_gaps(s);
+        elapsed_probability(gap_start(s).elapsed(), min_gap, max_gap)
     });
     if !draw::chance(&tc, p) {
         return;
@@ -232,7 +259,7 @@ pub fn run_quiet(d: &Driver, hook: Option<&QuietHook>, plan: Option<HookPlan>) {
     s.quiets_since_exact.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     s.quiet_open.store(true, std::sync::atomic::Ordering::SeqCst);
     let _end = EndGuard(s);
-    pause_faults(t.q0_pause_secs);
+    pause_faults(s, t.q0_pause_secs);
     check_reachable!("a quiet period starts", json!({"hook": name, "epoch": epoch}));
     println!("driver: quiet period {epoch} ({name}) starts");
 
@@ -295,7 +322,7 @@ pub fn run_quiet(d: &Driver, hook: Option<&QuietHook>, plan: Option<HookPlan>) {
     // Q5
     let completed = match (hook, plan.as_ref()) {
         (Some(h), Some(plan)) => {
-            pause_faults(h.budget.as_secs() + t.pause_margin_secs);
+            pause_faults(s, h.budget.as_secs() + t.pause_margin_secs);
             ctx.deadline = Instant::now() + h.budget;
             (h.run)(d, &mut ctx, plan);
             Instant::now() <= ctx.deadline
@@ -350,16 +377,49 @@ mod tests {
         assert_eq!(elapsed_probability(QUIET_MIN_GAP - Duration::from_secs(1), QUIET_MIN_GAP, QUIET_MAX_GAP), P_LOW);
         assert_eq!(elapsed_probability(QUIET_MAX_GAP, QUIET_MIN_GAP, QUIET_MAX_GAP), P_HIGH);
         assert_eq!(elapsed_probability(QUIET_MAX_GAP + Duration::from_secs(600), QUIET_MIN_GAP, QUIET_MAX_GAP), P_HIGH);
-        let mid = elapsed_probability(Duration::from_secs(315), QUIET_MIN_GAP, QUIET_MAX_GAP);
+        let mid = elapsed_probability(Duration::from_secs(150), QUIET_MIN_GAP, QUIET_MAX_GAP);
         assert!(mid > P_LOW && mid < P_HIGH);
+    }
+
+    #[test]
+    fn the_first_quiet_periods_use_short_gaps_until_exact_completes() {
+        let (d, _, _) = testkit::driver();
+        let s = &d.s;
+        assert_eq!(trigger_gaps(s), (FIRST_MIN_GAP, FIRST_MAX_GAP));
+        s.next_epoch.store(1 + FIRST_QUIETS - 1, Ordering::SeqCst);
+        assert_eq!(trigger_gaps(s), (FIRST_MIN_GAP, FIRST_MAX_GAP));
+        s.next_epoch.store(1 + FIRST_QUIETS, Ordering::SeqCst);
+        assert_eq!(trigger_gaps(s), (QUIET_MIN_GAP, QUIET_MAX_GAP), "bounded: a failing exact does not keep the short gaps");
+        s.next_epoch.store(1, Ordering::SeqCst);
+        s.exact_completed.store(true, Ordering::SeqCst);
+        assert_eq!(trigger_gaps(s), (QUIET_MIN_GAP, QUIET_MAX_GAP));
+    }
+
+    #[test]
+    fn the_gap_counts_from_the_end_of_the_fault_pause() {
+        let (d, _, _) = testkit::driver();
+        let s = &d.s;
+        let end = Instant::now();
+        *s.last_quiet_end.lock().unwrap() = end;
+        assert_eq!(gap_start(s), end);
+        *s.fault_pause_until.lock().unwrap() = Some(end + Duration::from_secs(100));
+        assert_eq!(gap_start(s), end + Duration::from_secs(100));
+        *s.fault_pause_until.lock().unwrap() = Some(end - Duration::from_secs(5));
+        assert_eq!(gap_start(s), end);
     }
 
     #[test]
     fn budget_table_fits_the_pause_limit() {
         assert_eq!(P_LOW, 1.0 / 5000.0);
         assert_eq!(P_HIGH, 1.0 / 10.0);
-        assert_eq!(QUIET_MIN_GAP, Duration::from_secs(150));
-        assert_eq!(QUIET_MAX_GAP, Duration::from_secs(480));
+        assert_eq!(QUIET_MIN_GAP, Duration::from_secs(60));
+        assert_eq!(QUIET_MAX_GAP, Duration::from_secs(240));
+        assert_eq!((FIRST_MIN_GAP, FIRST_MAX_GAP, FIRST_QUIETS), (Duration::from_secs(30), Duration::from_secs(120), 2));
+        assert!(FIRST_MIN_GAP < FIRST_MAX_GAP && FIRST_MAX_GAP <= QUIET_MAX_GAP && QUIET_MIN_GAP < QUIET_MAX_GAP);
+        // An `exact` drawn at the end of the first gap (Q0 pause, which bounds
+        // Q1–Q4, plus its budget) finishes within 6.5 minutes of workload.
+        let exact = crate::rules::quiet_hooks().into_iter().find(|h| h.name == "exact").expect("exact registered");
+        assert!(FIRST_MAX_GAP.as_secs() + Q0_PAUSE_SECS + exact.budget.as_secs() <= 390);
         assert_eq!((Q0_PAUSE_SECS, Q1_DEADLINE, Q2_DEADLINE, Q3_DEADLINE, Q4_EXTRA, PAUSE_MARGIN_SECS), (100, Duration::from_secs(45), Duration::from_secs(60), Duration::from_secs(90), Duration::from_secs(10), 15));
         let t = crate::shared::Timing::default();
         assert_eq!((t.q0_pause_secs, t.q1, t.q2, t.q3, t.q4_extra, t.pause_margin_secs), (Q0_PAUSE_SECS, Q1_DEADLINE, Q2_DEADLINE, Q3_DEADLINE, Q4_EXTRA, PAUSE_MARGIN_SECS));
