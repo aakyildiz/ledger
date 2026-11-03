@@ -13,13 +13,15 @@ send $amount ( source = $from allowing unbounded overdraft  destination = $to )
 Code: `HG/driver/src/rules/numscript.rs` (rules, setup hook, quiet hook),
 `rules/numscript/model.rs` (library and transaction model, script texts, pure checks),
 `rules/numscript/semver.rs` (ordering, selectors, bumps). Every write goes through
-`send_untracked` with a key; nothing goes through the oracle.
+`send_untracked`, with a key (except a quarter of the `ns_unresolved` sends). Nothing goes
+through the oracle.
 
 | Rule | Weight | What |
 |---|---|---|
 | `ns_save` | 0.5 | a next version of `transfer` (fixed `2.0.0` branch while the greatest sent version is below it, else a drawn major/minor/patch bump by 1 or by a drawn amount of the uint32 room), a next version of an existing `s-<N>`, or the first version of a new `s-<N>` (`N.0.0`, N ∈ 1..=10, or three drawn uint32 components below `u32::MAX`); 1/8 re-saves an acked version with other content. Versions are allocated under the model lock above the greatest version ever sent, so concurrent saves never race on one version. `transfer` versions differ from 1.0.0 only in drawn whitespace, line endings and comments (`Layout`); `s-<N>` versions are drawn among three templates (`Transfer`, `Reversed`, `ViaHub`) |
 | `ns_read` | 0.5 | GetNumscript (`""`, `latest`, exact, partial `a`, `a.b`), ListNumscripts (drawn page size, cursor paging ≤ 8 s), ListNumscriptVersions, on a name with an acked version; linearizable (server default), drawn route |
 | `ns_exec` | 1.0 | CreateTransaction with `scriptReference{name, "latest" | pinned acked version, vars}` or inline `script{plain: transfer, vars}`; from = pool address or `world`, to = another pool address, amount `COIN`/`USD/2` from `amount_positive`; unique reference `r-<run>-ns<N>`; keyed; `send_untracked` |
+| `ns_unresolved` | 0.15 | CreateTransaction with an inline script whose `$dst` is `meta(@ns-cfg:<N>, "dest")` of a fresh account that never gets that key, reference `r-<run>-nsu<N>`, keyed (3/4) or not, drawn routes and backoffs, a 3 s retry budget. Dependency resolution fails after a mutable metadata read. With a key, admission forwards the order as `preload_unavailable` and the FSM answers `PRELOAD_UNAVAILABLE` (retryable, not audited, not frozen; `admission.go` `classifyResolutionFailure`, EN-1406/EN-1557). Without a key, admission fails fast with `DEPENDENCY_DISCOVERY_FAILED`. It is the only source of 00's `a write attempt hits a preload miss` (triage of run 076d255c…-67-0) |
 | quiet `numscript_state` | 0.5 (30 s, `needs_oracle: false`) | per ledger (hegel-drawn order): ListTransactions (all pages), ListAccounts (all pages), GetLedgerStats; resolve Unknown records by reference; evaluate the Always properties only for fully read ledgers |
 
 ## Porting table
@@ -50,6 +52,7 @@ Code: `HG/driver/src/rules/numscript.rs` (rules, setup hook, quiet hook),
 | `a numscript read returns a saved version and its content` | AlwaysOrUnreachable | ns_read | GetNumscript (any selector) returns a legal resolution of the selector (stored possibly, matching, ≥ the greatest matching acked-before version) with the content the model saved for that version; ListNumscripts items are legal latest versions with their content; ListNumscriptVersions lists every acked-before version and only versions that may be stored; a server refusal of a selector that an acked version matches is a violation: a definitive reason, or the bare gRPC `NotFound` (no reason) GetNumscript answers a missing script with (`controller_default.go` GetNumscript, `adapter/grpc/server.go:662-664`) |
 | `a numscript transaction commits exactly the postings its script implies` | Always | ns_exec | a definitive success returns one log whose created transaction's postings are one of the candidates (`transfer`/inline: `[{from,to,amount,asset}]`; `s-<N>` with `latest`: the template of every non-rejected version, as known when the answer arrives, at or above the greatest version acked when the transaction was sent; pinned: that version's template). Second call site in numscript_state: an Unknown/Pending record found committed by the quiet listing must be listed with one of its candidates (for `latest`, recomputed from the library at the listing, so a write applied after the driver gave up on it is judged against every version saved since its floor) |
 | `a numscript transaction reports consistent post-commit volumes` | Always | ns_exec | on a definitive success whose created transaction carries `postCommitVolumes`: every posting's (account, asset) has an uncolored entry with present, decodable input and output (the server always sets both, `processor_volumes.go:60-80`), input ≥ the amounts the transaction sent to it and output ≥ the amounts it sent from it. An absent `postCommitVolumes` is tolerated, like the old helper |
+| `a numscript whose meta() source is absent never commits` | Always | ns_unresolved | the send's final outcome (a late usable answer included) is not a success: nothing ever writes the metadata it resolves its destination from |
 | `an acknowledged numscript transaction survives faults` | Always | numscript_state | every Acked record is listed by reference with the postings acknowledged |
 | `a definitively rejected numscript transaction never takes effect` | Always | numscript_state | no Rejected record is listed |
 | `a numscript ledger's balances equal its committed postings` | Always | numscript_state | ListAccounts volumes (input, output, balance = input − output) of every account equal the sums over committed records (Acked + resolved); no unexpected non-zero volume; color always `""`. The two listings are separate snapshots and a write the driver gave up on can still land between them (a client-side retry outlives the Q1 barrier), so on a mismatch the hook re-reads accounts then transactions and judges again; only a mismatch on three reads is asserted |
@@ -79,6 +82,7 @@ answer).
 | numscript execution count caught up | Sometimes | numscript_state | no faults |
 | a numscript transaction reports consistent post-commit volumes | Always | ns_exec success | no faults |
 | numscript_state completes within its quiet budget | Sometimes | numscript_state | no faults |
+| a numscript whose meta() source is absent never commits | Always | ns_unresolved | no faults |
 
 AlwaysOrUnreachable literals (`a saved numscript version is immutable`, `a numscript read
 returns a saved version and its content`, `a re-save of a saved numscript version is refused

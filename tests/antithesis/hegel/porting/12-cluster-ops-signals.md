@@ -82,7 +82,7 @@ Error classes used below (`cluster_ops.rs`):
 |---|---|---|
 | Always | a full backup's applied index covers every barrier completed before it started | `run_chain`: `lastAppliedIndex ≥` the highest barrier commit index (`BarrierState.high`) recorded in the rule. Backup applies its Start order (`orchestrator.go:274`) before it takes the checkpoint, and a proposal resolves only after its Pebble commit (`applier.go` `submitAsyncCommit`), so the checkpoint is past every barrier that completed earlier. Replaces the spec's `lastLogSequence ≥ Shared.acked_seq_high_water` (see Deviations) |
 | Sometimes | a follower reports an out-of-sync or snapshotting status | `cluster_state` |
-| Sometimes | the leader reports a follower in snapshot progress | `cluster_state` |
+| Sometimes | the leader reports a follower in snapshot progress | `explore_cluster_state`, which `Clients::call_with_op` runs on every successful `GetClusterState` answer that is the leader's own view (`localNode == leader`): the rules' calls, leader-routed discovery, and the snapshot watch (below) |
 | Reachable | the driver parses a structured server log record | server_signals.rs |
 | Reachable | the driver receives ledger server logs | server_signals.rs |
 | Reachable | the driver receives client logs while the workload runs | server_signals.rs (renamed from the spec's `the driver receives client logs`, which 00c already uses ungated in logs.rs; DESIGN §9.2 item 6) |
@@ -96,6 +96,17 @@ Error classes used below (`cluster_ops.rs`):
 | Reachable | a bloom config change triggers a rebuild | (`Bloom filter config changed: purging blocks and rebuilding`) |
 | Reachable | a bloom populate races a rebuild | (`Bloom task skipped SetReady: Rebuild occurred`) |
 | Unreachable | a server logs an invariant red flag | server_signals.rs: records whose `msg` starts with `SENTINEL DIAG:`, `CACHE COHERENCE:`, `POST-COMMIT VOLUME ASSERTION FAILED`, `AGGREGATED VOLUME BALANCE CHECK FAILED`, `PERSISTED VOLUME UPDATE at invariant violation`, `TRANSIENT VOLUME at invariant violation`, `Preload boundary mismatch`, `preload coverage miss: read of undeclared key`, `Pebble lags WAL snapshot`, `Leadership gained Ready has no entries`; ledger and restore-target lines, from boot. `Terminal Raft command failure; stopping node` is printed only (see Deviations) |
+
+The `snapshot_watch` log hook starts a helper thread (one at a time) when a
+`ledger-*` line `Applying snapshot sent by leader` arrives while the workload
+is active. The thread polls `GetClusterState{}` (leader-routed, rotating
+clients) every 100 ms for up to `SNAPSHOT_WATCH` (12 s), stopping at the
+first leader view with a follower in `Snapshot`. The leader keeps a follower
+in `Snapshot` from sending `MsgSnap` until that follower answers
+`MsgAppResp`, after it installs the snapshot (the leader never calls
+`ReportSnapshot`). The window is therefore the follower's install time,
+often milliseconds but sometimes seconds. Random `cluster_state` polls
+never land in it (run 076d255c…-67-0: 174 polls, 0 hits, 35 installs).
 
 Log signals are counted per node (`SignalState`, first occurrence printed as
 `driver: signal <name> first seen on <node>`), active or not; Reachables only while the
@@ -123,7 +134,7 @@ workload is active. Signal Reachables count only `ledger-*` lines (the main clus
 | CheckStore completed successfully | check_store job | no faults |
 | should be able to add NATS event sink, should be able to remove event sink | event_sinks | no faults |
 | a follower reports an out-of-sync or snapshotting status | cluster_state | faults + knobs |
-| the leader reports a follower in snapshot progress | cluster_state | faults + knobs |
+| the leader reports a follower in snapshot progress | every leader `GetClusterState` answer; the snapshot watch after `Applying snapshot sent by leader` (follower installs of 1–9 s) | faults + knobs |
 | the driver parses a structured server log record | log hook | no faults |
 | the driver receives ledger server logs | log hook | no faults |
 | the driver receives client logs while the workload runs | log hook | no faults |

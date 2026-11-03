@@ -221,7 +221,7 @@ family's own porting file records the final mapping.
 | a tracked write is handed off to a resolver | smoke_tx / any tracked write | faults |
 | a resolver settles a handed-off write | resolvers | faults |
 | a write attempt is refused as a stale proposal | any `Apply` the driver sends through `/op` | faults (+ heterogeneous cache knobs, DESIGN §8) |
-| a write attempt hits a preload miss | any `Apply` the driver sends through `/op` | faults |
+| a write attempt hits a preload miss | 13's `ns_unresolved`: a keyed send whose dependency resolution fails after a mutable read gets `PRELOAD_UNAVAILABLE` (triage of run 076d255c…-67-0). `BALANCE_NOT_PRELOADED` cannot be produced from outside the server: a volume read the admission plan did not declare fails as `COVERAGE_MISS`, so the server raises it only when a store read returns neither a volume nor an error (`processor_posting.go` `readVolumeOrZero`) | no faults |
 | a write attempt is blocked by clock skew | any `Apply` the driver sends through `/op` | faults (a clock offset between nodes; Antithesis clock faults that move every node together do not produce it) |
 | H/logs.rs leadership/restart/log-receipt literals | log receiver | faults for restarts and leadership changes; log receipt needs the compose log forwarders (not `run_native.sh`) |
 | the driver notices a client restart | any call after a client restart | faults |
@@ -1536,7 +1536,7 @@ Fixtures: `W/oraclecheck/testdata/rejections/07-*.json`.
 | oracle: index inspection summary counted unconvertible values | `typed_metadata_cycle` writes `own-bad = "not-a-number-<v>"` (declared INT64, indexed while the model lacks the index); `inspect_index` inspects l1 with the owned view 1/4 | no faults |
 | oracle: index inspection served from a checkpoint | `inspect_index` with `HEGEL_HAVE_CHECKPOINTS=1` | needs task 09 |
 | oracle: metadata field not in schema rejection exercised | `index_op` 1/16 probe | no faults |
-| a write attempt is refused while an index builds | a `createQueryCheckpoint` attempt (task 09) answered `INDEX_BUILDING` inside the audit-projection rebuild after a restart | faults (rare) |
+| a write attempt is refused while an index builds | a `createQueryCheckpoint` attempt (task 09) answered `INDEX_BUILDING` inside the audit-projection rebuild after a restart | faults (rare by design, see Deviations) |
 | changing metadata type should not crash (+ the two declaring literals) | `typed_metadata_cycle` | no faults (AlwaysOrUnreachable) |
 
 ## Deviations from the spec
@@ -1612,7 +1612,17 @@ Fixtures: `W/oraclecheck/testdata/rejections/07-*.json`.
   `checkpointId`; re-check if 09's view shape changes before merge.
 - `a write attempt is refused while an index builds` needs faults and a checkpoint create
   inside the audit rebuild window; it is now asserted on every `Apply` answer
-  (`write::explore_attempt`), not only on this family's (which never get it).
+  (`write::explore_attempt`), not only on this family's (which never get it). It is rare
+  by design. It was never evaluated in run 076d255c…-67-0. Admission runs on the leader,
+  and the leader's audit projection reports rebuilding only from process start
+  (`auditindexer.New`) until its asynchronous boot pass ends (`Indexer.boot`: one
+  `ProcessOnce`, or `Rebuild` over a few thousand audit entries, which takes milliseconds),
+  or after a failed indexing pass (`SetAuditProjectionFailed`, a Pebble read error). A
+  restarted node must therefore win an election before its own boot pass ends. That needs
+  a pause or throttle on that node, and a checkpoint create must land in the same window.
+  No compose knob widens this window, and the workload has no way to target it (the
+  readiness flag is node-local and not exposed). It stays a Sometimes, because it is the
+  only coverage of that admission branch, and it is listed as rare in 99.
 - Task 06's indexed-query validators depend on `index promoted to active` happening; with
   `index_op` at weight 1.0 roughly half of the pool is present at any time.
 
@@ -2315,7 +2325,7 @@ Error classes used below (`cluster_ops.rs`):
 |---|---|---|
 | Always | a full backup's applied index covers every barrier completed before it started | `run_chain`: `lastAppliedIndex ≥` the highest barrier commit index (`BarrierState.high`) recorded in the rule. Backup applies its Start order (`orchestrator.go:274`) before it takes the checkpoint, and a proposal resolves only after its Pebble commit (`applier.go` `submitAsyncCommit`), so the checkpoint is past every barrier that completed earlier. Replaces the spec's `lastLogSequence ≥ Shared.acked_seq_high_water` (see Deviations) |
 | Sometimes | a follower reports an out-of-sync or snapshotting status | `cluster_state` |
-| Sometimes | the leader reports a follower in snapshot progress | `cluster_state` |
+| Sometimes | the leader reports a follower in snapshot progress | `explore_cluster_state`, which `Clients::call_with_op` runs on every successful `GetClusterState` answer that is the leader's own view (`localNode == leader`): the rules' calls, leader-routed discovery, and the snapshot watch (below) |
 | Reachable | the driver parses a structured server log record | server_signals.rs |
 | Reachable | the driver receives ledger server logs | server_signals.rs |
 | Reachable | the driver receives client logs while the workload runs | server_signals.rs (renamed from the spec's `the driver receives client logs`, which 00c already uses ungated in logs.rs; DESIGN §9.2 item 6) |
@@ -2329,6 +2339,17 @@ Error classes used below (`cluster_ops.rs`):
 | Reachable | a bloom config change triggers a rebuild | (`Bloom filter config changed: purging blocks and rebuilding`) |
 | Reachable | a bloom populate races a rebuild | (`Bloom task skipped SetReady: Rebuild occurred`) |
 | Unreachable | a server logs an invariant red flag | server_signals.rs: records whose `msg` starts with `SENTINEL DIAG:`, `CACHE COHERENCE:`, `POST-COMMIT VOLUME ASSERTION FAILED`, `AGGREGATED VOLUME BALANCE CHECK FAILED`, `PERSISTED VOLUME UPDATE at invariant violation`, `TRANSIENT VOLUME at invariant violation`, `Preload boundary mismatch`, `preload coverage miss: read of undeclared key`, `Pebble lags WAL snapshot`, `Leadership gained Ready has no entries`; ledger and restore-target lines, from boot. `Terminal Raft command failure; stopping node` is printed only (see Deviations) |
+
+The `snapshot_watch` log hook starts a helper thread (one at a time) when a
+`ledger-*` line `Applying snapshot sent by leader` arrives while the workload
+is active. The thread polls `GetClusterState{}` (leader-routed, rotating
+clients) every 100 ms for up to `SNAPSHOT_WATCH` (12 s), stopping at the
+first leader view with a follower in `Snapshot`. The leader keeps a follower
+in `Snapshot` from sending `MsgSnap` until that follower answers
+`MsgAppResp`, after it installs the snapshot (the leader never calls
+`ReportSnapshot`). The window is therefore the follower's install time,
+often milliseconds but sometimes seconds. Random `cluster_state` polls
+never land in it (run 076d255c…-67-0: 174 polls, 0 hits, 35 installs).
 
 Log signals are counted per node (`SignalState`, first occurrence printed as
 `driver: signal <name> first seen on <node>`), active or not; Reachables only while the
@@ -2356,7 +2377,7 @@ workload is active. Signal Reachables count only `ledger-*` lines (the main clus
 | CheckStore completed successfully | check_store job | no faults |
 | should be able to add NATS event sink, should be able to remove event sink | event_sinks | no faults |
 | a follower reports an out-of-sync or snapshotting status | cluster_state | faults + knobs |
-| the leader reports a follower in snapshot progress | cluster_state | faults + knobs |
+| the leader reports a follower in snapshot progress | every leader `GetClusterState` answer; the snapshot watch after `Applying snapshot sent by leader` (follower installs of 1–9 s) | faults + knobs |
 | the driver parses a structured server log record | log hook | no faults |
 | the driver receives ledger server logs | log hook | no faults |
 | the driver receives client logs while the workload runs | log hook | no faults |
@@ -2447,13 +2468,15 @@ send $amount ( source = $from allowing unbounded overdraft  destination = $to )
 Code: `HG/driver/src/rules/numscript.rs` (rules, setup hook, quiet hook),
 `rules/numscript/model.rs` (library and transaction model, script texts, pure checks),
 `rules/numscript/semver.rs` (ordering, selectors, bumps). Every write goes through
-`send_untracked` with a key; nothing goes through the oracle.
+`send_untracked`, with a key (except a quarter of the `ns_unresolved` sends). Nothing goes
+through the oracle.
 
 | Rule | Weight | What |
 |---|---|---|
 | `ns_save` | 0.5 | a next version of `transfer` (fixed `2.0.0` branch while the greatest sent version is below it, else a drawn major/minor/patch bump by 1 or by a drawn amount of the uint32 room), a next version of an existing `s-<N>`, or the first version of a new `s-<N>` (`N.0.0`, N ∈ 1..=10, or three drawn uint32 components below `u32::MAX`); 1/8 re-saves an acked version with other content. Versions are allocated under the model lock above the greatest version ever sent, so concurrent saves never race on one version. `transfer` versions differ from 1.0.0 only in drawn whitespace, line endings and comments (`Layout`); `s-<N>` versions are drawn among three templates (`Transfer`, `Reversed`, `ViaHub`) |
 | `ns_read` | 0.5 | GetNumscript (`""`, `latest`, exact, partial `a`, `a.b`), ListNumscripts (drawn page size, cursor paging ≤ 8 s), ListNumscriptVersions, on a name with an acked version; linearizable (server default), drawn route |
 | `ns_exec` | 1.0 | CreateTransaction with `scriptReference{name, "latest" | pinned acked version, vars}` or inline `script{plain: transfer, vars}`; from = pool address or `world`, to = another pool address, amount `COIN`/`USD/2` from `amount_positive`; unique reference `r-<run>-ns<N>`; keyed; `send_untracked` |
+| `ns_unresolved` | 0.15 | CreateTransaction with an inline script whose `$dst` is `meta(@ns-cfg:<N>, "dest")` of a fresh account that never gets that key, reference `r-<run>-nsu<N>`, keyed (3/4) or not, drawn routes and backoffs, a 3 s retry budget. Dependency resolution fails after a mutable metadata read. With a key, admission forwards the order as `preload_unavailable` and the FSM answers `PRELOAD_UNAVAILABLE` (retryable, not audited, not frozen; `admission.go` `classifyResolutionFailure`, EN-1406/EN-1557). Without a key, admission fails fast with `DEPENDENCY_DISCOVERY_FAILED`. It is the only source of 00's `a write attempt hits a preload miss` (triage of run 076d255c…-67-0) |
 | quiet `numscript_state` | 0.5 (30 s, `needs_oracle: false`) | per ledger (hegel-drawn order): ListTransactions (all pages), ListAccounts (all pages), GetLedgerStats; resolve Unknown records by reference; evaluate the Always properties only for fully read ledgers |
 
 ## Porting table
@@ -2484,6 +2507,7 @@ Code: `HG/driver/src/rules/numscript.rs` (rules, setup hook, quiet hook),
 | `a numscript read returns a saved version and its content` | AlwaysOrUnreachable | ns_read | GetNumscript (any selector) returns a legal resolution of the selector (stored possibly, matching, ≥ the greatest matching acked-before version) with the content the model saved for that version; ListNumscripts items are legal latest versions with their content; ListNumscriptVersions lists every acked-before version and only versions that may be stored; a server refusal of a selector that an acked version matches is a violation: a definitive reason, or the bare gRPC `NotFound` (no reason) GetNumscript answers a missing script with (`controller_default.go` GetNumscript, `adapter/grpc/server.go:662-664`) |
 | `a numscript transaction commits exactly the postings its script implies` | Always | ns_exec | a definitive success returns one log whose created transaction's postings are one of the candidates (`transfer`/inline: `[{from,to,amount,asset}]`; `s-<N>` with `latest`: the template of every non-rejected version, as known when the answer arrives, at or above the greatest version acked when the transaction was sent; pinned: that version's template). Second call site in numscript_state: an Unknown/Pending record found committed by the quiet listing must be listed with one of its candidates (for `latest`, recomputed from the library at the listing, so a write applied after the driver gave up on it is judged against every version saved since its floor) |
 | `a numscript transaction reports consistent post-commit volumes` | Always | ns_exec | on a definitive success whose created transaction carries `postCommitVolumes`: every posting's (account, asset) has an uncolored entry with present, decodable input and output (the server always sets both, `processor_volumes.go:60-80`), input ≥ the amounts the transaction sent to it and output ≥ the amounts it sent from it. An absent `postCommitVolumes` is tolerated, like the old helper |
+| `a numscript whose meta() source is absent never commits` | Always | ns_unresolved | the send's final outcome (a late usable answer included) is not a success: nothing ever writes the metadata it resolves its destination from |
 | `an acknowledged numscript transaction survives faults` | Always | numscript_state | every Acked record is listed by reference with the postings acknowledged |
 | `a definitively rejected numscript transaction never takes effect` | Always | numscript_state | no Rejected record is listed |
 | `a numscript ledger's balances equal its committed postings` | Always | numscript_state | ListAccounts volumes (input, output, balance = input − output) of every account equal the sums over committed records (Acked + resolved); no unexpected non-zero volume; color always `""`. The two listings are separate snapshots and a write the driver gave up on can still land between them (a client-side retry outlives the Q1 barrier), so on a mismatch the hook re-reads accounts then transactions and judges again; only a mismatch on three reads is asserted |
@@ -2513,6 +2537,7 @@ answer).
 | numscript execution count caught up | Sometimes | numscript_state | no faults |
 | a numscript transaction reports consistent post-commit volumes | Always | ns_exec success | no faults |
 | numscript_state completes within its quiet budget | Sometimes | numscript_state | no faults |
+| a numscript whose meta() source is absent never commits | Always | ns_unresolved | no faults |
 
 AlwaysOrUnreachable literals (`a saved numscript version is immutable`, `a numscript read
 returns a saved version and its content`, `a re-save of a saved numscript version is refused
@@ -3143,7 +3168,7 @@ Sometimes / Reachable: `restore base backup completes`, `a restore cut has a non
 | `a finalize before validate is refused` | `restore_plan` finalize-early perturbation (1/2 of online plans) | no faults |
 | `an offline bootstrap with validation succeeds`, `an offline bootstrap without validation succeeds` | offline plans (1/4, validate 1/2) | no faults |
 | `a chained restore verifies` | chained plans (1/4) | no faults |
-| `a restore cycle survives a restart of restore-0` | any cycle during which restore-0's container restarts | faults |
+| `a restore cycle survives a restart of restore-0` | a held plan (`hold_secs`, 35% of plans) whose restore-0 is killed or stopped while it serves after the quiet period's fault pause | faults |
 | `a restored joiner syncs from the restored genesis` | joiner plans | `RESTORE_JOINER=1` (AlwaysOrUnreachable, not must-hit) |
 
 ## Deviations from the spec
@@ -3179,6 +3204,17 @@ Sometimes / Reachable: `restore base backup completes`, `a restore cut has a non
 7. Each long step (Cut → Staged, Staged → Serving, Serving → Verified) is one job; the seed
    writes run synchronously in `restore_base`/`restore_step` (rules are parked during quiet
    periods, so the seed never overlaps another family's quiet check).
+8. **Hold past the fault pause** (triage of run 076d255c…-67-0): the cut runs inside a
+   quiet period, and that quiet period pauses faults for `q0_pause_secs` (100 s). A whole
+   cycle fits inside the pause. In that run, all 25 cycles ended Verified 25–75 s after their
+   cut, and no restore-0 kill or stop fell between a cut and its cycle's end, so
+   `a restore cycle survives a restart of restore-0` was 0/25. `restore_plan` now draws
+   `hold_secs` (35% of plans, 10–60 s). `restore_step` does not submit the verify job of a
+   Serving cycle until `hold_secs` after `Shared::fault_pause_until`, or after the cut when
+   there was no pause (`holding`). The hold never goes past half the cycle budget, so faults
+   (restore-0's container kills and stops included) land while the restored server serves.
+   When restore-0 restarts, the agent resumes the child, and `verify_job` retries a failed
+   digest on the next step.
 
 ## Requests to 99
 
@@ -3207,12 +3243,12 @@ none was removed; each is justified here:
 |---|---|---|---|
 | `the fault pause command exists in Antithesis` | Always | evaluated only under `ANTITHESIS_OUTPUT_DIR` | Antithesis only |
 | `the fault pause command succeeds` | Always | evaluated only under `ANTITHESIS_OUTPUT_DIR` | Antithesis only |
-| `a write attempt hits a preload miss` | Sometimes | `BALANCE_NOT_PRELOADED` / `PRELOAD_UNAVAILABLE` need a leader change or a cache miss under faults | faults |
+| `a write attempt hits a preload miss` | Sometimes | `PRELOAD_UNAVAILABLE` needs a keyed write whose dependency resolution fails after a mutable read, and no rule sent one until 13's `ns_unresolved` (run 076d255c…-67-0: never evaluated). `BALANCE_NOT_PRELOADED` cannot be produced from outside the server: an undeclared volume read fails as `COVERAGE_MISS` | no faults (since `ns_unresolved`) |
 | `a write attempt is blocked by clock skew` | Sometimes | `WRITES_BLOCKED_CLOCK_SKEW` needs an offset between nodes; Antithesis clock faults move every node together (run 67-0: every sampled jump hit `["ALL"]`), so the health check only sees skew when a jump lands inside one `GetNodeTime` round | faults (rare) |
 | `a write attempt is refused as a stale proposal` | Sometimes | `STALE_PROPOSAL` needs a leadership change between plan and apply (more with per-node cache thresholds, see below); a `lib`-route retry hides it, so it shows on `plain` and `node` routes. Asserted on every `Apply` answer since the run 67-0 triage | faults + knobs |
-| `a write attempt is refused while an index builds` | Sometimes | the only write-path `INDEX_BUILDING` is a `createQueryCheckpoint` while the audit projection rebuilds after a restart (`admission.go` `checkQueryCheckpointProjectionReady`): reachable, kept. Since run 3d8b6ff1…-67-0 it is an arm of `write::explore_attempt`, which `Clients::call_with_op` runs on every `Apply` answer (so the checkpoint creates of task 09 too); before, only index-family attempts were checked, which never get it | faults |
-| `the leader reports a follower in snapshot progress` | Sometimes | a follower more than `RAFT_COMPACTION_MARGIN` entries behind while the leader reports it (`a follower reports an out-of-sync or snapshotting status` was hit once under local faults) | faults + knobs |
-| `a restore cycle survives a restart of restore-0` | Sometimes | needs restore-0 killed mid-cycle (a container fault inside a 5–10 minute cycle) | faults (long runs) |
+| `a write attempt is refused while an index builds` | Sometimes | the only write-path `INDEX_BUILDING` is a `createQueryCheckpoint` while the audit projection rebuilds after a restart (`admission.go` `checkQueryCheckpointProjectionReady`): reachable, kept. Since run 3d8b6ff1…-67-0 it is an arm of `write::explore_attempt`, which `Clients::call_with_op` runs on every `Apply` answer (so the checkpoint creates of task 09 too); before, only index-family attempts were checked, which never get it. Rare by design: the window lasts from process start until the boot pass of the restarted node's audit indexer ends, and that node must already lead (07, Deviations). No knob widens it | faults (rare) |
+| `the leader reports a follower in snapshot progress` | Sometimes | the leader holds a follower in `Snapshot` only while that follower installs the snapshot. Since run 076d255c…-67-0, every leader `GetClusterState` answer is evaluated, and a snapshot watch polls the leader after each `Applying snapshot sent by leader` (12) | faults + knobs |
+| `a restore cycle survives a restart of restore-0` | Sometimes | needs restore-0 killed mid-cycle. The cut's quiet period pauses faults for 100 s, which outlasts an unheld cycle, so only held plans (`hold_secs`, since run 076d255c…-67-0; 18, Deviation 8) can reach it | faults |
 | `a cluster config change resets the cache epoch` | Reachable | needs per-node `CACHE_ROTATION_THRESHOLD`, which the compose file equalises until the server divergence below is fixed | knobs (disabled) |
 | `a cluster config change was observed between quiet periods` | Sometimes | a leadership change that changes the persisted cluster config between two `cluster_config_convergence` runs | faults + knobs |
 | `a chained restore verifies` | Sometimes | a drawn plan variant (chained, about one cycle in four); a cycle takes 5–10 minutes, so 45 minutes give a handful of cycles | no faults (long runs) |
@@ -3314,6 +3350,38 @@ lists no `workload/internal` path, so the service does not link
     the leader holds a follower in `Snapshot` only until the follower acks the
     `MsgSnap`, and `cluster_state` (weight 0.3) polled 119 times, always seeing
     `Replicate`, while `a follower receives a raft snapshot` was hit 9 times.
+    Fixed after run 076d255c…-67-0 (below).
+- Antithesis run 076d255c…-67-0 (basic_test, 48 h) rare-coverage triage:
+  - `the leader reports a follower in snapshot progress` (0/174): followers
+    did fall behind `RAFT_COMPACTION_MARGIN` (100). There were 35
+    `Applying snapshot sent by leader` lines, and `a follower receives a raft
+    snapshot` was hit 15 times, so the knob works. The leader shows `Snapshot`
+    only from `MsgSnap` until the follower's `MsgAppResp` after its install.
+    Install durations: 31 of 35 in milliseconds, 4 between 1.1 s and 9.3 s.
+    The 174 evaluations came from `cluster_state` alone, at random moments
+    (most before vtime 50 s). The check now runs on every successful leader
+    view (`cluster_ops::explore_cluster_state`, called from
+    `Clients::call_with_op`). A `snapshot_watch` log hook also polls the
+    leader every 100 ms for 12 s after each install line (12). From source
+    only, not observed: the leader never calls `ReportSnapshot`, so a `MsgSnap`
+    lost to a fault leaves that follower in `Snapshot`, with replication
+    paused, until a leader change (etcd raft v3.7 `maybeSendAppend` skips
+    paused progress, and `MsgUnreachable` only demotes `Replicate`).
+  - `a restore cycle survives a restart of restore-0` (0/25): every cycle
+    started with its cut in a quiet period that pauses faults for 100 s. All 25
+    cycles ended Verified 25–75 s after their cut, and a fold over every
+    timeline found no restore-0 kill or stop between a cut and its cycle's end
+    (restore-0 was killed 21 times and stopped 16 times outside cycles). It
+    could not be reached. Plans now draw `hold_secs` (18, Deviation 8).
+  - `a write attempt hits a preload miss` (never evaluated): no workload write
+    could get either reason. The numscript templates never read state while
+    they resolve. Undeclared reads surface as `COVERAGE_MISS`, a red flag,
+    not as `BALANCE_NOT_PRELOADED`. New rule `ns_unresolved` (13), with the
+    Always `a numscript whose meta() source is absent never commits`.
+  - `a write attempt is refused while an index builds` (never evaluated): rare
+    by design, kept (07, Deviations). It is the only coverage of the
+    audit-readiness admission branch, and pause and throttle faults can
+    stretch a restarted leader's indexer boot.
 
 ## Server findings reported by task 99 (not masked in the checks)
 

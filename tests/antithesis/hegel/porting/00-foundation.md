@@ -95,7 +95,7 @@ family's own porting file records the final mapping.
 | a tracked write is handed off to a resolver | smoke_tx / any tracked write | faults |
 | a resolver settles a handed-off write | resolvers | faults |
 | a write attempt is refused as a stale proposal | any `Apply` the driver sends through `/op` | faults (+ heterogeneous cache knobs, DESIGN §8) |
-| a write attempt hits a preload miss | any `Apply` the driver sends through `/op` | faults |
+| a write attempt hits a preload miss | 13's `ns_unresolved`: a keyed send whose dependency resolution fails after a mutable read gets `PRELOAD_UNAVAILABLE` (triage of run 076d255c…-67-0). `BALANCE_NOT_PRELOADED` cannot be produced from outside the server: a volume read the admission plan did not declare fails as `COVERAGE_MISS`, so the server raises it only when a store read returns neither a volume nor an error (`processor_posting.go` `readVolumeOrZero`) | no faults |
 | a write attempt is blocked by clock skew | any `Apply` the driver sends through `/op` | faults (a clock offset between nodes; Antithesis clock faults that move every node together do not produce it) |
 | H/logs.rs leadership/restart/log-receipt literals | log receiver | faults for restarts and leadership changes; log receipt needs the compose log forwarders (not `run_native.sh`) |
 | the driver notices a client restart | any call after a client restart | faults |

@@ -13,12 +13,12 @@ none was removed; each is justified here:
 |---|---|---|---|
 | `the fault pause command exists in Antithesis` | Always | evaluated only under `ANTITHESIS_OUTPUT_DIR` | Antithesis only |
 | `the fault pause command succeeds` | Always | evaluated only under `ANTITHESIS_OUTPUT_DIR` | Antithesis only |
-| `a write attempt hits a preload miss` | Sometimes | `BALANCE_NOT_PRELOADED` / `PRELOAD_UNAVAILABLE` need a leader change or a cache miss under faults | faults |
+| `a write attempt hits a preload miss` | Sometimes | `PRELOAD_UNAVAILABLE` needs a keyed write whose dependency resolution fails after a mutable read, and no rule sent one until 13's `ns_unresolved` (run 076d255c…-67-0: never evaluated). `BALANCE_NOT_PRELOADED` cannot be produced from outside the server: an undeclared volume read fails as `COVERAGE_MISS` | no faults (since `ns_unresolved`) |
 | `a write attempt is blocked by clock skew` | Sometimes | `WRITES_BLOCKED_CLOCK_SKEW` needs an offset between nodes; Antithesis clock faults move every node together (run 67-0: every sampled jump hit `["ALL"]`), so the health check only sees skew when a jump lands inside one `GetNodeTime` round | faults (rare) |
 | `a write attempt is refused as a stale proposal` | Sometimes | `STALE_PROPOSAL` needs a leadership change between plan and apply (more with per-node cache thresholds, see below); a `lib`-route retry hides it, so it shows on `plain` and `node` routes. Asserted on every `Apply` answer since the run 67-0 triage | faults + knobs |
-| `a write attempt is refused while an index builds` | Sometimes | the only write-path `INDEX_BUILDING` is a `createQueryCheckpoint` while the audit projection rebuilds after a restart (`admission.go` `checkQueryCheckpointProjectionReady`): reachable, kept. Since run 3d8b6ff1…-67-0 it is an arm of `write::explore_attempt`, which `Clients::call_with_op` runs on every `Apply` answer (so the checkpoint creates of task 09 too); before, only index-family attempts were checked, which never get it | faults |
-| `the leader reports a follower in snapshot progress` | Sometimes | a follower more than `RAFT_COMPACTION_MARGIN` entries behind while the leader reports it (`a follower reports an out-of-sync or snapshotting status` was hit once under local faults) | faults + knobs |
-| `a restore cycle survives a restart of restore-0` | Sometimes | needs restore-0 killed mid-cycle (a container fault inside a 5–10 minute cycle) | faults (long runs) |
+| `a write attempt is refused while an index builds` | Sometimes | the only write-path `INDEX_BUILDING` is a `createQueryCheckpoint` while the audit projection rebuilds after a restart (`admission.go` `checkQueryCheckpointProjectionReady`): reachable, kept. Since run 3d8b6ff1…-67-0 it is an arm of `write::explore_attempt`, which `Clients::call_with_op` runs on every `Apply` answer (so the checkpoint creates of task 09 too); before, only index-family attempts were checked, which never get it. Rare by design: the window lasts from process start until the boot pass of the restarted node's audit indexer ends, and that node must already lead (07, Deviations). No knob widens it | faults (rare) |
+| `the leader reports a follower in snapshot progress` | Sometimes | the leader holds a follower in `Snapshot` only while that follower installs the snapshot. Since run 076d255c…-67-0, every leader `GetClusterState` answer is evaluated, and a snapshot watch polls the leader after each `Applying snapshot sent by leader` (12) | faults + knobs |
+| `a restore cycle survives a restart of restore-0` | Sometimes | needs restore-0 killed mid-cycle. The cut's quiet period pauses faults for 100 s, which outlasts an unheld cycle, so only held plans (`hold_secs`, since run 076d255c…-67-0; 18, Deviation 8) can reach it | faults |
 | `a cluster config change resets the cache epoch` | Reachable | needs per-node `CACHE_ROTATION_THRESHOLD`, which the compose file equalises until the server divergence below is fixed | knobs (disabled) |
 | `a cluster config change was observed between quiet periods` | Sometimes | a leadership change that changes the persisted cluster config between two `cluster_config_convergence` runs | faults + knobs |
 | `a chained restore verifies` | Sometimes | a drawn plan variant (chained, about one cycle in four); a cycle takes 5–10 minutes, so 45 minutes give a handful of cycles | no faults (long runs) |
@@ -120,6 +120,38 @@ lists no `workload/internal` path, so the service does not link
     the leader holds a follower in `Snapshot` only until the follower acks the
     `MsgSnap`, and `cluster_state` (weight 0.3) polled 119 times, always seeing
     `Replicate`, while `a follower receives a raft snapshot` was hit 9 times.
+    Fixed after run 076d255c…-67-0 (below).
+- Antithesis run 076d255c…-67-0 (basic_test, 48 h) rare-coverage triage:
+  - `the leader reports a follower in snapshot progress` (0/174): followers
+    did fall behind `RAFT_COMPACTION_MARGIN` (100). There were 35
+    `Applying snapshot sent by leader` lines, and `a follower receives a raft
+    snapshot` was hit 15 times, so the knob works. The leader shows `Snapshot`
+    only from `MsgSnap` until the follower's `MsgAppResp` after its install.
+    Install durations: 31 of 35 in milliseconds, 4 between 1.1 s and 9.3 s.
+    The 174 evaluations came from `cluster_state` alone, at random moments
+    (most before vtime 50 s). The check now runs on every successful leader
+    view (`cluster_ops::explore_cluster_state`, called from
+    `Clients::call_with_op`). A `snapshot_watch` log hook also polls the
+    leader every 100 ms for 12 s after each install line (12). From source
+    only, not observed: the leader never calls `ReportSnapshot`, so a `MsgSnap`
+    lost to a fault leaves that follower in `Snapshot`, with replication
+    paused, until a leader change (etcd raft v3.7 `maybeSendAppend` skips
+    paused progress, and `MsgUnreachable` only demotes `Replicate`).
+  - `a restore cycle survives a restart of restore-0` (0/25): every cycle
+    started with its cut in a quiet period that pauses faults for 100 s. All 25
+    cycles ended Verified 25–75 s after their cut, and a fold over every
+    timeline found no restore-0 kill or stop between a cut and its cycle's end
+    (restore-0 was killed 21 times and stopped 16 times outside cycles). It
+    could not be reached. Plans now draw `hold_secs` (18, Deviation 8).
+  - `a write attempt hits a preload miss` (never evaluated): no workload write
+    could get either reason. The numscript templates never read state while
+    they resolve. Undeclared reads surface as `COVERAGE_MISS`, a red flag,
+    not as `BALANCE_NOT_PRELOADED`. New rule `ns_unresolved` (13), with the
+    Always `a numscript whose meta() source is absent never commits`.
+  - `a write attempt is refused while an index builds` (never evaluated): rare
+    by design, kept (07, Deviations). It is the only coverage of the
+    audit-readiness admission branch, and pause and throttle faults can
+    stretch a restarted leader's indexer boot.
 
 ## Server findings reported by task 99 (not masked in the checks)
 
