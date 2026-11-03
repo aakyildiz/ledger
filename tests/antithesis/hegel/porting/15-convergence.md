@@ -120,3 +120,17 @@ every attempt ended `Other`.
   by every stats run; the 70 s budget cuts the hook (Sometimes false, no finding) if that
   becomes too slow. Task 99 should record how often `stats_convergence completes within its
   quiet budget` is false on the stack.
+- **Fixture conflict (blocks `go test ./bin/oracle/...` until fixed).** 00a's
+  `TestFixtures_ResponseShapes` compares `/quiet/begin`'s `providers` against
+  `HG/protocol-fixtures/core/quiet-begin.json`, whose `usage` placeholder is
+  `{"o-…-l3": {"transactions": "57", "accounts": "12"}}`. `mapPaths` exempts only the
+  `providers` level, so once a real `usage` provider is registered the test demands that
+  exact ledger key set and those two string fields. The provider's content is
+  provider-defined (DESIGN §4.10, the `mapPaths` comment says so). Fix in 99 (owner of the
+  core files): add `"providers.*": true, "providers.*.*": true` to `mapPaths` in
+  `W/bin/oracle/fixtures_test.go`, or regenerate the fixture's `usage` example as
+  `{"<ledger>": {"id": 3, "logCount": 3, "txCount": 1, "postingCount": 1,
+  "referenceCount": 1, "revertCount": 0}}`. Every other oracle test passes.
+- The native acceptance run (`QUIET_PROBABILITY=0.05 RULES=smoke_tx run_native.sh 180`) was
+  not run: the machine's root disk was full (0–100 MB free for most of the task, shared by
+  the parallel agents). Run it once in 99.
