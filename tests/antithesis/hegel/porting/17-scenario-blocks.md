@@ -25,15 +25,15 @@ Code:
 
 | Old source | Old assertion (kind: literal) | New | Where |
 |---|---|---|---|
-| W/internal/block/block.go:106 | Always: should be able to setup scenario | verbatim (one evaluation per group; a non-transient failure, or no success within the 120 s hook budget, is `false`) | rules/blocks.rs `blocks_setup` |
+| W/internal/block/block.go:106 | Always: should be able to setup scenario | verbatim: `true` when a group's setup succeeds, `false` only on a definitive (non-transient) answer, as the old loop, which retried Unavailable without limit. Transient answers are retried within the 120 s hook budget; a group still unanswered then is not asserted by the hook: `block_run` makes one setup attempt per run for it (and runs none of its blocks) until it is set up | rules/blocks.rs `blocks_setup`, `block_run` |
 | W/internal/block/block.go:135 | Unreachable: scenario block generation failed | dropped: no hegel callback runs in the client any more; the driver draws the values itself, and a block panic is reported as `block <name> failed` | – |
 | W/internal/block/block.go:189-193 (`emitBlockSucceeded`, AssertRaw, 26 names) | Reachable: block `<name>` succeeded | verbatim, 26 literal `check_reachable!` calls produced by `scenario_blocks!` | rules/blocks.rs `block_run` |
-| W/internal/block/block.go:195-198 (`emitBlockFailed`, AssertRaw, 26 names) | Unreachable: block `<name>` failed | verbatim, 26 literal `check_unreachable!` calls; classification **loosened**: DeadlineExceeded, Canceled and client-local errors are transient (nothing), because the harness imposes a per-call deadline (`timeoutMs` 8000) that the old loop did not (DESIGN Appendix A C11) | rules/blocks.rs `block_run` |
+| W/internal/block/block.go:195-198 (`emitBlockFailed`, AssertRaw, 26 names) | Unreachable: block `<name>` failed | verbatim, 26 literal `check_unreachable!` calls; classification **loosened**: (a) DeadlineExceeded, Canceled and client-local errors are transient (nothing), because the harness imposes a per-call deadline (`timeoutMs` 8000) that the old loop did not (DESIGN Appendix A C11); (b) NotFound with reason `METADATA_NOT_FOUND` is expected, because `marketplace/metadata`'s unkeyed delete of `last_seen` can find the key gone: two concurrent blocks on one address (the old loop was sequential), or the `lib` retry policy resending a delete whose first attempt committed; (c) reason `EXTERNAL_SERVICE_ERROR` (any code) and ResourceExhausted with a `WRITES_BLOCKED_*` reason are transient, as `W/internal/client.go` `IsTransient` and DESIGN §4.5 treat them (tmpfs volumes can fill); (d) Unauthenticated and PermissionDenied are transient, and `block_run` sends nothing while `signatures_required` is set, because task 16's signature window refuses unsigned Applies and a lagging follower can still refuse them after the window closes | rules/blocks.rs `block_run` |
 | W/internal/checks.go:66 (via `block.CheckPostCommitVolumes`) | Always: post-commit volume entry has missing required fields | renamed: `a block's post-commit volumes are well formed` (Always), evaluated once per succeeded block, false at the first malformed entry | rules/blocks.rs `block_run` |
 | W/internal/checks.go:72 | Always: post-commit volume input is invalid | merged into `a block's post-commit volumes are well formed` | rules/blocks.rs |
 | W/internal/checks.go:78 | Always: post-commit volume output is invalid | merged into `a block's post-commit volumes are well formed` | rules/blocks.rs |
 | W/internal/checks.go:14 (`CheckVolume` from `CheckPostCommitVolumes`) | Always: reported balance and volumes should be consistent | dropped: on post-commit volumes the balance is computed as `input − output` by the check itself, so the comparison is a tautology there | – |
-| W/internal/apply.go:30 (via `ExtractCreatedTransaction`) | Unreachable: CreatedTransaction must carry its transaction payload | dropped here: a created transaction without its payload simply has no post-commit volumes to check. The oracle's commit checks cover the shape on tracked ledgers | – |
+| W/internal/apply.go:30 (via `ExtractCreatedTransaction`) | Unreachable: CreatedTransaction must carry its transaction payload | merged into `a block's post-commit volumes are well formed`: a `createdTransaction` log without its `transaction` (or with a null one) makes it false | rules/blocks.rs `malformed_pcv` |
 
 The PCV check now covers every created transaction of a block's Apply response, not only the
 first log as `ExtractCreatedTransaction` did (a block Apply with two orders, e.g.
@@ -48,6 +48,7 @@ choice among the 26 replaces it.
 | Literal | Kind | Where |
 |---|---|---|
 | `a block runs within its pre-drawn values` | Sometimes (`exhausted == false`), every answered `/block` | rules/blocks.rs `block_run` |
+| `a block never runs out of its pre-drawn values` | AlwaysOrUnreachable (`exhausted == false`), every answered `/block`; the Sometimes above cannot detect exhaustion (no block uses more than 5 values, `TestEveryBlockUsesAtMostFiveValues`) | rules/blocks.rs `block_run` |
 | `a block's post-commit volumes are well formed` | Always | rules/blocks.rs `block_run` |
 | `the client program accepts every block request` | Unreachable (the client answered `/block` with a non-200) | rules/blocks.rs `post_block` |
 
@@ -59,6 +60,13 @@ choice among the 26 replaces it.
 | `block <name> succeeded` × 26 | `block_run`: every block is drawn with equal weight; the 16 values make a success likely once the group's ledger has funds. Blocks that read balances (`purchase`, `payout`, `buy_item`, `p2p_trade`, `clawback`, `disburse`, `repay`, `provision`, `write_off`, `charge`, `recognize`, `fx`, `vendor_pay`, `distribute`, `pay_salary`, `cost_alloc`, `revert`) skip until a funding block of the same group succeeded; in a long run every funding block is drawn many times | no faults (long enough run) |
 | `a block's post-commit volumes are well formed` | any succeeded block | no faults |
 | `a block runs within its pre-drawn values` | any answered `/block` (the largest block uses 5 of the 16 values) | no faults |
+
+Native run (`RULES=block_run run_native.sh 180`, one node, no faults): all six groups set up
+(`should be able to setup scenario` true ×6), 24 of the 26 `block … succeeded` hit, no
+`block … failed`, `a block's post-commit volumes are well formed` and `a block runs within
+its pre-drawn values` hit true. Not hit in 180 s: `subscription/charge` (needs a funded
+subscriber whose balance covers its tier's charge) and `subscription/recognize` (needs deferred
+revenue from a prior charge).
 
 ## Requests to 99
 

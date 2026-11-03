@@ -19,6 +19,7 @@ use hegel::generators as gs;
 use hegel::stateful::ConcurrentRule;
 use hegel::TestCase;
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 /// The six setup groups, by scenario prefix (the client's `blockGroups` keys).
@@ -108,16 +109,23 @@ pub fn setup_hooks() -> Vec<SetupHook> {
 
 // ---------------------------------------------------------------- classification
 
-/// How a `/block` answer classifies (`W/internal/block/block.go:136-157`).
+/// How a `/block` answer classifies (`W/internal/block/block.go:136-157`,
+/// loosened as the porting file records).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BlockClass {
     Succeeded,
     /// `ErrSkip`: the block's precondition was not met.
     Skipped,
-    /// Unavailable, and (loosened, the harness imposes a deadline)
-    /// DeadlineExceeded, Canceled and client-local errors.
+    /// Unavailable, and (loosened) DeadlineExceeded, Canceled and
+    /// client-local errors (the harness imposes a deadline), reason
+    /// `EXTERNAL_SERVICE_ERROR` under any code and ResourceExhausted with a
+    /// `WRITES_BLOCKED_*` reason (`W/internal/client.go` `IsTransient`, DESIGN
+    /// §4.5), Unauthenticated and PermissionDenied (task 16's signature window).
     Transient,
-    /// FailedPrecondition: idempotent retries, already reverted, overdraft races.
+    /// FailedPrecondition: idempotent retries, already reverted, overdraft
+    /// races; and (loosened) NotFound `METADATA_NOT_FOUND`: concurrent
+    /// `marketplace/metadata` blocks on one address, or a retried unkeyed
+    /// delete whose first attempt committed.
     Expected,
     Failed,
 }
@@ -125,13 +133,18 @@ pub enum BlockClass {
 pub fn classify(resp: &Value) -> BlockClass {
     let b = |k: &str| resp.get(k).and_then(Value::as_bool).unwrap_or(false);
     let code = resp.get("code").and_then(Value::as_str).unwrap_or("");
+    let reason = resp.get("reason").and_then(Value::as_str).unwrap_or("");
     if b("ok") {
         BlockClass::Succeeded
     } else if b("skipped") {
         BlockClass::Skipped
-    } else if b("local") || matches!(code, "Unavailable" | "DeadlineExceeded" | "Canceled") {
+    } else if b("local")
+        || matches!(code, "Unavailable" | "DeadlineExceeded" | "Canceled" | "Unauthenticated" | "PermissionDenied")
+        || reason == "EXTERNAL_SERVICE_ERROR"
+        || (code == "ResourceExhausted" && reason.starts_with("WRITES_BLOCKED_"))
+    {
         BlockClass::Transient
-    } else if code == "FailedPrecondition" {
+    } else if code == "FailedPrecondition" || (code == "NotFound" && reason == "METADATA_NOT_FOUND") {
         BlockClass::Expected
     } else {
         BlockClass::Failed
@@ -144,7 +157,13 @@ pub fn classify(resp: &Value) -> BlockClass {
 /// transaction of the response is checked.
 pub fn malformed_pcv(response: &Value) -> Option<Value> {
     for log in apply_logs(response) {
-        let Some(tx) = created_transaction(&log) else { continue };
+        let Some(tx) = created_transaction(&log).filter(|t| !t.is_null()) else {
+            // A created transaction without its payload (`W/internal/apply.go:28-31`).
+            if let Some(ct) = log.pointer("/payload/apply/log/data/createdTransaction") {
+                return Some(json!({"why": "createdTransaction carries no transaction", "createdTransaction": ct}));
+            }
+            continue;
+        };
         let Some(by_account) = tx.pointer("/postCommitVolumes/volumesByAccount") else { continue };
         let Some(by_account) = by_account.as_object() else {
             return Some(json!({"why": "volumesByAccount is not an object", "pcv": by_account}));
@@ -167,6 +186,7 @@ pub fn malformed_pcv(response: &Value) -> Option<Value> {
 pub fn report(name: &str, resp: &Value) -> BlockClass {
     let exhausted = resp.get("exhausted").and_then(Value::as_bool).unwrap_or(false);
     check_sometimes!(!exhausted, "a block runs within its pre-drawn values", json!({"block": name, "used": resp.get("used")}));
+    check_always_or_unreachable!(!exhausted, "a block never runs out of its pre-drawn values", json!({"block": name, "used": resp.get("used")}));
     let class = classify(resp);
     let details = json!({
         "block": name,
@@ -192,11 +212,43 @@ pub fn report(name: &str, resp: &Value) -> BlockClass {
 
 // ---------------------------------------------------------------- rule
 
+/// Which groups' setup has succeeded (`GROUPS` order).
+#[derive(Default)]
+pub struct BlocksState {
+    ready: [AtomicBool; 6],
+}
+
+impl BlocksState {
+    fn index(group: &str) -> Option<usize> {
+        GROUPS.iter().position(|g| *g == group)
+    }
+    pub fn is_ready(&self, group: &str) -> bool {
+        Self::index(group).is_some_and(|i| self.ready[i].load(Ordering::SeqCst))
+    }
+    fn mark_ready(&self, group: &str) {
+        if let Some(i) = Self::index(group) {
+            self.ready[i].store(true, Ordering::SeqCst);
+        }
+    }
+}
+
+/// The setup group of a block name (`marketplace/deposit` → `marketplace`).
+pub fn group_of(name: &str) -> &str {
+    name.split('/').next().unwrap_or(name)
+}
+
 /// `block_run` (weight 1.5): one block, 16 pre-drawn values, one client.
+/// While its group is not set up yet (the setup hook ran out of budget on
+/// transient failures), the run makes one setup attempt instead.
 pub fn block_run(d: &Driver, tc: TestCase) {
     d.guarded("block_run", &tc, |d, tc| {
         let n = d.s.clients.len();
         if n == 0 {
+            return None;
+        }
+        // Blocks send unsigned Applies, which every node refuses while
+        // signatures are required (task 16, DESIGN §4.8).
+        if d.s.signatures_required() {
             return None;
         }
         // Draws (all before the call).
@@ -204,6 +256,14 @@ pub fn block_run(d: &Driver, tc: TestCase) {
         let values: Vec<u64> = (0..VALUES_PER_RUN).map(|_| tc.draw(gs::integers::<u64>())).collect();
         let client = draw::pick(tc, n);
         let name = BLOCKS[i].0;
+        let group = group_of(name);
+        if !d.s.ext::<BlocksState>().is_ready(group) {
+            match setup_attempt(d, client, group) {
+                SetupTry::Transient(last) => println!("driver: block group {group} still not set up: {last}"),
+                done => conclude_setup(d, group, done),
+            }
+            return Some(());
+        }
         // Exec.
         let resp = post_block(d, client, name, &values)?;
         report(name, &resp);
@@ -240,49 +300,86 @@ fn post_block(d: &Driver, client: usize, name: &str, values: &[u64]) -> Option<V
 
 // ---------------------------------------------------------------- setup
 
+/// One `/block-setup` attempt's outcome.
+#[derive(Debug)]
+pub enum SetupTry {
+    Ok,
+    /// No answer, or a transient one (`classify`); worth retrying.
+    Transient(Value),
+    /// A definitive failure (`should be able to setup scenario` is false).
+    Definitive(Value),
+}
+
+/// Sends one `/block-setup` for `group` through `client`.
+pub fn setup_attempt(d: &Driver, client: usize, group: &str) -> SetupTry {
+    let op = d.s.clients.next_op_id();
+    let body = json!({"opId": op, "group": group, "timeoutMs": BLOCK_TIMEOUT.as_millis() as u64});
+    match d.s.clients.transport.post(client, "/block-setup", &body, BLOCK_TIMEOUT + HTTP_SLACK) {
+        Ok(v) => {
+            d.s.clients.observe_boot(client, v.get("boot").and_then(Value::as_str).unwrap_or(""));
+            if v.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+                SetupTry::Ok
+            } else if classify(&v) == BlockClass::Transient {
+                SetupTry::Transient(v)
+            } else {
+                SetupTry::Definitive(v)
+            }
+        }
+        Err(TransportError::Status(code, text)) => SetupTry::Definitive(json!({"status": code, "body": text})),
+        Err(e) => SetupTry::Transient(json!({"transport": format!("{e:?}")})),
+    }
+}
+
+/// Asserts a concluded setup attempt (`Ok` or `Definitive`).
+fn conclude_setup(d: &Driver, group: &str, done: SetupTry) {
+    let (ok, last) = match done {
+        SetupTry::Ok => {
+            d.s.ext::<BlocksState>().mark_ready(group);
+            (true, Value::Null)
+        }
+        SetupTry::Definitive(v) | SetupTry::Transient(v) => (false, v),
+    };
+    println!("setup: block group {group}: {}", if ok { "ok".to_string() } else { format!("failed: {last}") });
+    check_always!(ok, "should be able to setup scenario", json!({"group": group, "error": last}));
+}
+
 /// `blocks_setup` (no draws): `/block-setup` for the six groups, through
-/// the clients in turn, retried until ok. A non-transient failure, or no
-/// success within the setup budget, fails `should be able to setup
-/// scenario` (`W/internal/block/block.go:106`).
+/// the clients in turn, retried while the answers are transient, as the old
+/// loop retried Unavailable without limit (`W/internal/block/block.go:85-106`).
+/// A definitive failure fails `should be able to setup scenario`. A group
+/// still answered only transiently when the hook budget runs out is not
+/// asserted here: `block_run` keeps retrying it, one attempt per run, and
+/// runs none of its blocks until it is set up.
 pub fn blocks_setup(d: &Driver) {
+    blocks_setup_within(d, SETUP_BUDGET);
+}
+
+fn blocks_setup_within(d: &Driver, budget: Duration) {
     let n = d.s.clients.len();
     if n == 0 {
         return;
     }
-    let deadline = Instant::now() + SETUP_BUDGET;
+    let deadline = Instant::now() + budget;
     let mut attempt = 0usize;
     for group in GROUPS {
-        let mut last = Value::Null;
-        let ok = loop {
+        loop {
             let client = attempt % n;
             attempt += 1;
-            let op = d.s.clients.next_op_id();
-            let body = json!({"opId": op, "group": group, "timeoutMs": BLOCK_TIMEOUT.as_millis() as u64});
-            match d.s.clients.transport.post(client, "/block-setup", &body, BLOCK_TIMEOUT + HTTP_SLACK) {
-                Ok(v) => {
-                    d.s.clients.observe_boot(client, v.get("boot").and_then(Value::as_str).unwrap_or(""));
-                    if v.get("ok").and_then(Value::as_bool).unwrap_or(false) {
-                        break true;
+            match setup_attempt(d, client, group) {
+                SetupTry::Transient(last) => {
+                    if Instant::now() >= deadline {
+                        println!("setup: block group {group}: not set up within the hook budget, block_run retries it: {last}");
+                        break;
                     }
-                    last = v.clone();
-                    if classify(&v) != BlockClass::Transient {
-                        break false;
-                    }
+                    println!("setup: block group {group}: retrying after {last}");
+                    std::thread::sleep(d.s.timing().poll.min(Duration::from_secs(1)));
                 }
-                Err(TransportError::Status(code, text)) => {
-                    last = json!({"status": code, "body": text});
-                    break false;
+                done => {
+                    conclude_setup(d, group, done);
+                    break;
                 }
-                Err(e) => last = json!({"transport": format!("{e:?}")}),
             }
-            if Instant::now() >= deadline {
-                break false;
-            }
-            println!("setup: block group {group}: retrying after {last}");
-            std::thread::sleep(d.s.timing().poll.min(Duration::from_secs(1)));
-        };
-        println!("setup: block group {group}: {}", if ok { "ok".to_string() } else { format!("failed: {last}") });
-        check_always!(ok, "should be able to setup scenario", json!({"group": group, "error": last}));
+        }
     }
 }
 
@@ -355,9 +452,24 @@ mod tests {
         }
         assert_eq!(c(json!({"ok": false, "code": "ResourceExhausted", "local": true})), BlockClass::Transient);
         assert_eq!(c(json!({"ok": false, "code": "FailedPrecondition", "reason": "INSUFFICIENT_FUNDS"})), BlockClass::Expected);
-        for code in ["Internal", "Unknown", "Aborted", "InvalidArgument", "NotFound", "AlreadyExists", ""] {
+        for code in ["Internal", "Unknown", "Aborted", "InvalidArgument", "NotFound", "AlreadyExists", "ResourceExhausted", ""] {
             assert_eq!(c(json!({"ok": false, "code": code})), BlockClass::Failed, "{code}");
         }
+        // Loosened (porting file): metadata races, signature window,
+        // external services and blocked writes.
+        assert_eq!(c(json!({"ok": false, "code": "NotFound", "reason": "METADATA_NOT_FOUND"})), BlockClass::Expected);
+        assert_eq!(c(json!({"ok": false, "code": "NotFound", "reason": "LEDGER_NOT_FOUND"})), BlockClass::Failed);
+        for code in ["Unauthenticated", "PermissionDenied"] {
+            assert_eq!(c(json!({"ok": false, "code": code, "reason": "SIGNATURE_REQUIRED"})), BlockClass::Transient, "{code}");
+            assert_eq!(c(json!({"ok": false, "code": code})), BlockClass::Transient, "{code}");
+        }
+        for code in ["Internal", "Unavailable", "FailedPrecondition"] {
+            assert_eq!(c(json!({"ok": false, "code": code, "reason": "EXTERNAL_SERVICE_ERROR"})), BlockClass::Transient, "{code}");
+        }
+        for reason in ["WRITES_BLOCKED_DISK_FULL", "WRITES_BLOCKED_CLOCK_SKEW"] {
+            assert_eq!(c(json!({"ok": false, "code": "ResourceExhausted", "reason": reason})), BlockClass::Transient, "{reason}");
+        }
+        assert_eq!(c(json!({"ok": false, "code": "ResourceExhausted", "reason": "OTHER"})), BlockClass::Failed);
     }
 
     #[test]
@@ -372,6 +484,11 @@ mod tests {
         // Responses without a created transaction carry nothing to check.
         assert!(malformed_pcv(&json!({"logs": [{"payload": {"apply": {"log": {"data": {"savedMetadata": {}}}}}}]})).is_none());
         assert!(malformed_pcv(&json!({})).is_none());
+        // A created transaction without its payload is malformed.
+        let empty = json!({"logs": [{"payload": {"apply": {"log": {"data": {"createdTransaction": {}}}}}}]});
+        assert_eq!(malformed_pcv(&empty).unwrap()["why"], "createdTransaction carries no transaction");
+        let null = json!({"logs": [{"payload": {"apply": {"log": {"data": {"createdTransaction": {"transaction": null}}}}}}]});
+        assert!(malformed_pcv(&null).is_some());
     }
 
     /// A client transport that answers `/block` and `/block-setup` from scripts.
@@ -399,6 +516,19 @@ mod tests {
     }
 
     fn block_driver() -> (Driver, Arc<BlockTransport>) {
+        let (base, _, fo) = testkit::driver();
+        let t = Arc::new(BlockTransport::default());
+        let s = Shared::new(base.s.cfg.clone(), t.clone(), Box::new(SharedFakeOracle(fo)));
+        s.active.store(true, std::sync::atomic::Ordering::SeqCst);
+        let d = Driver { s };
+        for g in GROUPS {
+            d.s.ext::<BlocksState>().mark_ready(g);
+        }
+        (d, t)
+    }
+
+    /// A driver whose groups are not set up yet.
+    fn fresh_driver() -> (Driver, Arc<BlockTransport>) {
         let (base, _, fo) = testkit::driver();
         let t = Arc::new(BlockTransport::default());
         let s = Shared::new(base.s.cfg.clone(), t.clone(), Box::new(SharedFakeOracle(fo)));
@@ -438,6 +568,7 @@ mod tests {
         assert!(fired("Unreachable", failed).is_empty());
         assert_eq!(fired("Always", "a block's post-commit volumes are well formed"), vec![true]);
         assert_eq!(fired("Sometimes", "a block runs within its pre-drawn values"), vec![true]);
+        assert_eq!(fired("AlwaysOrUnreachable", "a block never runs out of its pre-drawn values"), vec![true]);
     }
 
     #[test]
@@ -449,6 +580,7 @@ mod tests {
         testkit::run_rule(&d, block_run);
         assert_eq!(fired("Always", "a block's post-commit volumes are well formed"), vec![false]);
         assert_eq!(fired("Sometimes", "a block runs within its pre-drawn values"), vec![false]);
+        assert_eq!(fired("AlwaysOrUnreachable", "a block never runs out of its pre-drawn values"), vec![false]);
     }
 
     #[test]
@@ -461,6 +593,13 @@ mod tests {
             (json!({"ok": false, "code": "Unavailable"}), false),
             (json!({"ok": false, "code": "ResourceExhausted", "local": true}), false),
             (json!({"ok": false, "skipped": true}), false),
+            (json!({"ok": false, "code": "NotFound", "reason": "METADATA_NOT_FOUND"}), false),
+            (json!({"ok": false, "code": "NotFound", "reason": "LEDGER_NOT_FOUND"}), true),
+            (json!({"ok": false, "code": "Unauthenticated", "reason": "SIGNATURE_REQUIRED"}), false),
+            (json!({"ok": false, "code": "PermissionDenied"}), false),
+            (json!({"ok": false, "code": "ResourceExhausted", "reason": "WRITES_BLOCKED_DISK_FULL"}), false),
+            (json!({"ok": false, "code": "ResourceExhausted"}), true),
+            (json!({"ok": false, "code": "Internal", "reason": "EXTERNAL_SERVICE_ERROR"}), false),
         ] {
             let (d, t) = block_driver();
             *t.default.lock().unwrap() = Some(resp.clone());
@@ -510,5 +649,58 @@ mod tests {
         assert_eq!(got.len(), 6);
         assert_eq!(got[0], false);
         assert!(got[1..].iter().all(|c| *c));
+    }
+
+    #[test]
+    fn blocks_setup_never_fails_on_transient_answers_alone() {
+        let (d, t) = fresh_driver();
+        *t.default.lock().unwrap() = Some(json!({"ok": false, "code": "Unavailable"}));
+        testkit::reset();
+        blocks_setup_within(&d, Duration::ZERO);
+        // One attempt per group, then the budget is out: no assertion.
+        assert_eq!(t.calls.lock().unwrap().len(), 6);
+        assert!(fired("Always", "should be able to setup scenario").is_empty());
+        assert!(GROUPS.iter().all(|g| !d.s.ext::<BlocksState>().is_ready(g)));
+        // block_run retries the setup instead of running a block.
+        testkit::run_rule(&d, block_run);
+        let calls = t.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 7);
+        assert_eq!(calls[6].1, "/block-setup");
+        assert!(fired("Always", "should be able to setup scenario").is_empty());
+        assert!(testkit::assertions().iter().all(|a| !a.message.starts_with("block ")));
+        // Once the setup answers ok, the group is ready and asserted true.
+        *t.default.lock().unwrap() = None;
+        testkit::run_rule(&d, block_run);
+        let calls = t.calls.lock().unwrap().clone();
+        assert_eq!(calls[7].1, "/block-setup");
+        let g2 = calls[7].2["group"].as_str().unwrap();
+        assert!(d.s.ext::<BlocksState>().is_ready(g2));
+        assert_eq!(fired("Always", "should be able to setup scenario"), vec![true]);
+    }
+
+    #[test]
+    fn blocks_setup_marks_groups_ready() {
+        let (d, _t) = fresh_driver();
+        testkit::reset();
+        blocks_setup(&d);
+        assert!(GROUPS.iter().all(|g| d.s.ext::<BlocksState>().is_ready(g)));
+        assert_eq!(fired("Always", "should be able to setup scenario"), vec![true; 6]);
+    }
+
+    #[test]
+    fn block_run_waits_out_the_signature_window() {
+        let (d, t) = block_driver();
+        d.s.signatures_required.store(true, std::sync::atomic::Ordering::SeqCst);
+        testkit::reset();
+        testkit::run_rule(&d, block_run);
+        assert!(t.calls.lock().unwrap().is_empty());
+        assert!(testkit::assertions().iter().all(|a| !a.message.starts_with("block ")));
+    }
+
+    #[test]
+    fn group_of_maps_every_block_to_a_group() {
+        for (name, _, _) in BLOCKS {
+            assert!(GROUPS.contains(&group_of(name)), "{name}");
+        }
     }
 }

@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -325,4 +326,43 @@ func TestBlockEndpoints(t *testing.T) {
 	require.Equal(t, http.StatusBadRequest, code)
 	code, _ = post("/block-setup", `{"opId":6,"group":"nope"}`)
 	require.Equal(t, http.StatusBadRequest, code)
+}
+
+// Every block, on both its skip and its success branches (balances 0, 1 and
+// 100M) and over several value vectors (zeros, maxima, mixed), uses at most
+// five values, so 16 pre-drawn values never run out.
+func TestEveryBlockUsesAtMostFiveValues(t *testing.T) {
+	t.Parallel()
+	vectors := [][]uint64{make([]uint64, 16), make([]uint64, 16), make([]uint64, 16), make([]uint64, 16)}
+	for i := range 16 {
+		vectors[1][i] = ^uint64(0)
+		vectors[2][i] = uint64(i*7919 + 1)
+		vectors[3][i] = uint64(i) * 0x9e3779b97f4a7c15
+	}
+	for _, balance := range []int64{0, 1, 100_000_000} {
+		client := bufconnClient(t, &blockFakeServer{balance: balance})
+		for _, name := range expectedBlockNames {
+			for vi, values := range vectors {
+				res := runBlock(context.Background(), client, blocksByName[name], values)
+				require.True(t, res.out.OK || res.skipped, "%s balance %d vector %d: %+v", name, balance, vi, res.out)
+				require.False(t, res.exhausted, "%s balance %d vector %d", name, balance, vi)
+				require.LessOrEqual(t, res.used, 5, "%s balance %d vector %d", name, balance, vi)
+			}
+		}
+	}
+}
+
+// The reason of a business error reaches the driver, which classifies
+// NotFound METADATA_NOT_FOUND as expected (rules/blocks.rs `classify`).
+func TestBlockRunCarriesTheErrorReason(t *testing.T) {
+	t.Parallel()
+	st, err := status.New(codes.NotFound, "metadata not found").WithDetails(&errdetails.ErrorInfo{Reason: "METADATA_NOT_FOUND"})
+	require.NoError(t, err)
+	f := &blockFakeServer{balance: 1_000_000, applyErr: st.Err()}
+	client := bufconnClient(t, f)
+	res := runBlock(context.Background(), client, blocksByName["marketplace/metadata"], []uint64{0, 0, 0, 0, 0})
+	require.False(t, res.out.OK)
+	require.False(t, res.out.Local)
+	require.Equal(t, "NotFound", res.out.Code)
+	require.Equal(t, "METADATA_NOT_FOUND", res.out.Reason)
 }
