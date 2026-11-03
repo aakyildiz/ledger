@@ -1,0 +1,291 @@
+{
+  "cases": [
+    {
+      "filter": {
+        "audit": {
+          "field": "AUDIT_FIELD_LEDGER",
+          "stringCond": {
+            "hardcoded": "o-test-l1"
+          }
+        }
+      },
+      "name": "ledger",
+      "probe": "none"
+    },
+    {
+      "filter": {
+        "audit": {
+          "field": "AUDIT_FIELD_OUTCOME",
+          "stringCond": {
+            "hardcoded": "failure"
+          }
+        }
+      },
+      "name": "outcome",
+      "probe": "none"
+    },
+    {
+      "filter": {
+        "audit": {
+          "field": "AUDIT_FIELD_SEQUENCE",
+          "uintCond": {
+            "max": "9",
+            "min": "3",
+            "minExclusive": true
+          }
+        }
+      },
+      "name": "seq",
+      "probe": "none"
+    },
+    {
+      "filter": {
+        "audit": {
+          "field": "AUDIT_FIELD_PROPOSAL_ID",
+          "uintCond": {
+            "max": "18446744073709551615",
+            "maxExclusive": true
+          }
+        }
+      },
+      "name": "proposal",
+      "probe": "none"
+    },
+    {
+      "filter": {
+        "audit": {
+          "field": "AUDIT_FIELD_TIMESTAMP",
+          "uintCond": {
+            "max": "1700000000000000",
+            "min": "0"
+          }
+        }
+      },
+      "name": "timestamp",
+      "probe": "none"
+    },
+    {
+      "filter": {
+        "audit": {
+          "field": "AUDIT_FIELD_LOG_SEQUENCE",
+          "uintCond": {
+            "max": "12",
+            "min": "4"
+          }
+        }
+      },
+      "name": "log-seq",
+      "probe": "none"
+    },
+    {
+      "filter": {
+        "audit": {
+          "field": "AUDIT_FIELD_CALLER_SUBJECT",
+          "stringCond": {
+            "hardcoded": ""
+          }
+        }
+      },
+      "name": "subject-empty",
+      "probe": "none"
+    },
+    {
+      "filter": {
+        "audit": {
+          "field": "AUDIT_FIELD_IDEMPOTENCY_KEY",
+          "stringCond": {
+            "hardcoded": "o-test-k4"
+          }
+        }
+      },
+      "name": "key-exact",
+      "probe": "none"
+    },
+    {
+      "filter": {
+        "audit": {
+          "field": "AUDIT_FIELD_IDEMPOTENCY_KEY",
+          "stringPrefix": "o-test-k"
+        }
+      },
+      "name": "key-prefix",
+      "probe": "none"
+    },
+    {
+      "filter": {
+        "audit": {
+          "field": "AUDIT_FIELD_ORDER_TYPE",
+          "stringCond": {
+            "hardcoded": "add_metadata"
+          }
+        }
+      },
+      "name": "order-type",
+      "probe": "none"
+    },
+    {
+      "filter": {
+        "and": {
+          "filters": []
+        }
+      },
+      "name": "and-empty",
+      "probe": "none"
+    },
+    {
+      "filter": {
+        "and": {
+          "filters": [
+            {
+              "audit": {
+                "field": "AUDIT_FIELD_SEQUENCE",
+                "uintCond": {
+                  "max": "9",
+                  "min": "3",
+                  "minExclusive": true
+                }
+              }
+            },
+            {
+              "audit": {
+                "field": "AUDIT_FIELD_OUTCOME",
+                "stringCond": {
+                  "hardcoded": "success"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "name": "and",
+      "probe": "none"
+    },
+    {
+      "filter": {
+        "or": {
+          "filters": [
+            {
+              "audit": {
+                "field": "AUDIT_FIELD_LEDGER",
+                "stringCond": {
+                  "hardcoded": "default"
+                }
+              }
+            },
+            {
+              "audit": {
+                "field": "AUDIT_FIELD_IDEMPOTENCY_KEY",
+                "stringPrefix": "o-test-k1"
+              }
+            }
+          ]
+        }
+      },
+      "name": "or-indexed",
+      "probe": "none"
+    },
+    {
+      "filter": {
+        "or": {
+          "filters": [
+            {
+              "audit": {
+                "field": "AUDIT_FIELD_SEQUENCE",
+                "uintCond": {
+                  "max": "5",
+                  "min": "1"
+                }
+              }
+            },
+            {
+              "audit": {
+                "field": "AUDIT_FIELD_LEDGER",
+                "stringCond": {
+                  "hardcoded": "x"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "name": "seq-in-or",
+      "probe": "seq-in-or"
+    },
+    {
+      "filter": {
+        "not": {
+          "filter": {
+            "audit": {
+              "field": "AUDIT_FIELD_OUTCOME",
+              "stringCond": {
+                "hardcoded": "success"
+              }
+            }
+          }
+        }
+      },
+      "name": "not",
+      "probe": "not"
+    },
+    {
+      "filter": {
+        "audit": {
+          "field": "AUDIT_FIELD_UNSPECIFIED",
+          "stringCond": {
+            "hardcoded": "anything"
+          }
+        }
+      },
+      "name": "unspecified",
+      "probe": "unspecified-field"
+    },
+    {
+      "filter": {
+        "audit": {
+          "field": "AUDIT_FIELD_SEQUENCE",
+          "stringCond": {
+            "hardcoded": "not-a-number"
+          }
+        }
+      },
+      "name": "string-on-seq",
+      "probe": "type-mismatch"
+    },
+    {
+      "filter": {
+        "audit": {
+          "field": "AUDIT_FIELD_LEDGER",
+          "uintCond": {
+            "max": "9",
+            "min": "3",
+            "minExclusive": true
+          }
+        }
+      },
+      "name": "uint-on-ledger",
+      "probe": "type-mismatch"
+    },
+    {
+      "filter": {
+        "audit": {
+          "field": "AUDIT_FIELD_IDEMPOTENCY_KEY",
+          "stringCond": {
+            "param": "p0"
+          }
+        }
+      },
+      "name": "key-param",
+      "probe": "key-param"
+    },
+    {
+      "filter": {
+        "audit": {
+          "field": "AUDIT_FIELD_IDEMPOTENCY_KEY",
+          "stringPrefix": "o-test-k\u0000bad"
+        }
+      },
+      "name": "key-nul-prefix",
+      "probe": "nul-prefix"
+    }
+  ]
+}
