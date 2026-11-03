@@ -1,0 +1,21 @@
+{
+  "endpoint": "POST /quiet/section",
+  "request": {
+    "epoch": 7,
+    "section": "ledger",
+    "seq": 3,
+    "body": {
+      "ledger": "o-1a2b-l1",
+      "scope": "linearizable",
+      "part": "stats",
+      "items": [{"transactionCount": "812", "logCount": "1290", "postingCount": "1700"}],
+      "final": true
+    }
+  },
+  "status": 200,
+  "response": {
+    "bootId": "1793836800123456789",
+    "verdict": {"ok": true, "skipped": false, "violations": []},
+    "next": {}
+  }
+}

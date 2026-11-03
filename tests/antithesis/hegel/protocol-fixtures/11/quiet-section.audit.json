@@ -1,0 +1,38 @@
+{
+  "endpoint": "POST /quiet/section",
+  "request": {
+    "epoch": 7,
+    "section": "audit",
+    "seq": 0,
+    "body": {
+      "entries": [
+        {
+          "sequence": "18234",
+          "timestamp": {"data": "1793836800123456"},
+          "proposalId": "4411",
+          "success": {"minLogSequence": "30117", "maxLogSequence": "30118"},
+          "orderCount": 2,
+          "ledgers": ["o-1a2b-l1"],
+          "idempotency": {"key": "o-1a2b-k77"}
+        },
+        {
+          "sequence": "18235",
+          "timestamp": {"data": "1793836800124001"},
+          "proposalId": "4412",
+          "failure": {"details": {"insufficientFunds": {}}},
+          "orderCount": 1,
+          "ledgers": ["o-1a2b-l1"],
+          "idempotency": {"key": "o-1a2b-k78"}
+        }
+      ],
+      "complete": false,
+      "head": "18301"
+    }
+  },
+  "status": 200,
+  "response": {
+    "bootId": "1793836800123456789",
+    "verdict": {"ok": true, "skipped": false, "violations": []},
+    "next": {"cursor": "18235", "resync": false}
+  }
+}

@@ -24,6 +24,7 @@ pub mod smoke;
 // ==== 10-audit mods ====
 // ==== end 10-audit mods ====
 // ==== 11-quiet-exact mods ====
+pub mod quiet_exact;
 // ==== end 11-quiet-exact mods ====
 // ==== 12-cluster-ops-signals mods ====
 // ==== end 12-cluster-ops-signals mods ====
@@ -143,6 +144,7 @@ pub fn quiet_hooks() -> Vec<crate::quiet::QuietHook> {
     // ==== 10-audit quiet_hooks ====
     // ==== end 10-audit quiet_hooks ====
     // ==== 11-quiet-exact quiet_hooks ====
+    v.extend(quiet_exact::quiet_hooks());
     // ==== end 11-quiet-exact quiet_hooks ====
     // ==== 12-cluster-ops-signals quiet_hooks ====
     // ==== end 12-cluster-ops-signals quiet_hooks ====
