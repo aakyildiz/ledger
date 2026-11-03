@@ -53,11 +53,20 @@ const POLL: Duration = Duration::from_millis(200);
 const RPC: Duration = Duration::from_secs(5);
 /// Page size for the hooks' own listings.
 const PAGE: u64 = 1000;
+/// How long `select_source` keeps retrying the candidates (a leader
+/// election right after a restart takes a few seconds).
+const SOURCE_WAIT: Duration = Duration::from_secs(15);
+/// Foreign ledgers folded per stats attempt (a `plan`-seeded sample; the
+/// fold reads every log of the ledger).
+pub const FOREIGN_SAMPLE: usize = 8;
+/// Foreign ledgers with more logs than this are not folded (`r-stress-*`
+/// bulks): the fold would eat the budget before the convergence window.
+pub const FOLD_LOG_LIMIT: u64 = 5000;
 
 pub fn quiet_hooks() -> Vec<QuietHook> {
     vec![
         QuietHook { name: "cross_node_identity", budget: CROSS_NODE_BUDGET, needs_oracle: false, weight: weight_one, plan: plan_client, run: run_cross_node },
-        QuietHook { name: "stats_convergence", budget: STATS_BUDGET, needs_oracle: true, weight: weight_one, plan: plan_client, run: run_stats },
+        QuietHook { name: "stats_convergence", budget: STATS_BUDGET, needs_oracle: true, weight: weight_one, plan: plan_stats, run: run_stats },
         QuietHook { name: "cluster_config_convergence", budget: CLUSTER_CONFIG_BUDGET, needs_oracle: false, weight: weight_half, plan: plan_client, run: run_cluster_config },
     ]
 }
@@ -69,17 +78,28 @@ fn weight_half(_: &Shared) -> f64 {
     0.5
 }
 
-/// The hooks' only draw: which client carries the pinned calls.
+/// The hooks' draws: which client carries the pinned calls, and (stats)
+/// the seed of the foreign-ledger sample.
 struct Plan {
     client: usize,
+    seed: u64,
 }
 
 fn plan_client(d: &Driver, tc: &TestCase) -> HookPlan {
-    Box::new(Plan { client: draw::pick(tc, d.s.clients.len()) })
+    Box::new(Plan { client: draw::pick(tc, d.s.clients.len()), seed: 0 })
+}
+
+fn plan_stats(d: &Driver, tc: &TestCase) -> HookPlan {
+    let client = draw::pick(tc, d.s.clients.len());
+    Box::new(Plan { client, seed: draw::int_in(tc, 0, u64::from(u32::MAX)) })
 }
 
 fn plan_of(d: &Driver, ctx: &QuietCtx, plan: &HookPlan) -> usize {
     plan.downcast_ref::<Plan>().map(|p| p.client).filter(|c| *c < d.s.clients.len()).unwrap_or(ctx.client)
+}
+
+fn seed_of(plan: &HookPlan) -> u64 {
+    plan.downcast_ref::<Plan>().map(|p| p.seed).unwrap_or(0)
 }
 
 /// Per-`Shared` state of the family.
@@ -187,21 +207,42 @@ fn candidates(d: &Driver, nodes: &NodeMap) -> Vec<String> {
 }
 
 /// The first candidate whose pinned Barrier works, and that Barrier's index.
-fn select_source(d: &Driver, client: usize, cands: &[String], deadline: Instant) -> Result<(String, u64), Fail> {
+/// While some candidate's answer is transient (no leader during an
+/// election, a restarting node), rounds over the candidates are retried with
+/// backoff for up to `SOURCE_WAIT`, or a quarter of the remaining budget. Any
+/// non-local answer from a candidate sets `connected` (the old check was a
+/// per-node dial, `MD/eventually_cross_node_identity/main.go:24`).
+fn select_source(d: &Driver, client: usize, cands: &[String], deadline: Instant, connected: &mut bool) -> Result<(String, u64), Fail> {
     let mut last = "no candidate node".to_string();
-    for addr in cands {
-        let left = remaining(deadline);
-        if left < Duration::from_millis(100) {
+    let give_up = Instant::now() + SOURCE_WAIT.min(remaining(deadline) / 4);
+    let mut backoff = POLL;
+    loop {
+        let mut retryable = false;
+        for addr in cands {
+            let left = remaining(deadline);
+            if left < Duration::from_millis(100) {
+                return Err(Fail::Cut);
+            }
+            let o = d.call(&Route::node(client, addr), "bucket", "Barrier", json!({}), &CallOpts::default().timeout(RPC.min(left))).1;
+            if !o.is_unknown() && !o.local {
+                *connected = true;
+            }
+            let idx = o.response.as_ref().filter(|_| o.is_ok()).map(|r| u64_field(r, "commitIndex")).unwrap_or(0);
+            if idx > 0 {
+                return Ok((addr.clone(), idx));
+            }
+            retryable |= transient(&o);
+            last = format!("{addr}: {}", describe(&o));
+        }
+        if !retryable || Instant::now() + backoff >= give_up {
+            return Err(Fail::Other(format!("no reachable source for a quorum barrier ({last})")));
+        }
+        if Instant::now() + backoff >= deadline {
             return Err(Fail::Cut);
         }
-        let o = d.call(&Route::node(client, addr), "bucket", "Barrier", json!({}), &CallOpts::default().timeout(RPC.min(left))).1;
-        let idx = o.response.as_ref().filter(|_| o.is_ok()).map(|r| u64_field(r, "commitIndex")).unwrap_or(0);
-        if idx > 0 {
-            return Ok((addr.clone(), idx));
-        }
-        last = format!("{addr}: {}", describe(&o));
+        std::thread::sleep(backoff);
+        backoff = (backoff * 2).min(Duration::from_secs(2));
     }
-    Err(Fail::Other(format!("no reachable source for a quorum barrier ({last})")))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -340,7 +381,15 @@ pub struct AuditObs {
     pub tip_present: bool,
     /// The point tip, items stripped.
     pub tip: Option<Value>,
-    /// The listing's last entry is the tail, and the stripped tip equals it.
+    /// The point tip as served, items included (compared across members:
+    /// the old `TipDigest`, `MD/eventually_cross_node_identity/observation.go:162`).
+    #[serde(skip)]
+    pub tip_full: Option<Value>,
+    /// The window listing's last entry (a forward one-item listing at
+    /// `tail_seq`), items stripped.
+    pub listed_last: Option<Value>,
+    /// The listing's last entry is the tail (whole entry, as the old
+    /// `proto.Equal(lastListed, tail)`), and the stripped tip equals it.
     pub tail_matches: bool,
 }
 
@@ -389,8 +438,27 @@ fn strip_items(mut v: Value) -> Value {
     v
 }
 
-/// The listing tail and the point tip of one member (stale, pinned).
-fn read_tail(d: &Driver, client: usize, m: &Member, deadline: Instant) -> Result<(Option<Value>, bool, Option<Value>), Fail> {
+/// One member's audit tail reads.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TailObs {
+    /// The reverse one-item listing, items stripped.
+    pub tail: Option<Value>,
+    /// The forward one-item listing at the tail's sequence, items stripped.
+    pub listed_last: Option<Value>,
+    /// `GetAuditEntry(tail)` answered.
+    pub tip_present: bool,
+    /// The point tip as served (items included).
+    pub tip_full: Option<Value>,
+}
+
+/// The audit listing filtered to exactly one sequence (forward).
+fn audit_at(seq: u64) -> Value {
+    json!({"options": {"pageSize": 1, "filter": {"audit": {"field": "AUDIT_FIELD_SEQUENCE", "uintCond": {"min": seq.to_string(), "max": seq.to_string()}}}}})
+}
+
+/// The listing tail, the forward listing's entry at the tail's sequence and
+/// the point tip of one member (stale, pinned).
+fn read_tail(d: &Driver, client: usize, m: &Member, deadline: Instant) -> Result<TailObs, Fail> {
     let route = Route::node(client, &m.addr);
     let o = call_retry(d, &route, "bucket", "ListAuditEntries", &json!({"options": {"pageSize": 1, "reverse": true}}), &CallOpts::stale().timeout(RPC).max_items(2), deadline)?;
     if !o.is_ok() || !o.complete {
@@ -400,34 +468,45 @@ fn read_tail(d: &Driver, client: usize, m: &Member, deadline: Instant) -> Result
     if items.len() > 1 {
         return Err(Fail::Other(format!("member {} audit tail page exceeded requested size", m.id)));
     }
-    let Some(tail) = items.into_iter().next().map(strip_items) else { return Ok((None, false, None)) };
+    let Some(tail) = items.into_iter().next().map(strip_items) else { return Ok(TailObs::default()) };
     let seq = tail.get("sequence").cloned().unwrap_or(Value::Null);
+    let fwd = call_retry(d, &route, "bucket", "ListAuditEntries", &audit_at(u64_field(&tail, "sequence")), &CallOpts::stale().timeout(RPC).max_items(2), deadline)?;
+    if !fwd.is_ok() || !fwd.complete {
+        return Err(Fail::Other(format!("member {} audit listing at the tail: {}", m.id, describe(&fwd))));
+    }
+    let listed = fwd.items.clone().unwrap_or_default();
+    if listed.len() > 1 {
+        return Err(Fail::Other(format!("member {} audit listing at the tail exceeded requested size", m.id)));
+    }
+    let listed_last = listed.into_iter().next().map(strip_items);
     let o = call_retry(d, &route, "bucket", "GetAuditEntry", &json!({"sequence": seq}), &CallOpts::stale().timeout(RPC), deadline)?;
     if o.is_ok() {
-        let tip = o.response.clone().map(strip_items);
-        return Ok((Some(tail), tip.is_some(), tip));
+        let tip_full = o.response.clone();
+        return Ok(TailObs { tail: Some(tail), listed_last, tip_present: tip_full.is_some(), tip_full });
     }
     if o.code == "NotFound" {
         // At an exact durable horizon absence is an observation, not skew.
-        return Ok((Some(tail), false, None));
+        return Ok(TailObs { tail: Some(tail), listed_last, tip_present: false, tip_full: None });
     }
     Err(Fail::Other(format!("member {} audit tip: {}", m.id, describe(&o))))
 }
 
-fn audit_obs(from: u64, sections: &Value, tail: Option<Value>, tip_present: bool, tip: Option<Value>) -> AuditObs {
+fn audit_obs(from: u64, sections: &Value, t: TailObs) -> AuditObs {
+    let TailObs { tail, listed_last, tip_present, tip_full } = t;
+    let tip = tip_full.clone().map(strip_items);
     let a = &sections["audit"];
     let (count, last) = (u64_field(a, "count"), str_field(a, "lastKey").to_string());
     let tail_seq = tail.as_ref().map(|t| u64_field(t, "sequence")).unwrap_or(0);
     let version = tail.as_ref().map(|t| t.get("hashVersion").and_then(as_u64).unwrap_or(0)).unwrap_or(0);
     let listing_ends_at_tail = match &tail {
         None => count == 0,
-        Some(_) => count > 0 && last == tail_seq.to_string(),
+        Some(_) => count > 0 && last == tail_seq.to_string() && listed_last == tail,
     };
     let tip_agrees = match (&tail, &tip) {
         (Some(t), Some(p)) => t == p,
         _ => true,
     };
-    AuditObs { from, count, last, sha256: str_field(a, "sha256").to_string(), tail, tail_seq, version, tip_present, tip, tail_matches: listing_ends_at_tail && tip_agrees }
+    AuditObs { from, count, last, sha256: str_field(a, "sha256").to_string(), tail, tail_seq, version, tip_present, tip, tip_full, listed_last, tail_matches: listing_ends_at_tail && tip_agrees }
 }
 
 /// The first difference between two members' `ledgers`/`accounts` digests:
@@ -454,9 +533,19 @@ pub fn first_difference(a: &Value, b: &Value) -> Option<Value> {
     None
 }
 
-/// Audit identity of two members: same window digest and the same tail and tip.
+/// Audit identity of two members: same window digest, the same tail and the
+/// same tip, items included.
 pub fn audit_equal(a: &AuditObs, b: &AuditObs) -> bool {
-    a.from == b.from && a.count == b.count && a.last == b.last && a.sha256 == b.sha256 && a.tail == b.tail && a.tip_present == b.tip_present && a.tip == b.tip && a.tail_matches == b.tail_matches
+    a.from == b.from
+        && a.count == b.count
+        && a.last == b.last
+        && a.sha256 == b.sha256
+        && a.tail == b.tail
+        && a.listed_last == b.listed_last
+        && a.tip_present == b.tip_present
+        && a.tip == b.tip
+        && a.tip_full == b.tip_full
+        && a.tail_matches == b.tail_matches
 }
 
 /// Timing knobs (tests shorten them).
@@ -471,11 +560,15 @@ pub struct Windows {
 pub const CROSS_WINDOWS: Windows = Windows { convergence: Duration::from_secs(60), reserve: Duration::from_secs(3) };
 pub const STATS_WINDOWS: Windows = Windows { convergence: Duration::from_secs(60), reserve: Duration::from_secs(3) };
 
+/// The shortest stats window worth opening.
+const MIN_WINDOW: Duration = Duration::from_secs(1);
+
 impl Windows {
-    /// The end of the shared window. When the budget cannot hold the whole
-    /// window plus the reserve, the window ends at the deadline, so running
-    /// out is a cut (no verdict), never a convergence failure.
-    fn end(&self, deadline: Instant) -> Instant {
+    /// Cross-node: the end of the shared window. When the budget cannot hold
+    /// the whole window plus the reserve, the window ends at the deadline, so
+    /// running out is a cut (no verdict), never a qualification failure (a
+    /// member missing a shortened window would be an `Other` attempt).
+    fn end_or_deadline(&self, deadline: Instant) -> Instant {
         let e = Instant::now() + self.convergence;
         if e + self.reserve > deadline {
             deadline
@@ -483,12 +576,54 @@ impl Windows {
             e
         }
     }
+
+    /// Stats: `now + min(convergence, remaining − reserve)`, so the window
+    /// always ends before the reserve and the closing fence still runs; an
+    /// uncertified member at a shortened window end is a liveness
+    /// observation, not a usage verdict. `Cut` when not even `MIN_WINDOW`
+    /// fits.
+    fn end_within(&self, deadline: Instant) -> Result<Instant, Fail> {
+        let usable = remaining(deadline).saturating_sub(self.reserve);
+        if usable < MIN_WINDOW {
+            return Err(Fail::Cut);
+        }
+        Ok(Instant::now() + self.convergence.min(usable))
+    }
+}
+
+/// Below this much budget a digest is not started, and a failed digest is a
+/// cut (it most likely timed out because the budget ran out).
+const DIGEST_MIN: Duration = Duration::from_secs(1);
+
+/// One member's digest, retried once on failure while the budget allows.
+fn member_digest(d: &Driver, client: usize, m: &Member, from: u64, deadline: Instant, digest: &DigestFn<'_>) -> Result<Value, Fail> {
+    let mut last = String::new();
+    for _ in 0..2 {
+        let left = remaining(deadline);
+        if left < DIGEST_MIN {
+            return Err(Fail::Cut);
+        }
+        let body = json!({
+            "node": m.addr, "consistency": "stale", "sections": ["ledgers", "accounts", "audit"],
+            "auditFrom": from.to_string(), "items": false, "timeoutMs": (left - Duration::from_millis(500)).as_millis() as u64,
+        });
+        match digest(d, client, &body) {
+            Ok(s) => return Ok(s),
+            Err(e) => {
+                println!("driver: cross_node_identity: member {} digest failed: {e}", m.id);
+                last = e;
+            }
+        }
+    }
+    if remaining(deadline) < DIGEST_MIN {
+        return Err(Fail::Cut);
+    }
+    Err(Fail::Other(format!("member {} digest: {last}", m.id)))
 }
 
 /// One cross-node attempt (`MD/eventually_cross_node_identity/oracle.go` runAttempt).
 fn cross_attempt(d: &Driver, client: usize, cands: &[String], deadline: Instant, w: Windows, digest: &DigestFn<'_>, connected: &mut bool) -> Result<CrossReport, Fail> {
-    let (source, before) = select_source(d, client, cands, deadline)?;
-    *connected = true;
+    let (source, before) = select_source(d, client, cands, deadline, connected)?;
     let src = Route::node(client, &source);
     let (members, _) = membership(d, client, &source, deadline)?;
     let horizon = barrier(d, &src, deadline)?;
@@ -496,23 +631,15 @@ fn cross_attempt(d: &Driver, client: usize, cands: &[String], deadline: Instant,
         return Err(Fail::Late(format!("quiescence not established: {before} -> {horizon}")));
     }
     // Every current member participates; one shared window.
-    let end = w.end(deadline);
+    let end = w.end_or_deadline(deadline);
     first_fail(per_member(&members, |m| await_horizon(d, client, m, horizon, true, end, deadline)))?;
 
     // The audit head fixes the common digest window.
     let tails = first_fail(per_member(&members, |m| read_tail(d, client, m, deadline)))?;
-    let head = tails.first().and_then(|t| t.0.as_ref()).map(|t| u64_field(t, "sequence")).unwrap_or(0);
+    let head = tails.first().and_then(|t| t.tail.as_ref()).map(|t| u64_field(t, "sequence")).unwrap_or(0);
     let from = head.saturating_sub(AUDIT_WINDOW).max(1);
     let observed = per_member(&members, |m| {
-        let left = remaining(deadline);
-        if left < Duration::from_secs(1) {
-            return Err(Fail::Cut);
-        }
-        let body = json!({
-            "node": m.addr, "consistency": "stale", "sections": ["ledgers", "accounts", "audit"],
-            "auditFrom": from.to_string(), "items": false, "timeoutMs": (left - Duration::from_millis(500)).as_millis() as u64,
-        });
-        let sections = digest(d, client, &body).map_err(|e| if Instant::now() >= deadline { Fail::Cut } else { Fail::Other(format!("member {} digest: {e}", m.id)) })?;
+        let sections = member_digest(d, client, m, from, deadline, digest)?;
         // The member must still be exactly at the horizon.
         await_horizon(d, client, m, horizon, true, Instant::now(), deadline).map_err(|f| match f {
             Fail::Other(e) => Fail::Other(format!("after the digest: {e}")),
@@ -525,7 +652,7 @@ fn cross_attempt(d: &Driver, client: usize, cands: &[String], deadline: Instant,
         .iter()
         .zip(sections)
         .zip(tails)
-        .map(|((m, s), (tail, tip_present, tip))| Observation { member: m.clone(), audit: audit_obs(from, &s, tail, tip_present, tip), sections: s })
+        .map(|((m, s), t)| Observation { member: m.clone(), audit: audit_obs(from, &s, t), sections: s })
         .collect();
 
     // Fences: a late write, election entry or membership change invalidates the sweep.
@@ -543,7 +670,8 @@ fn cross_attempt(d: &Driver, client: usize, cands: &[String], deadline: Instant,
 /// The cross-node identity hook body.
 pub fn cross_node_identity(d: &Driver, client: usize, nodes: &NodeMap, deadline: Instant, w: Windows, digest: &DigestFn<'_>) {
     let cands = candidates(d, nodes);
-    let mut connected = false;
+    // Discovery answered (the old per-node dial), or a candidate answers below.
+    let mut connected = !nodes.nodes.is_empty();
     let mut failures = Vec::new();
     let mut report = None;
     let mut cut = false;
@@ -630,14 +758,23 @@ pub struct Expected {
     pub counts: Counts,
 }
 
+/// One tracked ledger of `/quiet/begin` `providers.usage`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct Tracked {
+    /// The model's transaction count (checked against the source's
+    /// `transactionCount` inside the capture fence).
+    pub tx: u64,
+    pub counts: Counts,
+}
+
 /// Tracked source counts from `/quiet/begin` `providers.usage`.
-pub fn tracked_expectations(begin: &Value) -> Option<BTreeMap<String, Expected>> {
+pub fn tracked_expectations(begin: &Value) -> Option<BTreeMap<String, Tracked>> {
     let ledgers = begin.pointer("/providers/usage")?.as_object()?;
     Some(
         ledgers
             .iter()
             .map(|(name, u)| {
-                (name.clone(), Expected { id: u64_field(u, "id"), counts: Counts { logs: u64_field(u, "logCount"), postings: u64_field(u, "postingCount"), reverts: u64_field(u, "revertCount") } })
+                (name.clone(), Tracked { tx: u64_field(u, "txCount"), counts: Counts { logs: u64_field(u, "logCount"), postings: u64_field(u, "postingCount"), reverts: u64_field(u, "revertCount") } })
             })
             .collect(),
     )
@@ -679,12 +816,36 @@ fn stats_counts(s: &Value) -> Counts {
 pub struct StatsObservation {
     pub node: String,
     pub node_id: u64,
+    /// A certified sweep matched every expectation.
     pub converged: bool,
+    /// At least one complete sweep was certified: the witness showed
+    /// `referenceCount == 1` before and after it, so the member's usage fold
+    /// had passed the source horizon for the whole sweep.
+    pub certified: bool,
+    /// A definitive divergence outside the counters (a ledger incarnation
+    /// differing from the source's, a non-transient read failure at a member
+    /// past the horizon).
+    pub fatal: bool,
     pub witness_references: u64,
     pub attempts: u64,
-    /// The last complete sweep's mismatches: ledger → served counts.
+    /// The last certified sweep's mismatches: ledger → served counts.
     pub mismatches: BTreeMap<String, Counts>,
     pub error: String,
+}
+
+impl StatsObservation {
+    /// The usage verdict: `Some(true)` converged, `Some(false)` a certified
+    /// sweep mismatched (or a definitive divergence), `None` no certified
+    /// sweep (a liveness observation, not a usage finding).
+    pub fn verdict(&self) -> Option<bool> {
+        if self.converged {
+            Some(true)
+        } else if self.fatal || (self.certified && !self.mismatches.is_empty()) {
+            Some(false)
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -716,7 +877,8 @@ fn stale_read(d: &Driver, route: &Route, method: &str, req: Value, deadline: Ins
     }
 }
 
-/// One complete sweep of a member (`observe.go` sampleUsage).
+/// One complete sweep of a member (`observe.go` sampleUsage). `deadline` is
+/// the end of the member's window.
 fn sample_usage(d: &Driver, route: &Route, witness: &str, wid: u64, expected: &BTreeMap<String, Expected>, deadline: Instant, obs: &mut StatsObservation) -> Sample {
     macro_rules! read {
         ($method:literal, $ledger:expr) => {
@@ -754,21 +916,30 @@ fn sample_usage(d: &Driver, route: &Route, witness: &str, wid: u64, expected: &B
             mismatches.insert(name.clone(), got);
         }
     }
-    obs.mismatches = mismatches;
-    // The usage store has no WAL and can rewind on restart: re-check the witness.
+    // The usage store has no WAL and can rewind on restart: re-check the
+    // witness. Only a sweep certified at both ends counts.
     let marker = read!("GetLedgerStats", witness);
     obs.witness_references = u64_field(&marker, "referenceCount");
-    if obs.witness_references == 1 && obs.mismatches.is_empty() {
+    if obs.witness_references != 1 {
+        return Sample::NotYet;
+    }
+    obs.certified = true;
+    obs.mismatches = mismatches;
+    if obs.mismatches.is_empty() {
         Sample::Matched
     } else {
         Sample::NotYet
     }
 }
 
-/// Polls one member until its usage matches (`observe.go` awaitReplica +
-/// awaitUsage). `Err(Cut)` when the deadline, not the window, ended it.
+/// Polls one member until a certified sweep matches (`observe.go`
+/// awaitReplica + awaitUsage), or its window `end` passes. `end` is always
+/// before the hook's deadline (`Windows::end_within`), so a member that never
+/// matches returns its last certified sweep rather than a cut.
+#[allow(clippy::too_many_arguments)]
 fn await_usage(d: &Driver, client: usize, m: &Member, horizon: u64, witness: &str, wid: u64, expected: &BTreeMap<String, Expected>, end: Instant, deadline: Instant) -> Result<StatsObservation, Fail> {
     let mut obs = StatsObservation { node: m.addr.clone(), node_id: m.id, ..Default::default() };
+    let end = end.min(deadline);
     match await_horizon(d, client, m, horizon, false, end, deadline) {
         Ok(_) => {}
         Err(Fail::Other(e)) => {
@@ -780,26 +951,24 @@ fn await_usage(d: &Driver, client: usize, m: &Member, horizon: u64, witness: &st
     let route = Route::node(client, &m.addr);
     loop {
         obs.attempts += 1;
-        match sample_usage(d, &route, witness, wid, expected, deadline, &mut obs) {
+        match sample_usage(d, &route, witness, wid, expected, end, &mut obs) {
             Sample::Matched => {
                 obs.converged = true;
                 obs.error.clear();
                 return Ok(obs);
             }
             Sample::Fatal(e) => {
+                obs.fatal = true;
                 obs.error = e;
                 return Ok(obs);
             }
             Sample::NotYet => {}
         }
-        if !pause_until(end.min(deadline)) {
-            if end < deadline {
-                if obs.error.is_empty() {
-                    obs.error = "usage convergence did not complete within the window".into();
-                }
-                return Ok(obs);
+        if !pause_until(end) {
+            if obs.error.is_empty() {
+                obs.error = if obs.certified { "certified sweeps never matched within the window".into() } else { "the usage witness did not certify within the window".into() };
             }
-            return Err(Fail::Cut);
+            return Ok(obs);
         }
     }
 }
@@ -820,10 +989,41 @@ fn apply_ok(d: &Driver, client: usize, source: &str, requests: Vec<Value>, deadl
     }
 }
 
+/// A deterministic rank of `name` under `seed` (splitmix64 over FNV-1a).
+fn sample_rank(seed: u64, name: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in name.bytes() {
+        h = (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
+    }
+    let mut z = h ^ seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
+}
+
+/// The foreign ledgers folded this attempt: every untracked ledger of the
+/// tracked partition (reserved `o-<run>-own<N>` ledgers, any `o-` ledger the
+/// model does not list: they are small) plus a `seed`-ranked sample of
+/// `FOREIGN_SAMPLE` other foreign ledgers.
+pub fn foreign_sample(seed: u64, partition: &[String], others: &[String]) -> Vec<String> {
+    let mut ranked: Vec<&String> = others.iter().collect();
+    ranked.sort_by_key(|n| (sample_rank(seed, n), (*n).clone()));
+    let mut out: Vec<String> = partition.to_vec();
+    out.extend(ranked.into_iter().take(FOREIGN_SAMPLE).cloned());
+    out
+}
+
+/// A source `GetLedgerStats` (main-store `transactionCount`/`logCount` are
+/// synchronous; DESIGN §7 C6).
+fn source_stats(d: &Driver, src: &Route, name: &str, deadline: Instant) -> Result<Value, Fail> {
+    let st = call_retry(d, src, "bucket", "GetLedgerStats", &json!({"ledger": name}), &CallOpts::default().timeout(RPC), deadline)?;
+    st.response.clone().filter(|_| st.is_ok()).ok_or_else(|| Fail::Other(format!("source stats of {name}: {}", describe(&st))))
+}
+
 /// One stats attempt (`MD/eventually_stats_consistency/oracle.go` runAttempt).
-fn stats_attempt(d: &Driver, client: usize, cands: &[String], tracked: &BTreeMap<String, Expected>, deadline: Instant, w: Windows, connected: &mut bool) -> Result<StatsReport, Fail> {
-    let (source, _) = select_source(d, client, cands, deadline)?;
-    *connected = true;
+#[allow(clippy::too_many_arguments)]
+fn stats_attempt(d: &Driver, client: usize, cands: &[String], tracked: &BTreeMap<String, Tracked>, seed: u64, deadline: Instant, w: Windows, connected: &mut bool) -> Result<StatsReport, Fail> {
+    let (source, _) = select_source(d, client, cands, deadline, connected)?;
     let src = Route::node(client, &source);
     let (members, _) = membership(d, client, &source, deadline)?;
 
@@ -843,6 +1043,8 @@ fn stats_attempt(d: &Driver, client: usize, cands: &[String], tracked: &BTreeMap
     let prefix = d.s.tracked_prefix();
     let mut expected = BTreeMap::new();
     let mut seen = BTreeSet::new();
+    let mut ids = BTreeMap::new();
+    let (mut partition, mut others) = (Vec::new(), Vec::new());
     for row in &rows {
         let (name, id) = (str_field(row, "name").to_string(), u64_field(row, "id"));
         if name.is_empty() || id == 0 || !seen.insert(name.clone()) {
@@ -851,21 +1053,46 @@ fn stats_attempt(d: &Driver, client: usize, cands: &[String], tracked: &BTreeMap
         if row.get("deletedAt").is_some_and(|v| !v.is_null()) || name == witness {
             continue;
         }
-        if name.starts_with(&prefix) {
-            // Tracked: exact counts from the oracle's quiescent model.
-            if let Some(t) = tracked.get(&name) {
-                expected.insert(name, Expected { id, counts: t.counts });
+        if let Some(t) = tracked.get(&name).filter(|_| name.starts_with(&prefix)) {
+            // Tracked: exact counts from the oracle's quiescent model, checked
+            // against the source inside the fence.
+            let st = source_stats(d, &src, &name, deadline)?;
+            let (txs, logs) = (u64_field(&st, "transactionCount"), u64_field(&st, "logCount"));
+            if txs != t.tx || logs != t.counts.logs {
+                return Err(Fail::Other(format!(
+                    "tracked ledger {name}: source transactionCount {txs} logCount {logs}, the oracle's model at /quiet/begin txCount {} logCount {}",
+                    t.tx, t.counts.logs
+                )));
             }
+            expected.insert(name, Expected { id, counts: t.counts });
+            continue;
+        }
+        ids.insert(name.clone(), id);
+        if name.starts_with(&prefix) {
+            partition.push(name);
+        } else {
+            others.push(name);
+        }
+    }
+    let sample = foreign_sample(seed, &partition, &others);
+    let mut skipped = Vec::new();
+    for name in sample {
+        let st = source_stats(d, &src, &name, deadline)?;
+        let main_logs = u64_field(&st, "logCount");
+        if main_logs > FOLD_LOG_LIMIT {
+            skipped.push(name);
             continue;
         }
         let items = list_all(d, &src, "ListLogs", json!({"ledger": name, "options": {}}), &CallOpts::default().timeout(RPC), deadline)?;
         let counts = fold_logs(&name, &items).map_err(|e| Fail::Other(format!("folding {name}: {e}")))?;
-        let st = call_retry(d, &src, "bucket", "GetLedgerStats", &json!({"ledger": name}), &CallOpts::default().timeout(RPC), deadline)?;
-        let main_logs = st.response.as_ref().filter(|_| st.is_ok()).map(|v| u64_field(v, "logCount"));
-        if main_logs != Some(counts.logs) {
-            return Err(Fail::Other(format!("incomplete source for {name}: folded {counts:?}, main logs {main_logs:?}")));
+        if main_logs != counts.logs {
+            return Err(Fail::Other(format!("incomplete source for {name}: folded {counts:?}, main logs {main_logs}")));
         }
+        let id = ids[&name];
         expected.insert(name, Expected { id, counts });
+    }
+    if !skipped.is_empty() {
+        println!("driver: stats_convergence: not folded (more than {FOLD_LOG_LIMIT} logs): {skipped:?}");
     }
     for name in tracked.keys() {
         if !expected.contains_key(name) {
@@ -890,7 +1117,7 @@ fn stats_attempt(d: &Driver, client: usize, cands: &[String], tracked: &BTreeMap
         return Err(Fail::Late(format!("source changed during witness: {after} -> {horizon}")));
     }
 
-    let end = w.end(deadline);
+    let end = w.end_within(deadline)?;
     let observations = first_fail(per_member(&members, |m| await_usage(d, client, m, horizon, &witness, wid, &expected, end, deadline)))?;
     let closing = barrier(d, &src, deadline)?;
     if closing != horizon + 1 {
@@ -901,7 +1128,7 @@ fn stats_attempt(d: &Driver, client: usize, cands: &[String], tracked: &BTreeMap
 
 /// The stats convergence hook body. `begin == None` (oracle skipped or
 /// degraded) returns at once: not a finding.
-pub fn stats_convergence(d: &Driver, client: usize, nodes: &NodeMap, begin: Option<&Value>, deadline: Instant, w: Windows) {
+pub fn stats_convergence(d: &Driver, client: usize, nodes: &NodeMap, begin: Option<&Value>, seed: u64, deadline: Instant, w: Windows) {
     let Some(begin) = begin else {
         println!("driver: stats_convergence skipped: no /quiet/begin");
         return;
@@ -911,12 +1138,13 @@ pub fn stats_convergence(d: &Driver, client: usize, nodes: &NodeMap, begin: Opti
         return;
     };
     let cands = candidates(d, nodes);
-    let mut connected = false;
+    // Discovery answered (the old per-node dial), or a candidate answers below.
+    let mut connected = !nodes.nodes.is_empty();
     let mut failures = Vec::new();
     let mut report = None;
     let mut cut = false;
     for _ in 0..ATTEMPTS {
-        match stats_attempt(d, client, &cands, &tracked, deadline, w, &mut connected) {
+        match stats_attempt(d, client, &cands, &tracked, seed, deadline, w, &mut connected) {
             Ok(r) => {
                 report = Some(r);
                 break;
@@ -947,11 +1175,21 @@ pub fn stats_convergence(d: &Driver, client: usize, nodes: &NodeMap, begin: Opti
     }
 }
 
+/// Usage verdicts only for members with a certified sweep (or a definitive
+/// divergence); an uncertified member (the usage store still rebuilding
+/// after a restart, a shortened window) is reported by the liveness
+/// Sometimes, never as a usage finding.
 pub fn publish_stats(r: &StatsReport) {
     for o in &r.observations {
         let details = json!({"node": o.node, "sourceIndex": r.horizon, "witness": r.witness, "expected": r.expected, "observation": o});
-        check_always!(o.converged, "usage counters converge exactly at a fixed source horizon", details);
-        if o.converged {
+        let v = o.verdict();
+        check_sometimes!(o.certified || o.fatal, "the usage witness certifies on a member within the stats window", details);
+        let Some(converged) = v else {
+            println!("driver: stats_convergence: member {} not certified: {}", o.node_id, o.error);
+            continue;
+        };
+        check_always!(converged, "usage counters converge exactly at a fixed source horizon", details);
+        if converged {
             check_reachable!("stats usage convergence verified", details);
         }
     }
@@ -960,7 +1198,7 @@ pub fn publish_stats(r: &StatsReport) {
 fn run_stats(d: &Driver, ctx: &mut QuietCtx, plan: &HookPlan) {
     let client = plan_of(d, ctx, plan);
     let begin = ctx.begin.clone();
-    stats_convergence(d, client, &ctx.nodes, begin.as_ref(), ctx.deadline, STATS_WINDOWS);
+    stats_convergence(d, client, &ctx.nodes, begin.as_ref(), seed_of(plan), ctx.deadline, STATS_WINDOWS);
 }
 
 // ---------------------------------------------------------------- cluster config convergence
@@ -974,6 +1212,16 @@ pub struct ConfigReport {
     pub configs: BTreeMap<u64, Value>,
 }
 
+/// Whether a `clusterConfig` answer is the persisted one. With no
+/// ClusterConfig ever persisted, `GetClusterState` falls back to
+/// `{rotationThreshold: <local cache threshold>}`
+/// (`internal/adapter/grpc/server_cluster.go:155-160`), which differs per node
+/// on purpose (DESIGN §8); the persisted config always carries the bloom
+/// fields too (`proposeClusterConfigIfNeeded`).
+pub fn config_persisted(c: &Value) -> bool {
+    c.as_object().is_some_and(|o| o.keys().any(|k| k != "rotationThreshold"))
+}
+
 /// Members whose `clusterConfig` differs from the leader's.
 pub fn config_mismatches(r: &ConfigReport) -> Vec<u64> {
     let lead = r.configs.get(&r.leader);
@@ -981,7 +1229,7 @@ pub fn config_mismatches(r: &ConfigReport) -> Vec<u64> {
 }
 
 fn config_attempt(d: &Driver, client: usize, cands: &[String], deadline: Instant) -> Result<ConfigReport, Fail> {
-    let (source, _) = select_source(d, client, cands, deadline)?;
+    let (source, _) = select_source(d, client, cands, deadline, &mut false)?;
     let src = Route::node(client, &source);
     let (members, leader) = membership(d, client, &source, deadline)?;
     if !members.iter().any(|m| m.id == leader) {
@@ -1036,6 +1284,13 @@ pub fn cluster_config_convergence(d: &Driver, client: usize, nodes: &NodeMap, de
         println!("driver: cluster_config_convergence: no qualified observation: {failures:?}");
         return;
     };
+    let lead = r.configs.get(&r.leader).cloned().unwrap_or(Value::Null);
+    if !config_persisted(&lead) {
+        // The leader never persisted a ClusterConfig: every node answers its
+        // own local fallback, which is not a replicated state to compare.
+        println!("driver: cluster_config_convergence: the leader's cluster config is not persisted ({lead}); not compared");
+        return;
+    }
     publish_config(d, &r);
 }
 
@@ -1167,9 +1422,15 @@ mod tests {
         assert_eq!(first_difference(&a, &e).unwrap()["section"], "ledgers");
     }
 
-    fn obs(id: u64, s: Value, version: u64) -> Observation {
+    fn tobs(tail: Option<Value>, listed_last: Option<Value>, tip: Option<Value>) -> TailObs {
+        TailObs { tail, listed_last, tip_present: tip.is_some(), tip_full: tip }
+    }
+    fn obs_tip(id: u64, s: Value, version: u64, tip: Value) -> Observation {
         let tail = json!({"sequence": "7", "hashVersion": version});
-        Observation { member: Member { id, addr: format!("ledger-{}:8888", id - 1), suffrage: "Voter".into() }, audit: audit_obs(1, &s, Some(tail.clone()), true, Some(tail)), sections: s }
+        Observation { member: Member { id, addr: format!("ledger-{}:8888", id - 1), suffrage: "Voter".into() }, audit: audit_obs(1, &s, tobs(Some(tail.clone()), Some(tail), Some(tip))), sections: s }
+    }
+    fn obs(id: u64, s: Value, version: u64) -> Observation {
+        obs_tip(id, s, version, json!({"sequence": "7", "hashVersion": version}))
     }
 
     #[test]
@@ -1202,22 +1463,35 @@ mod tests {
         s4["audit"]["lastKey"] = json!("6");
         publish_cross(&CrossReport { horizon: 11, members: vec![], observations: vec![obs(1, s4, 1)] });
         assert!(!hit("complete audit listing and point tip agree at a common applied index").unwrap().cond);
+
+        // Same headers, different tip items: the tip is compared items included.
+        testkit::reset();
+        let tip = |x: u64| json!({"sequence": "7", "hashVersion": 1, "items": [{"x": x}]});
+        publish_cross(&CrossReport { horizon: 11, members: vec![], observations: vec![obs_tip(1, sections(), 1, tip(1)), obs_tip(2, sections(), 1, tip(2))] });
+        assert!(hit("complete audit listing and point tip agree at a common applied index").unwrap().cond, "stripped tips agree");
+        assert!(!hit("audit hash is identical across nodes at the same sequence").unwrap().cond);
     }
 
     #[test]
     fn audit_tail_and_tip_logic() {
         let s = sections();
         let t = json!({"sequence": "7", "hashVersion": 2});
-        let a = audit_obs(1, &s, Some(t.clone()), true, Some(t.clone()));
+        let a = audit_obs(1, &s, tobs(Some(t.clone()), Some(t.clone()), Some(t.clone())));
         assert!(a.tail_matches && a.tip_present && a.version == 2 && a.tail_seq == 7);
-        let a = audit_obs(1, &s, Some(t.clone()), true, Some(json!({"sequence": "7", "hashVersion": 3})));
+        let a = audit_obs(1, &s, tobs(Some(t.clone()), Some(t.clone()), Some(json!({"sequence": "7", "hashVersion": 2, "items": [1]}))));
+        assert!(a.tail_matches, "the tip is stripped before the header comparison");
+        let a = audit_obs(1, &s, tobs(Some(t.clone()), Some(t.clone()), Some(json!({"sequence": "7", "hashVersion": 3}))));
         assert!(!a.tail_matches, "tip differs from tail");
-        let a = audit_obs(1, &s, Some(t.clone()), false, None);
+        let a = audit_obs(1, &s, tobs(Some(t.clone()), Some(json!({"sequence": "7", "hashVersion": 2, "hash": "other"})), Some(t.clone())));
+        assert!(!a.tail_matches, "the listing's last entry differs from the tail");
+        let a = audit_obs(1, &s, tobs(Some(t.clone()), None, Some(t.clone())));
+        assert!(!a.tail_matches, "the listing has no entry at the tail");
+        let a = audit_obs(1, &s, tobs(Some(t.clone()), Some(t.clone()), None));
         assert!(a.tail_matches && !a.tip_present, "absent tip is an observation");
         let mut empty = sections();
         empty["audit"] = json!({"count": 0, "sha256": "e", "lastKey": ""});
-        assert!(audit_obs(1, &empty, None, false, None).tail_matches);
-        assert!(!audit_obs(1, &s, None, false, None).tail_matches, "listing has entries, tail does not");
+        assert!(audit_obs(1, &empty, TailObs::default()).tail_matches);
+        assert!(!audit_obs(1, &s, TailObs::default()).tail_matches, "listing has entries, tail does not");
     }
 
     #[test]
@@ -1334,7 +1608,7 @@ mod tests {
         let dig = |_: &Driver, _: usize, _: &Value| -> Result<Value, String> { Ok(sections()) };
         cross_node_identity(&d, 0, &nodes1(), Instant::now(), short(), &dig);
         assert!(!hit("cross_node_identity completes within its quiet budget").unwrap().cond);
-        stats_convergence(&d, 0, &nodes1(), Some(&usage_begin()), Instant::now(), short());
+        stats_convergence(&d, 0, &nodes1(), Some(&usage_begin()), 0, Instant::now(), short());
         assert!(!hit("stats_convergence completes within its quiet budget").unwrap().cond);
         cluster_config_convergence(&d, 0, &nodes1(), Instant::now());
         assert!(!hit("cluster_config_convergence completes within its quiet budget").unwrap().cond);
@@ -1356,7 +1630,7 @@ mod tests {
         json!({"providers": {"usage": {"o-test-l1": {"id": 5, "logCount": 3, "txCount": 2, "postingCount": 2, "referenceCount": 1, "revertCount": 0}}}})
     }
     fn stats(refs: u64, logs: u64, postings: u64, reverts: u64) -> FakeReply {
-        ok(json!({"referenceCount": refs.to_string(), "logCount": logs.to_string(), "postingCount": postings.to_string(), "revertCount": reverts.to_string()}))
+        ok(json!({"transactionCount": "2", "referenceCount": refs.to_string(), "logCount": logs.to_string(), "postingCount": postings.to_string(), "revertCount": reverts.to_string()}))
     }
     fn stats_fakes(ft: &testkit::FakeTransport) {
         ft.set_default("cluster", "GetClusterState", ok(cs1(100, json!({}))));
@@ -1371,7 +1645,7 @@ mod tests {
         let (d, ft, _) = testkit::driver();
         testkit::reset();
         stats_fakes(&ft);
-        stats_convergence(&d, 2, &nodes1(), Some(&usage_begin()), soon(), short());
+        stats_convergence(&d, 2, &nodes1(), Some(&usage_begin()), 0, soon(), short());
         for m in [
             "stats_convergence completes within its quiet budget",
             "stats convergence oracle connects to replicas",
@@ -1403,9 +1677,9 @@ mod tests {
         let (d, ft, _) = testkit::driver();
         testkit::reset();
         stats_fakes(&ft);
-        // witness ok, l1 ok, witness rewound → next sweep.
-        ft.script("bucket", "GetLedgerStats", vec![stats(1, 3, 2, 0), stats(1, 3, 2, 0), stats(0, 0, 0, 0)]);
-        stats_convergence(&d, 0, &nodes1(), Some(&usage_begin()), soon(), short());
+        // source check of l1, then witness ok, l1 ok, witness rewound → next sweep.
+        ft.script("bucket", "GetLedgerStats", vec![stats(1, 3, 2, 0), stats(1, 3, 2, 0), stats(1, 3, 2, 0), stats(0, 0, 0, 0)]);
+        stats_convergence(&d, 0, &nodes1(), Some(&usage_begin()), 0, soon(), short());
         let a = hit("usage counters converge exactly at a fixed source horizon").unwrap();
         assert!(a.cond);
         assert_eq!(a.details["observation"]["attempts"], 2);
@@ -1417,7 +1691,7 @@ mod tests {
         testkit::reset();
         stats_fakes(&ft);
         ft.set_default("bucket", "GetLedgerStats", stats(1, 3, 9, 0));
-        stats_convergence(&d, 0, &nodes1(), Some(&usage_begin()), soon(), short());
+        stats_convergence(&d, 0, &nodes1(), Some(&usage_begin()), 0, soon(), short());
         let a = hit("usage counters converge exactly at a fixed source horizon").unwrap();
         assert!(!a.cond);
         assert_eq!(a.details["observation"]["mismatches"]["o-test-l1"]["postings"], 9);
@@ -1426,24 +1700,113 @@ mod tests {
     }
 
     #[test]
-    fn a_witness_that_never_certifies_is_not_compared() {
+    fn a_witness_that_never_certifies_is_not_a_usage_finding() {
         let (d, ft, _) = testkit::driver();
         testkit::reset();
         stats_fakes(&ft);
         ft.set_default("bucket", "GetLedgerStats", stats(0, 3, 2, 0));
-        stats_convergence(&d, 0, &nodes1(), Some(&usage_begin()), soon(), short());
-        let a = hit("usage counters converge exactly at a fixed source horizon").unwrap();
+        stats_convergence(&d, 0, &nodes1(), Some(&usage_begin()), 0, soon(), short());
+        assert!(hit("usage counters converge exactly at a fixed source horizon").is_none(), "{:?}", testkit::assertions());
+        let a = hit("the usage witness certifies on a member within the stats window").unwrap();
         assert!(!a.cond);
         assert_eq!(a.details["observation"]["witnessReferences"], 0);
         assert!(a.details["observation"]["mismatches"].as_object().unwrap().is_empty(), "never compared without the certificate");
+        assert!(hit("stats oracle obtains a qualified observation within its bounded retry budget").unwrap().cond);
+    }
+
+    #[test]
+    fn a_mismatching_certified_sweep_is_a_finding_even_when_the_budget_clips_the_window() {
+        let (d, ft, _) = testkit::driver();
+        testkit::reset();
+        stats_fakes(&ft);
+        ft.set_default("bucket", "GetLedgerStats", stats(1, 3, 9, 0));
+        // The full 60 s window does not fit in the budget: the window is
+        // clipped to the budget minus the reserve, not stretched to the deadline.
+        let w = Windows { convergence: Duration::from_secs(60), reserve: Duration::from_millis(500) };
+        let t0 = Instant::now();
+        stats_convergence(&d, 0, &nodes1(), Some(&usage_begin()), 0, t0 + Duration::from_secs(3), w);
+        assert!(hit("stats_convergence completes within its quiet budget").unwrap().cond, "{:?}", testkit::assertions());
+        let a = hit("usage counters converge exactly at a fixed source horizon").unwrap();
+        assert!(!a.cond);
+        assert_eq!(a.details["observation"]["certified"], true);
+        assert!(Instant::now() < t0 + Duration::from_secs(3));
+
+        // Not even MIN_WINDOW left after the reserve: a cut, no verdict.
+        testkit::reset();
+        let (d, ft, _) = testkit::driver();
+        stats_fakes(&ft);
+        let w = Windows { convergence: Duration::from_secs(60), reserve: Duration::from_secs(30) };
+        stats_convergence(&d, 0, &nodes1(), Some(&usage_begin()), 0, Instant::now() + Duration::from_secs(5), w);
+        assert!(!hit("stats_convergence completes within its quiet budget").unwrap().cond);
+        assert_eq!(always_count(), 0);
+    }
+
+    #[test]
+    fn tracked_counts_disagreeing_with_the_source_fail_the_attempt_not_usage() {
+        let (d, ft, _) = testkit::driver();
+        testkit::reset();
+        stats_fakes(&ft);
+        ft.script("bucket", "Barrier", barriers(&[20, 21, 30, 31]));
+        // The source holds a late commit the model did not see at /quiet/begin.
+        ft.set_default("bucket", "GetLedgerStats", ok(json!({"transactionCount": "3", "logCount": "4", "referenceCount": "1", "postingCount": "2", "revertCount": "0"})));
+        stats_convergence(&d, 0, &nodes1(), Some(&usage_begin()), 0, soon(), short());
+        assert!(hit("usage counters converge exactly at a fixed source horizon").is_none());
+        let q = hit("stats oracle obtains a qualified observation within its bounded retry budget").unwrap();
+        assert!(!q.cond, "three Other attempts");
+        assert!(q.details["attempts"][0].to_string().contains("txCount 2"), "{}", q.details);
+        let src = ft.calls_of("bucket", "GetLedgerStats");
+        assert!(src.iter().any(|c| c["request"]["ledger"] == "o-test-l1" && c["consistency"] != "stale"));
+    }
+
+    #[test]
+    fn untracked_partition_ledgers_are_folded() {
+        let (d, ft, _) = testkit::driver();
+        testkit::reset();
+        stats_fakes(&ft);
+        ft.set_default("bucket", "ListLedgers", items(vec![json!({"name": "o-test-l1", "id": 5}), json!({"name": "o-test-own1", "id": 5})]));
+        let p = json!({"source": "world", "destination": "a", "asset": "USD", "amount": "1"});
+        let log = |id: u64| json!({"payload": {"apply": {"ledgerName": "o-test-own1", "log": {"id": id.to_string(), "data": {"createdTransaction": {"transaction": {"postings": [p]}}}}}}});
+        ft.set_default("bucket", "ListLogs", items(vec![log(1), log(2), log(3)]));
+        ft.set_default("bucket", "GetLedgerStats", stats(1, 3, 3, 0));
+        let begin = json!({"providers": {"usage": {"o-test-l1": {"id": 5, "logCount": 3, "txCount": 2, "postingCount": 3, "revertCount": 0}}}});
+        stats_convergence(&d, 0, &nodes1(), Some(&begin), 0, soon(), short());
+        let a = hit("usage counters converge exactly at a fixed source horizon").unwrap();
+        assert!(a.cond, "{:?}", testkit::assertions());
+        assert_eq!(a.details["expected"]["o-test-own1"]["counts"]["logs"], 3);
+        assert_eq!(ft.calls_of("bucket", "ListLogs").iter().map(|c| c["request"]["ledger"].clone()).collect::<Vec<_>>(), vec![json!("o-test-own1")]);
+    }
+
+    #[test]
+    fn the_foreign_fold_is_bounded() {
+        let others: Vec<String> = (0..20).map(|i| format!("r-x-{i}")).collect();
+        let part = vec!["o-test-own1".to_string()];
+        let a = foreign_sample(7, &part, &others);
+        assert_eq!(a.len(), 1 + FOREIGN_SAMPLE);
+        assert_eq!(a[0], "o-test-own1");
+        assert_eq!(a, foreign_sample(7, &part, &others), "deterministic for a seed");
+        assert_ne!(a, foreign_sample(8, &part, &others), "the seed rotates the sample");
+        assert_eq!(foreign_sample(1, &[], &others[..3]).len(), 3);
+
+        // A ledger with too many logs is not folded.
+        let (d, ft, _) = testkit::driver();
+        testkit::reset();
+        stats_fakes(&ft);
+        ft.set_default("bucket", "ListLedgers", items(vec![json!({"name": "o-test-l1", "id": 5}), json!({"name": "r-stress-x", "id": 6})]));
+        ft.set_default("bucket", "GetLedgerStats", ok(json!({"transactionCount": "2", "logCount": "3", "referenceCount": "1", "postingCount": "2", "revertCount": "0"})));
+        ft.script("bucket", "GetLedgerStats", vec![stats(1, 3, 2, 0), ok(json!({"logCount": (FOLD_LOG_LIMIT + 1).to_string()}))]);
+        stats_convergence(&d, 0, &nodes1(), Some(&usage_begin()), 0, soon(), short());
+        assert!(ft.calls_of("bucket", "ListLogs").is_empty());
+        let a = hit("usage counters converge exactly at a fixed source horizon").unwrap();
+        assert!(a.cond);
+        assert!(a.details["expected"].get("r-stress-x").is_none());
     }
 
     #[test]
     fn stats_without_quiet_begin_returns_quietly() {
         let (d, ft, _) = testkit::driver();
         testkit::reset();
-        stats_convergence(&d, 0, &nodes1(), None, soon(), short());
-        stats_convergence(&d, 0, &nodes1(), Some(&json!({"providers": {}})), soon(), short());
+        stats_convergence(&d, 0, &nodes1(), None, 0, soon(), short());
+        stats_convergence(&d, 0, &nodes1(), Some(&json!({"providers": {}})), 0, soon(), short());
         assert!(ft.calls().is_empty());
         assert!(testkit::assertions().is_empty());
     }
@@ -1469,7 +1832,7 @@ mod tests {
         ft.set_default("bucket", "ListLedgers", items(vec![json!({"name": "r-ns-x", "id": 5})]));
         ft.set_default("bucket", "ListLogs", items(its.clone()));
         ft.set_default("bucket", "GetLedgerStats", stats(1, 3, 3, 1));
-        stats_convergence(&d, 0, &nodes1(), Some(&json!({"providers": {"usage": {}}})), soon(), short());
+        stats_convergence(&d, 0, &nodes1(), Some(&json!({"providers": {"usage": {}}})), 0, soon(), short());
         assert!(hit("usage counters converge exactly at a fixed source horizon").is_some_and(|a| a.cond), "{:?}", testkit::assertions());
         assert_eq!(ft.calls_of("bucket", "ListLogs")[0]["request"]["ledger"], "r-ns-x");
     }
@@ -1488,11 +1851,77 @@ mod tests {
         assert!(!hit("a cluster config change was observed between quiet periods").unwrap().cond, "first run");
 
         testkit::reset();
-        ft.set_default("cluster", "GetClusterState", ok(cs1(100, json!({"rotationThreshold": "64"}))));
+        ft.set_default("cluster", "GetClusterState", ok(cs1(100, json!({"rotationThreshold": "64", "bloomVolumes": {"expectedKeys": "1000001"}}))));
         ft.script("bucket", "Barrier", barriers(&[20, 21, 22]));
         cluster_config_convergence(&d, 0, &nodes1(), Instant::now() + Duration::from_secs(10));
         assert!(hit("a cluster config change was observed between quiet periods").unwrap().cond);
         assert!(ft.calls_of("cluster", "GetClusterState").iter().any(|c| c["request"] == json!({"nodeId": "1"}) && c["node"] == "ledger-0:8888"));
+    }
+
+    #[test]
+    fn an_unpersisted_leader_config_is_not_compared() {
+        let (d, ft, _) = testkit::driver();
+        testkit::reset();
+        assert!(!config_persisted(&json!({"rotationThreshold": "50"})));
+        assert!(!config_persisted(&json!({})));
+        assert!(config_persisted(&json!({"rotationThreshold": "50", "bloomVolumes": {}})));
+        ft.set_default("cluster", "GetClusterState", ok(cs1(100, json!({"rotationThreshold": "50"}))));
+        ft.script("bucket", "Barrier", barriers(&[10, 11, 12]));
+        cluster_config_convergence(&d, 0, &nodes1(), Instant::now() + Duration::from_secs(10));
+        assert!(hit("cluster_config_convergence completes within its quiet budget").unwrap().cond);
+        assert!(hit("every node's cluster config equals the leader's at a common horizon").is_none());
+        assert!(hit("a cluster config change was observed between quiet periods").is_none());
+    }
+
+    #[test]
+    fn source_selection_retries_through_a_leaderless_moment() {
+        let (d, ft, _) = testkit::driver();
+        testkit::reset();
+        ft.set_default("cluster", "GetClusterState", ok(cs1(11, json!({}))));
+        let unavailable = || FakeReply::Outcome(Outcome::from_json(&json!({"ok": false, "code": "Unavailable", "reason": "NO_LEADER"})));
+        let mut script = vec![unavailable(), unavailable(), unavailable()];
+        script.extend(barriers(&[10, 11, 12]));
+        ft.script("bucket", "Barrier", script);
+        audit_fakes(&ft);
+        let dig = |_: &Driver, _: usize, _: &Value| -> Result<Value, String> { Ok(sections()) };
+        // No discovery: `connected` comes from a candidate's (non-local) answer.
+        cross_node_identity(&d, 0, &NodeMap::default(), soon(), short(), &dig);
+        assert!(hit("cross-node identity oracle connects to replicas").unwrap().cond, "{:?}", testkit::assertions());
+        assert!(hit("cross-node complete account and audit identity verified").is_some());
+    }
+
+    #[test]
+    fn digests_are_retried_once_and_a_late_failure_is_a_cut() {
+        let (d, ft, _) = testkit::driver();
+        testkit::reset();
+        ft.set_default("cluster", "GetClusterState", ok(cs1(11, json!({}))));
+        ft.script("bucket", "Barrier", barriers(&[10, 11, 12]));
+        audit_fakes(&ft);
+        let n = AtomicU64::new(0);
+        let dig = |_: &Driver, _: usize, _: &Value| -> Result<Value, String> {
+            if n.fetch_add(1, Ordering::SeqCst) == 0 {
+                Err("transient".into())
+            } else {
+                Ok(sections())
+            }
+        };
+        cross_node_identity(&d, 0, &nodes1(), soon(), short(), &dig);
+        assert_eq!(n.load(Ordering::SeqCst), 2);
+        assert!(hit("cross-node complete account and audit identity verified").is_some());
+
+        // A digest that runs until the budget is gone is a cut, not Other.
+        let (d, ft, _) = testkit::driver();
+        testkit::reset();
+        ft.set_default("cluster", "GetClusterState", ok(cs1(11, json!({}))));
+        ft.script("bucket", "Barrier", barriers(&[10, 11, 12]));
+        audit_fakes(&ft);
+        let slow = |_: &Driver, _: usize, b: &Value| -> Result<Value, String> {
+            std::thread::sleep(Duration::from_millis(b["timeoutMs"].as_u64().unwrap()));
+            Err("DeadlineExceeded".into())
+        };
+        cross_node_identity(&d, 0, &nodes1(), Instant::now() + Duration::from_secs(3), short(), &slow);
+        assert!(!hit("cross_node_identity completes within its quiet budget").unwrap().cond);
+        assert_eq!(always_count(), 0, "{:?}", testkit::assertions());
     }
 
     #[test]
