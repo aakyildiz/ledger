@@ -21,6 +21,18 @@ pub struct ProbeResult {
 
 /// An RFC 3339 timestamp as (seconds since the epoch, nanos), enough to
 /// order protojson Timestamps whose fractional digits vary.
+/// A served timestamp: the ledger's protojson `Timestamp` is
+/// `{"data": "<unix micros>"}` (seen on the stack, task 99); an RFC 3339
+/// string is accepted too.
+pub fn ts_value(v: &Value) -> Option<(i64, u32)> {
+    if let Some(s) = v.as_str() {
+        return parse_ts(s);
+    }
+    let d = v.get("data")?;
+    let micros: i64 = d.as_str().and_then(|s| s.parse().ok()).or_else(|| d.as_i64())?;
+    Some((micros.div_euclid(1_000_000), (micros.rem_euclid(1_000_000) * 1000) as u32))
+}
+
 pub fn parse_ts(s: &str) -> Option<(i64, u32)> {
     let s = s.strip_suffix('Z')?;
     let (date, time) = s.split_once('T')?;
@@ -102,12 +114,12 @@ pub fn run(cx: &Cx, node: &str, seed: &Seed, s: u64) -> Vec<ProbeResult> {
     let out = p.apply(vec![tx(l, "world", "probe:d", 1, None)], Some(&cx.d.s.next_untracked_key()));
     if let (true, Some(txs)) = (first_write, &txs) {
         let max_id = txs.iter().map(|t| u64_field(t, "id")).max().unwrap_or(0);
-        let max_ins = txs.iter().filter_map(|t| t.get("insertedAt").and_then(Value::as_str).and_then(parse_ts)).max();
+        let max_ins = txs.iter().filter_map(|t| t.get("insertedAt").and_then(ts_value)).max();
         let logs = out.response.as_ref().map(apply_logs).unwrap_or_default();
         let seq = logs.first().map(|l| u64_field(l, "sequence")).unwrap_or(0);
         let created = logs.first().and_then(created_transaction).cloned().unwrap_or(json!({}));
         let id = u64_field(&created, "id");
-        let ins = created.get("insertedAt").and_then(Value::as_str).and_then(parse_ts);
+        let ins = created.get("insertedAt").and_then(ts_value);
         let ok = out.is_ok() && seq == s + 1 && id == max_id + 1 && matches!((ins, max_ins), (Some(a), Some(b)) if a > b);
         judge("next ids and clock", &out, ok, json!({"sequence": seq, "expectedSequence": s + 1, "id": id, "expectedId": max_id + 1, "insertedAt": created.get("insertedAt"), "maxRestoredInsertedAt": max_ins}));
     }
@@ -191,5 +203,9 @@ mod tests {
         assert_eq!(parse_ts("1970-01-01T00:00:00Z"), Some((0, 0)));
         assert_eq!(parse_ts("2000-03-01T00:00:00Z").unwrap().0, 951868800);
         assert!(parse_ts("nope").is_none());
+        // The served protojson form (unix micros).
+        assert_eq!(ts_value(&json!({"data": "1793711713261142"})), Some((1793711713, 261142000)));
+        assert_eq!(ts_value(&json!("1970-01-01T00:00:00Z")), Some((0, 0)));
+        assert!(ts_value(&json!({"data": "x"})).is_none());
     }
 }
