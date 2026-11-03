@@ -98,3 +98,10 @@ rules run in degraded mode and both hooks ignore `QuietCtx.begin`.
 
 - None for dependencies. `stale read observed lag behind acked writes` needs faults or a lagging
   follower: do not remove it for being unhit in a single-node native run.
+- Flavour draw bias: in the native acceptance run (`RULES=stale_probe,malformed_write
+  QUIET_PROBABILITY=0.05`, 180 s) all 23 quiet periods drew `quiesce_and_absence`, the first of the
+  two equally weighted hooks, so `eventually_correct` never ran. hegel biases
+  `draw::weighted`'s `int_in(0, 2^32-1)` toward 0. With the quiesce weight set to 0 for a local
+  run only (not committed), 61 periods ran `eventually_correct` over 7 ledgers with every must-hit
+  hit and no finding. 99 should check how hooks spread once all families are merged; the fix
+  belongs in 00c's `draw::weighted`.
