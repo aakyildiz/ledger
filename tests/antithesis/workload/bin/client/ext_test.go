@@ -11,7 +11,7 @@ import (
 )
 
 func TestMuxServesOpAndExtensions(t *testing.T) {
-	t.Parallel()
+	// Not parallel: s.mux() sets the process-wide extension server.
 	f := &fakeBucket{name: "a"}
 	addr := startFake(t, f)
 	cs, err := newConns(addr)

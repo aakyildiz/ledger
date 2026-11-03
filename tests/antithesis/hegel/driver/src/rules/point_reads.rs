@@ -428,7 +428,16 @@ mod tests {
 
         let mut want = Vec::new();
         for (f, kind) in [(get_account as fn(&Driver, TestCase), "GetAccount"), (get_transaction, "GetTransaction"), (aggregate, "AggregateVolumes"), (ledger_stats, "GetLedgerStats"), (get_log, "GetLog")] {
-            testkit::run_rule(&d, f);
+            // A rare draw can abandon its read (the suite saw it about once
+            // in ten full runs under load, never alone); run the rule until
+            // it ended one read (task 99).
+            let before = fo.calls("/read/end").len();
+            for _ in 0..20 {
+                testkit::run_rule(&d, f);
+                if fo.calls("/read/end").len() > before {
+                    break;
+                }
+            }
             want.push(kind);
         }
         let ends = fo.calls("/read/end");

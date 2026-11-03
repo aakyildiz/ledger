@@ -24,7 +24,9 @@ out.append("# Porting record of the hegel workload\n")
 out.append("This file is generated from `porting/*.md` by `porting/gen_porting.py` (one file per task; edit those, not this "
            "concatenation). Each family file maps every old assertion it inherits to "
            "`verbatim | renamed | oracle (literal) | new | dropped (why)`, lists its new properties, "
-           "its must-hit reachability and its requests to task 99.\n")
+           "its must-hit reachability and its requests to task 99. The integration record (catalog audit, "
+           "dispositions of the requests, integration fixes, server findings) is the last section, "
+           "[99 — Integration](#99-integration).\n")
 out.append("## Summary\n")
 inscope = [d for d in drivers if d not in K8S]
 out.append(f"- **{len(drivers)} main drivers** (`workload/bin/cmds/main/`): {len(inscope)} in scope, "

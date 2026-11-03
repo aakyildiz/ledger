@@ -278,7 +278,9 @@ func TestBlockSetupToleratesAlreadyExists(t *testing.T) {
 }
 
 func TestBlockEndpoints(t *testing.T) {
-	t.Parallel()
+	// Not parallel: s.mux() sets the process-wide extension server
+	// (ext.go), which ext_test.go sets too (task 99: flaky when both ran
+	// at once).
 	f := &blockFakeServer{balance: 1_000_000}
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
