@@ -61,12 +61,17 @@ choice among the 26 replaces it.
 | `a block's post-commit volumes are well formed` | any succeeded block | no faults |
 | `a block runs within its pre-drawn values` | any answered `/block` (the largest block uses 5 of the 16 values) | no faults |
 
-Native run (`RULES=block_run run_native.sh 180`, one node, no faults): all six groups set up
-(`should be able to setup scenario` true ×6), 24 of the 26 `block … succeeded` hit, no
-`block … failed`, `a block's post-commit volumes are well formed` and `a block runs within
-its pre-drawn values` hit true. Not hit in 180 s: `subscription/charge` (needs a funded
-subscriber whose balance covers its tier's charge) and `subscription/recognize` (needs deferred
-revenue from a prior charge).
+Native runs (one node, no faults):
+
+- `RULES=block_run run_native.sh 180` (first version): all six groups set up, 24 of the 26
+  `block … succeeded` hit, no `block … failed`; `subscription/charge` and
+  `subscription/recognize` not hit.
+- `RULES=block_run run_native.sh 300` (after the review fixes; `HEALTH_*_THRESHOLD=0.995`
+  because the host disk was 96 % full and the default threshold blocked writes): all six
+  groups set up (`should be able to setup scenario` true), **all 26** `block … succeeded`
+  hit, including `subscription/charge` and `subscription/recognize`, no `block … failed`, no
+  finding; `a block's post-commit volumes are well formed`, `a block runs within its
+  pre-drawn values` and `a block never runs out of its pre-drawn values` true.
 
 ## Requests to 99
 
