@@ -358,12 +358,28 @@ impl NsLedger {
     /// template; `latest` to the template of every possible version at or
     /// above the greatest acked one (deduplicated, in version order).
     pub fn candidates(&self, sel: &Selector, vars: &Vars) -> Vec<Vec<Posting>> {
+        self.candidates_since(sel, vars, self.floor(sel))
+    }
+
+    /// The greatest acked version of a `latest` selector's name (None for
+    /// other selectors or without an acked version).
+    pub fn floor(&self, sel: &Selector) -> Option<Semver> {
+        match sel {
+            Selector::Latest(name) => self.library.get(name).and_then(ScriptRec::max_acked),
+            _ => None,
+        }
+    }
+
+    /// `candidates` with the `latest` floor taken when the transaction was
+    /// sent: evaluated after the answer, it also covers versions whose save
+    /// started while the transaction was in flight (their content may be the
+    /// greatest stored version when the FSM resolves `latest`).
+    pub fn candidates_since(&self, sel: &Selector, vars: &Vars, floor: Option<Semver>) -> Vec<Vec<Posting>> {
         let templates: Vec<Template> = match sel {
             Selector::Inline => vec![Template::Transfer],
             Selector::Pinned(name, v) => self.library.get(name).and_then(|s| s.versions.get(v)).map(|r| vec![r.template]).unwrap_or_default(),
             Selector::Latest(name) => {
                 let Some(s) = self.library.get(name) else { return vec![] };
-                let floor = s.max_acked();
                 let mut t = Vec::new();
                 for (v, r) in &s.versions {
                     if r.status.possible() && floor.is_none_or(|f| *v >= f) && !t.contains(&r.template) {
@@ -576,6 +592,12 @@ mod tests {
         // once 2.0.0 is acked, 1.0.0 can no longer be the latest
         l.library.get_mut("s-1").unwrap().versions.get_mut(&Semver::new(2, 0, 0)).unwrap().status = Status::Acked;
         assert_eq!(l.candidates(&Selector::Latest("s-1".into()), &v), vec![Template::Reversed.postings(&v)]);
+        // A floor taken before 2.0.0 was acked still accepts 1.0.0's template.
+        assert_eq!(l.candidates_since(&Selector::Latest("s-1".into()), &v, Some(Semver::new(1, 0, 0))), vec![Template::Transfer.postings(&v), Template::Reversed.postings(&v)]);
+        // A save that started after the send (4.0.0, pending) is covered when evaluated after the answer.
+        l.library.get_mut("s-1").unwrap().versions.insert(Semver::new(4, 0, 0), VersionRec { content: String::new(), template: Template::ViaHub, status: Status::Pending });
+        assert!(l.candidates_since(&Selector::Latest("s-1".into()), &v, Some(Semver::new(2, 0, 0))).contains(&Template::ViaHub.postings(&v)));
+        l.library.get_mut("s-1").unwrap().versions.remove(&Semver::new(4, 0, 0));
         assert_eq!(l.candidates(&Selector::Pinned("s-1".into(), Semver::new(1, 0, 0)), &v), vec![Template::Transfer.postings(&v)]);
         assert_eq!(l.candidates(&Selector::Inline, &v), vec![Template::Transfer.postings(&v)]);
         assert!(l.candidates(&Selector::Latest("nope".into()), &v).is_empty());

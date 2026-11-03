@@ -538,15 +538,16 @@ pub fn ns_exec(d: &Driver, tc: TestCase) {
         // EXEC
         let reference = format!("r-{}-ns{}", d.s.run, st.next_ref.fetch_add(1, Ordering::SeqCst));
         let key = d.s.next_untracked_key();
-        let (ledger, candidates, idx) = {
+        let (ledger, floor, idx) = {
             let mut g = lock(&st);
             let l = g.get_mut(li)?;
-            let candidates = l.candidates(&sel, &vars);
+            let floor = l.floor(&sel);
+            let candidates = l.candidates_since(&sel, &vars, floor);
             if candidates.is_empty() {
                 return None;
             }
-            let idx = l.record_tx(TxRec { reference: reference.clone(), key: key.clone(), selector: sel.clone(), vars: vars.clone(), candidates: candidates.clone(), status: Status::Pending, tx_id: None, committed: None });
-            (l.name.clone(), candidates, idx)
+            let idx = l.record_tx(TxRec { reference: reference.clone(), key: key.clone(), selector: sel.clone(), vars: vars.clone(), candidates, status: Status::Pending, tx_id: None, committed: None });
+            (l.name.clone(), floor, idx)
         };
         let mut send = UntrackedSend::new(vec![exec_request(&ledger, &sel, &vars, &reference)], Some(key));
         send.schedule = schedule;
@@ -555,6 +556,10 @@ pub fn ns_exec(d: &Driver, tc: TestCase) {
         let out = &r.outcome;
         let mut details = json!({"ledger": ledger, "reference": reference, "selector": format!("{sel:?}"), "vars": vars.to_json(), "outcome": out.summary(), "attempts": r.attempts.len()});
         let status = status_of(out);
+        // Candidates as of the answer, with the floor of the send: a save of
+        // `name` that started while the transaction was in flight may be the
+        // version `latest` resolved to.
+        let candidates = lock(&st).get(li).map(|l| l.candidates_since(&sel, &vars, floor)).unwrap_or_default();
         let (mut committed, mut tx_id) = (None, None);
         if out.is_ok() {
             let (ok, postings, id) = check_exec_response(out.response.as_ref(), &candidates);
@@ -567,6 +572,7 @@ pub fn ns_exec(d: &Driver, tc: TestCase) {
         {
             let mut g = lock(&st);
             if let Some(rec) = g.get_mut(li).and_then(|l| l.txs.get_mut(idx)) {
+                rec.candidates = candidates;
                 rec.status = status;
                 rec.committed = committed;
                 rec.tx_id = tx_id;
