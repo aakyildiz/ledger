@@ -1,0 +1,36 @@
+{
+  "name": "04-write-to-mirror",
+  "setup": [
+    {
+      "createLedger": {
+        "name": "o-rej-m1",
+        "mode": "LEDGER_MODE_MIRROR",
+        "mirrorSource": {
+          "ledgerName": "unused"
+        }
+      }
+    }
+  ],
+  "requests": [
+    {
+      "apply": {
+        "ledger": "o-rej-m1",
+        "action": {
+          "createTransaction": {
+            "postings": [
+              {
+                "source": "world",
+                "destination": "users:1",
+                "asset": "COIN",
+                "amount": {
+                  "v0": "5"
+                }
+              }
+            ]
+          }
+        }
+      }
+    }
+  ],
+  "expectReason": "LEDGER_IN_MIRROR_MODE"
+}

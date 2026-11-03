@@ -1,0 +1,35 @@
+{
+  "name": "04-mode-setter-disallowed-opt-in",
+  "setup": [
+    {
+      "createLedger": {
+        "name": "o-rej-l1"
+      }
+    }
+  ],
+  "requests": [
+    {
+      "addAccountType": {
+        "ledger": "o-rej-l1",
+        "accountType": {
+          "name": "t-6",
+          "pattern": "t-6:{id}"
+        }
+      }
+    },
+    {
+      "apply": {
+        "ledger": "o-rej-l1",
+        "action": {
+          "setDefaultEnforcementMode": {
+            "enforcementMode": "CHART_ENFORCEMENT_AUDIT"
+          }
+        },
+        "skippableReasons": [
+          "ERROR_REASON_ACCOUNT_TYPE_NOT_FOUND"
+        ]
+      }
+    }
+  ],
+  "expectReason": "VALIDATION"
+}

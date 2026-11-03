@@ -1,0 +1,23 @@
+{
+  "name": "04-create-existing",
+  "setup": [
+    {
+      "createLedger": {
+        "name": "o-rej-l1",
+        "metadata": {
+          "k0": {
+            "stringValue": "v0"
+          }
+        }
+      }
+    }
+  ],
+  "requests": [
+    {
+      "createLedger": {
+        "name": "o-rej-l1"
+      }
+    }
+  ],
+  "expectReason": "LEDGER_ALREADY_EXISTS"
+}
