@@ -1,0 +1,10 @@
+{
+  "name": "03 delete of an absent key on a transaction that has metadata (no opt-in)",
+  "setup": [
+    {"createLedger": {"name": "o-rej-l1"}},
+    {"apply": {"ledger": "o-rej-l1", "action": {"createTransaction": {"postings": [{"source": "world", "destination": "users:1", "asset": "COIN", "amount": {"v0": "5"}}]}}}},
+    {"apply": {"ledger": "o-rej-l1", "action": {"addMetadata": {"target": {"transactionId": "1"}, "metadata": {"k2": {"boolValue": true}}}}}}
+  ],
+  "requests": [{"apply": {"ledger": "o-rej-l1", "action": {"deleteMetadata": {"target": {"transactionId": "1"}, "key": "absent-k2"}}}}],
+  "expectReason": "METADATA_NOT_FOUND"
+}

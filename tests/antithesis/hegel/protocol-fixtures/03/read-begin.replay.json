@@ -1,0 +1,14 @@
+{
+  "endpoint": "POST /read/begin",
+  "request": {"rid": "r457", "kind": "Replay", "views": [{"name": "replayable"}], "params": {}},
+  "status": 200,
+  "response": {
+    "bootId": "1793836800123456789",
+    "ticket": 914,
+    "version": 4711,
+    "views": [{"entries": [
+      {"wid": "w99", "key": "o-18f6c2a1b3d4e-k77", "status": "committed", "reason": "", "stage": ""},
+      {"wid": "w120", "key": "o-18f6c2a1b3d4e-k91", "status": "failed", "reason": "TRANSACTION_ALREADY_REVERTED", "stage": "fsm"}
+    ]}]
+  }
+}

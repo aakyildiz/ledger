@@ -1,0 +1,11 @@
+{
+  "name": "03 revert of a revert transaction that was already reverted",
+  "setup": [
+    {"createLedger": {"name": "o-rej-l1"}},
+    {"apply": {"ledger": "o-rej-l1", "action": {"createTransaction": {"postings": [{"source": "world", "destination": "users:1", "asset": "COIN", "amount": {"v0": "5"}}]}}}},
+    {"apply": {"ledger": "o-rej-l1", "action": {"revertTransaction": {"transactionId": "1", "force": true}}}},
+    {"apply": {"ledger": "o-rej-l1", "action": {"revertTransaction": {"transactionId": "2", "force": true}}}}
+  ],
+  "requests": [{"apply": {"ledger": "o-rej-l1", "action": {"revertTransaction": {"transactionId": "2"}}}}],
+  "expectReason": "TRANSACTION_ALREADY_REVERTED"
+}

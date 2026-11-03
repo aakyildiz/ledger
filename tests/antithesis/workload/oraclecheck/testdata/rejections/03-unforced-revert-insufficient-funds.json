@@ -1,0 +1,10 @@
+{
+  "name": "03 unforced revert whose reversed source has spent the funds",
+  "setup": [
+    {"createLedger": {"name": "o-rej-l1"}},
+    {"apply": {"ledger": "o-rej-l1", "action": {"createTransaction": {"postings": [{"source": "world", "destination": "users:1", "asset": "COIN", "amount": {"v0": "5"}}]}}}},
+    {"apply": {"ledger": "o-rej-l1", "action": {"createTransaction": {"postings": [{"source": "users:1", "destination": "users:2", "asset": "COIN", "amount": {"v0": "5"}}]}}}}
+  ],
+  "requests": [{"apply": {"ledger": "o-rej-l1", "action": {"revertTransaction": {"transactionId": "1"}}}}],
+  "expectReason": "INSUFFICIENT_FUNDS"
+}

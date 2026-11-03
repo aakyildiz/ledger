@@ -8,6 +8,9 @@ pub mod smoke;
 // ==== 02-tx-writes mods ====
 // ==== end 02-tx-writes mods ====
 // ==== 03-reverts-metadata-idempotency mods ====
+pub mod idempotency;
+pub mod metadata;
+pub mod reverts;
 // ==== end 03-reverts-metadata-idempotency mods ====
 // ==== 04-ledgers-chart-maintenance mods ====
 // ==== end 04-ledgers-chart-maintenance mods ====
@@ -46,6 +49,9 @@ pub fn rules() -> Vec<ConcurrentRule<Driver>> {
     // ==== 02-tx-writes rules ====
     // ==== end 02-tx-writes rules ====
     // ==== 03-reverts-metadata-idempotency rules ====
+    v.extend(reverts::rules());
+    v.extend(metadata::rules());
+    v.extend(idempotency::rules());
     // ==== end 03-reverts-metadata-idempotency rules ====
     // ==== 04-ledgers-chart-maintenance rules ====
     // ==== end 04-ledgers-chart-maintenance rules ====
@@ -87,6 +93,7 @@ pub fn order_gens() -> Vec<crate::write::OrderGen> {
     // ==== 02-tx-writes order_gens ====
     // ==== end 02-tx-writes order_gens ====
     // ==== 03-reverts-metadata-idempotency order_gens ====
+    v.extend(metadata::family_gens());
     // ==== end 03-reverts-metadata-idempotency order_gens ====
     // ==== 04-ledgers-chart-maintenance order_gens ====
     // ==== end 04-ledgers-chart-maintenance order_gens ====

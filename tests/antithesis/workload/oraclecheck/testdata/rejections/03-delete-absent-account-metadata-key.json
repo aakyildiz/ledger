@@ -1,0 +1,9 @@
+{
+  "name": "03 delete of an absent key on an account that has metadata (no opt-in)",
+  "setup": [
+    {"createLedger": {"name": "o-rej-l1"}},
+    {"apply": {"ledger": "o-rej-l1", "action": {"addMetadata": {"target": {"account": {"addr": "t-3:4"}}, "metadata": {"k1": {"intValue": "42"}}}}}}
+  ],
+  "requests": [{"apply": {"ledger": "o-rej-l1", "action": {"deleteMetadata": {"target": {"account": {"addr": "t-3:4"}}, "key": "absent-k1"}}}}],
+  "expectReason": "METADATA_NOT_FOUND"
+}
