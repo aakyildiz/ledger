@@ -142,10 +142,10 @@ snouty launch --launcher basic_test --config tests/antithesis/hegel \
   --max-compute-hours 192
 ```
 
-The first short run (`--max-compute-hours 12`) should be checked with `snouty runs events`: no kill,
-stop, partition or CPU fault may target `driver` or `oracle`, and `the fault
-pause command exists in Antithesis` / `the fault pause command succeeds` must
-be hit.
+The first short run (`--max-compute-hours 12`) should be checked with
+`snouty runs events`: no kill, stop, partition or CPU fault may target
+`driver` or `oracle`, and `the fault pause command exists in Antithesis` /
+`the fault pause command succeeds` must be hit.
 
 **Triage note.** Ignore `tests/antithesis/workload/oraclecheck/**` and
 `tests/antithesis/workload/bin/oracle/**` in `.results.coverage`: the oracle

@@ -3090,7 +3090,7 @@ Sometimes / Reachable: `restore base backup completes`, `a restore cut has a non
 
 1. **Budget** (review finding 5): the 10-minute wall budget runs from the cut. From the base
    until the cut the cycle waits at most `cut_wait` = 15 minutes (quiet periods come every
-   3–8 minutes, so a single budget from the base would expire most cycles before their cut).
+   1.5–4 minutes, so a single budget from the base would expire most cycles before their cut).
    Expiry resets the agents and returns to Idle with `a restore cycle completes within its wall
    budget` (Sometimes) false; it never evaluates an Always.
 2. **Chained restore** (review finding 4): the chain uses the per-generation namespace
