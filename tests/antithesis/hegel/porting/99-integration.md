@@ -14,11 +14,11 @@ none was removed; each is justified here:
 | `the fault pause command exists in Antithesis` | Always | evaluated only under `ANTITHESIS_OUTPUT_DIR` | Antithesis only |
 | `the fault pause command succeeds` | Always | evaluated only under `ANTITHESIS_OUTPUT_DIR` | Antithesis only |
 | `a write attempt hits a preload miss` | Sometimes | `BALANCE_NOT_PRELOADED` / `PRELOAD_UNAVAILABLE` need a leader change or a cache miss under faults | faults |
-| `a write attempt is blocked by clock skew` | Sometimes | `WRITES_BLOCKED_CLOCK_SKEW` needs Antithesis clock faults | faults |
-| `a write attempt is refused as a stale proposal` | Sometimes | `STALE_PROPOSAL` needs a leadership change between plan and apply (more with per-node cache thresholds, see below) | faults + knobs |
-| `a write attempt is refused while an index builds` | Sometimes | the only write-path `INDEX_BUILDING` is a `createQueryCheckpoint` while the audit projection rebuilds after a restart (`admission.go` `checkQueryCheckpointProjectionReady`): reachable, kept. Since run 3d8b6ff1…-67-0 it is an arm of `write::explore_attempt` (every tracked attempt, so the checkpoint creates of task 09 too); before, only index-family attempts were checked, which never get it | faults |
+| `a write attempt is blocked by clock skew` | Sometimes | `WRITES_BLOCKED_CLOCK_SKEW` needs an offset between nodes; Antithesis clock faults move every node together (run 67-0: every sampled jump hit `["ALL"]`), so the health check only sees skew when a jump lands inside one `GetNodeTime` round | faults (rare) |
+| `a write attempt is refused as a stale proposal` | Sometimes | `STALE_PROPOSAL` needs a leadership change between plan and apply (more with per-node cache thresholds, see below); a `lib`-route retry hides it, so it shows on `plain` and `node` routes. Asserted on every `Apply` answer since the run 67-0 triage | faults + knobs |
+| `a write attempt is refused while an index builds` | Sometimes | the only write-path `INDEX_BUILDING` is a `createQueryCheckpoint` while the audit projection rebuilds after a restart (`admission.go` `checkQueryCheckpointProjectionReady`): reachable, kept. Since run 3d8b6ff1…-67-0 it is an arm of `write::explore_attempt`, which `Clients::call_with_op` runs on every `Apply` answer (so the checkpoint creates of task 09 too); before, only index-family attempts were checked, which never get it | faults |
 | `the leader reports a follower in snapshot progress` | Sometimes | a follower more than `RAFT_COMPACTION_MARGIN` entries behind while the leader reports it (`a follower reports an out-of-sync or snapshotting status` was hit once under local faults) | faults + knobs |
-| `a restore cycle survives a restart of restore-0` | Sometimes | needs restore-0 killed mid-cycle | faults |
+| `a restore cycle survives a restart of restore-0` | Sometimes | needs restore-0 killed mid-cycle (a container fault inside a 5–10 minute cycle) | faults (long runs) |
 | `a cluster config change resets the cache epoch` | Reachable | needs per-node `CACHE_ROTATION_THRESHOLD`, which the compose file equalises until the server divergence below is fixed | knobs (disabled) |
 | `a cluster config change was observed between quiet periods` | Sometimes | a leadership change that changes the persisted cluster config between two `cluster_config_convergence` runs | faults + knobs |
 | `a chained restore verifies` | Sometimes | a drawn plan variant (chained, about one cycle in four); a cycle takes 5–10 minutes, so 45 minutes give a handful of cycles | no faults (long runs) |
@@ -98,6 +98,28 @@ lists no `workload/internal` path, so the service does not link
   end of the previous period's fault pause when that is later. `exact` weighs
   50 until it completes once in the process (and again after 3 quiet periods
   without a completion), 10 otherwise, instead of 4 (50 after 3).
+- Antithesis run 67-0 coverage triage (timelines of 20–60 s, no quiet phase
+  reached):
+  - Five blocks never succeeded (`lending/provision`, `marketplace/payout`,
+    `payroll/cost_alloc`, `subscription/charge`, `subscription/recognize`):
+    every attempt was `precondition not met`, because each consumer drew its
+    entity independently of the producer that funded one. `block_run` now
+    chains a succeeded producer with its consumer on the same entity (17),
+    with the Sometimes `a chained consumer block succeeds after its producer
+    commits`.
+  - The write-attempt Sometimes (`explore_attempt`) ran only on tracked
+    attempts: `send_untracked` and the rules' direct Applies never reached it,
+    and the run's one `STALE_PROPOSAL` went unasserted while the server's
+    `stale proposal rejected: predicted index mismatch` was hit 3 times. It now
+    runs in `Clients::call_with_op` on every `Apply` answer. Preload misses
+    and clock skew stay rare by construction (table above).
+  - Restore plans draw the cancel and finalize-early perturbations for half of
+    the online cycles (was a quarter), and the cancel lands after the first or
+    second running poll (was up to the fourth): the run completed one download.
+  - `the leader reports a follower in snapshot progress` stays a coverage gap:
+    the leader holds a follower in `Snapshot` only until the follower acks the
+    `MsgSnap`, and `cluster_state` (weight 0.3) polled 119 times, always seeing
+    `Replicate`, while `a follower receives a raft snapshot` was hit 9 times.
 
 ## Server findings reported by task 99 (not masked in the checks)
 

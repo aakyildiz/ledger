@@ -139,6 +139,10 @@ fn start_download(cx: &Cx, sc: &StageCtx) -> Result<Option<String>, StageResult>
 pub fn online(cx: &Cx, sc: &StageCtx) -> StageResult {
     let p = sc.perturb;
     let mut canceled = false;
+    // The cancel took effect (the job reported CANCELED), so the download
+    // that later succeeds is a retry. A cancel that lands after the job
+    // finished leaves it SUCCEEDED and retries nothing.
+    let mut cancel_took = false;
     let mut bounced = false;
     'attempt: for attempt in 0..6 {
         if left(sc.deadline).is_zero() {
@@ -198,7 +202,10 @@ pub fn online(cx: &Cx, sc: &StageCtx) -> StageResult {
                         cx.sleep_ms(sc.poll_ms);
                     }
                     DlState::Succeeded => break,
-                    DlState::Canceled => continue 'attempt,
+                    DlState::Canceled => {
+                        cancel_took |= canceled;
+                        continue 'attempt;
+                    }
                     DlState::Failed => {
                         let msg = resp.get("errorMessage").and_then(Value::as_str).unwrap_or("").to_string();
                         if let Some(frag) = rpc::corrupt_backup(&msg) {
@@ -213,7 +220,7 @@ pub fn online(cx: &Cx, sc: &StageCtx) -> StageResult {
             }
         }
         check_sometimes!(true, "an online restore download succeeds", json!({"gen": cx.gen, "ns": sc.ns}));
-        if canceled {
+        if cancel_took {
             check_sometimes!(true, "a canceled restore download is retried", json!({"gen": cx.gen}));
         }
         // Finalize before validate: only when this server staged the backup

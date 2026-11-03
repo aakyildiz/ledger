@@ -631,10 +631,14 @@ pub fn restore_plan(d: &Driver, tc: TestCase) {
         let validate = !online && draw::chance(tc, 0.5);
         let perturb = if online {
             Perturb {
-                cancel_mid: draw::chance(tc, 0.25),
-                cancel_after_polls: draw::int_in(tc, 0, 3) as u32,
+                // Half of the online cycles each: a short Antithesis run
+                // completes about one download (triage of run 67-0), and a
+                // cancel only lands while the download still runs, so it is
+                // sent after the first or second running poll.
+                cancel_mid: draw::chance(tc, 0.5),
+                cancel_after_polls: draw::int_in(tc, 0, 1) as u32,
                 duplicate_start: draw::chance(tc, 0.25),
-                finalize_early: draw::chance(tc, 0.25),
+                finalize_early: draw::chance(tc, 0.5),
                 agent_bounce: draw::chance(tc, 0.125),
             }
         } else {

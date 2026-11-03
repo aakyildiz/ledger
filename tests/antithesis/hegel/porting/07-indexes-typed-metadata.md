@@ -92,7 +92,7 @@ Fixtures: `W/oraclecheck/testdata/rejections/07-*.json`.
 - `oracle: metadata field not in schema rejection exercised` (Reachable, failure hook):
   a CreateIndex on an undeclared metadata field was rejected and explained by the model.
 - `a write attempt is refused while an index builds` (Rust Sometimes, DESIGN §4.9): an arm
-  of `write::explore_attempt`, so it sees every tracked attempt of every family. The only
+  of `write::explore_attempt`, which `Clients::call_with_op` runs on every `Apply` answer. The only
   write-path `INDEX_BUILDING` is a `createQueryCheckpoint` (task 09) while the audit
   projection rebuilds after a restart (`admission.go` `checkQueryCheckpointProjectionReady`);
   index-family writes never get it. It used to be checked only on this family's attempt
@@ -196,7 +196,7 @@ Fixtures: `W/oraclecheck/testdata/rejections/07-*.json`.
   `hegel/09-query-checkpoints` `checkpointcheck/hooks.go viewCheckpoints`) and sends one as
   `checkpointId`; re-check if 09's view shape changes before merge.
 - `a write attempt is refused while an index builds` needs faults and a checkpoint create
-  inside the audit rebuild window; it is now asserted on every tracked attempt
+  inside the audit rebuild window; it is now asserted on every `Apply` answer
   (`write::explore_attempt`), not only on this family's (which never get it).
 - Task 06's indexed-query validators depend on `index promoted to active` happening; with
   `index_op` at weight 1.0 roughly half of the pool is present at any time.

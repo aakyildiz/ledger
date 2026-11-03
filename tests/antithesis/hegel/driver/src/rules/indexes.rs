@@ -7,7 +7,7 @@
 //! Every tracked verdict comes from the oracle (`indexcheck`); the driver
 //! re-asserts only the deterministic `MD/parallel_driver_typed_metadata`
 //! literals on its rule-owned key. The `INDEX_BUILDING` write exploration
-//! lives in `write::explore_attempt`, on every tracked attempt (the only
+//! lives in `write::explore_attempt`, on every `Apply` answer (the only
 //! write-path `INDEX_BUILDING` is a `createQueryCheckpoint` while the audit
 //! projection rebuilds).
 use crate::clients::{CallOpts, Outcome, Route};

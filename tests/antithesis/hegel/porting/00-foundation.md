@@ -64,9 +64,9 @@ family's own porting file records the final mapping.
 | a late completion event ends a tracked write | Reachable | write.rs `finish` |
 | a tracked write is handed off to a resolver | Sometimes | write.rs `handoff` |
 | a resolver settles a handed-off write | Sometimes | resolver.rs `resolve_once` |
-| a write attempt is refused as a stale proposal | Sometimes | write.rs `explore_attempt` |
-| a write attempt hits a preload miss | Sometimes | write.rs `explore_attempt` |
-| a write attempt is blocked by clock skew | Sometimes | write.rs `explore_attempt` |
+| a write attempt is refused as a stale proposal | Sometimes | write.rs `explore_attempt`, run by clients.rs `call_with_op` on every `Apply` answer (tracked attempts, `send_untracked`, direct Applies) |
+| a write attempt hits a preload miss | Sometimes | write.rs `explore_attempt` (every `Apply` answer, as above) |
+| a write attempt is blocked by clock skew | Sometimes | write.rs `explore_attempt` (every `Apply` answer, as above) |
 | a driver rule panics | Unreachable | machine.rs `guarded` |
 | a driver helper thread panics | Unreachable | machine.rs `helper_iteration` (resolvers, poster, jobs, log hooks) |
 | the oracle service stays reachable | Unreachable | oracle.rs |
@@ -94,9 +94,9 @@ family's own porting file records the final mapping.
 | a late completion event ends a tracked write | smoke_tx / any tracked write | faults |
 | a tracked write is handed off to a resolver | smoke_tx / any tracked write | faults |
 | a resolver settles a handed-off write | resolvers | faults |
-| a write attempt is refused as a stale proposal | any tracked write | faults (+ heterogeneous cache knobs, DESIGN §8) |
-| a write attempt hits a preload miss | any tracked write | faults |
-| a write attempt is blocked by clock skew | any tracked write | faults (clock jitter) |
+| a write attempt is refused as a stale proposal | any `Apply` the driver sends through `/op` | faults (+ heterogeneous cache knobs, DESIGN §8) |
+| a write attempt hits a preload miss | any `Apply` the driver sends through `/op` | faults |
+| a write attempt is blocked by clock skew | any `Apply` the driver sends through `/op` | faults (a clock offset between nodes; Antithesis clock faults that move every node together do not produce it) |
 | H/logs.rs leadership/restart/log-receipt literals | log receiver | faults for restarts and leadership changes; log receipt needs the compose log forwarders (not `run_native.sh`) |
 | the driver notices a client restart | any call after a client restart | faults |
 

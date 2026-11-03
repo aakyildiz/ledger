@@ -190,9 +190,9 @@ family's own porting file records the final mapping.
 | a late completion event ends a tracked write | Reachable | write.rs `finish` |
 | a tracked write is handed off to a resolver | Sometimes | write.rs `handoff` |
 | a resolver settles a handed-off write | Sometimes | resolver.rs `resolve_once` |
-| a write attempt is refused as a stale proposal | Sometimes | write.rs `explore_attempt` |
-| a write attempt hits a preload miss | Sometimes | write.rs `explore_attempt` |
-| a write attempt is blocked by clock skew | Sometimes | write.rs `explore_attempt` |
+| a write attempt is refused as a stale proposal | Sometimes | write.rs `explore_attempt`, run by clients.rs `call_with_op` on every `Apply` answer (tracked attempts, `send_untracked`, direct Applies) |
+| a write attempt hits a preload miss | Sometimes | write.rs `explore_attempt` (every `Apply` answer, as above) |
+| a write attempt is blocked by clock skew | Sometimes | write.rs `explore_attempt` (every `Apply` answer, as above) |
 | a driver rule panics | Unreachable | machine.rs `guarded` |
 | a driver helper thread panics | Unreachable | machine.rs `helper_iteration` (resolvers, poster, jobs, log hooks) |
 | the oracle service stays reachable | Unreachable | oracle.rs |
@@ -220,9 +220,9 @@ family's own porting file records the final mapping.
 | a late completion event ends a tracked write | smoke_tx / any tracked write | faults |
 | a tracked write is handed off to a resolver | smoke_tx / any tracked write | faults |
 | a resolver settles a handed-off write | resolvers | faults |
-| a write attempt is refused as a stale proposal | any tracked write | faults (+ heterogeneous cache knobs, DESIGN §8) |
-| a write attempt hits a preload miss | any tracked write | faults |
-| a write attempt is blocked by clock skew | any tracked write | faults (clock jitter) |
+| a write attempt is refused as a stale proposal | any `Apply` the driver sends through `/op` | faults (+ heterogeneous cache knobs, DESIGN §8) |
+| a write attempt hits a preload miss | any `Apply` the driver sends through `/op` | faults |
+| a write attempt is blocked by clock skew | any `Apply` the driver sends through `/op` | faults (a clock offset between nodes; Antithesis clock faults that move every node together do not produce it) |
 | H/logs.rs leadership/restart/log-receipt literals | log receiver | faults for restarts and leadership changes; log receipt needs the compose log forwarders (not `run_native.sh`) |
 | the driver notices a client restart | any call after a client restart | faults |
 
@@ -1507,7 +1507,7 @@ Fixtures: `W/oraclecheck/testdata/rejections/07-*.json`.
 - `oracle: metadata field not in schema rejection exercised` (Reachable, failure hook):
   a CreateIndex on an undeclared metadata field was rejected and explained by the model.
 - `a write attempt is refused while an index builds` (Rust Sometimes, DESIGN §4.9): an arm
-  of `write::explore_attempt`, so it sees every tracked attempt of every family. The only
+  of `write::explore_attempt`, which `Clients::call_with_op` runs on every `Apply` answer. The only
   write-path `INDEX_BUILDING` is a `createQueryCheckpoint` (task 09) while the audit
   projection rebuilds after a restart (`admission.go` `checkQueryCheckpointProjectionReady`);
   index-family writes never get it. It used to be checked only on this family's attempt
@@ -1611,7 +1611,7 @@ Fixtures: `W/oraclecheck/testdata/rejections/07-*.json`.
   `hegel/09-query-checkpoints` `checkpointcheck/hooks.go viewCheckpoints`) and sends one as
   `checkpointId`; re-check if 09's view shape changes before merge.
 - `a write attempt is refused while an index builds` needs faults and a checkpoint create
-  inside the audit rebuild window; it is now asserted on every tracked attempt
+  inside the audit rebuild window; it is now asserted on every `Apply` answer
   (`write::explore_attempt`), not only on this family's (which never get it).
 - Task 06's indexed-query validators depend on `index promoted to active` happening; with
   `index_op` at weight 1.0 roughly half of the pool is present at any time.
@@ -2995,6 +2995,19 @@ Code:
 - `HG/driver/src/rules/blocks.rs`: setup hook `blocks_setup`, rule `block_run` (weight 1.5),
   and `scenario_blocks!`, which declares the 26 names and expands to one literal
   `check_reachable!` and one literal `check_unreachable!` per block.
+- Chaining (`chained_consumer`, `run_blocks`): `block_run` draws `chain` (1/2) before any
+  call. When the drawn block succeeds and `chain` is set, its consumer runs next through the
+  same client, with values mapped so that it picks the entity the producer just funded (each
+  `Intn` takes one value modulo its bound): `subscription/fund` → `charge` (same subscriber)
+  → `recognize`; `marketplace/deposit` → `purchase` (same customer) → `payout` (values
+  rotated by one: purchase's merchant is payout's first draw); `lending/fund_pool` →
+  `disburse` → `provision` (same borrower); `payroll/fund_clearing` → `distribute` →
+  `cost_alloc` (first value mapped to the allocation drawn from the funded department). The
+  chain continues while each block succeeds and stops when less than 2 s of its 8 s
+  client-side budget is left. Without it each consumer drew its entity independently (1 in 50
+  for `charge`, 1 in 10 for `payout` and `provision`), and Antithesis run 67-0 (timelines of
+  20–60 s) never saw `charge`, `recognize`, `payout`, `provision` or `cost_alloc` succeed:
+  every attempt was `precondition not met`.
 
 ## Old assertions
 
@@ -3026,13 +3039,15 @@ choice among the 26 replaces it.
 | `a block never runs out of its pre-drawn values` | AlwaysOrUnreachable (`exhausted == false`), every answered `/block`; the Sometimes above cannot detect exhaustion (no block uses more than 5 values, `TestEveryBlockUsesAtMostFiveValues`) | rules/blocks.rs `block_run` |
 | `a block's post-commit volumes are well formed` | Always | rules/blocks.rs `block_run` |
 | `the client program accepts every block request` | Unreachable (the client answered `/block` with a non-200) | rules/blocks.rs `post_block` |
+| `a chained consumer block succeeds after its producer commits` | Sometimes, every non-transient answer of a chained consumer. Not an Always: a concurrent block can drain the entity in between. It also makes a chained consumer that always skips visible: `GetColoredAccountBalance` turns a read error into `ErrSkip`, which `report` does not assert on | rules/blocks.rs `run_blocks` |
 
 ## Reachability
 
 | Must-hit | Reached by | Needs |
 |---|---|---|
 | `should be able to setup scenario` | `blocks_setup` (setup hook, 6 evaluations) | no faults |
-| `block <name> succeeded` × 26 | `block_run`: every block is drawn with equal weight; the 16 values make a success likely once the group's ledger has funds. Blocks that read balances (`purchase`, `payout`, `buy_item`, `p2p_trade`, `clawback`, `disburse`, `repay`, `provision`, `write_off`, `charge`, `recognize`, `fx`, `vendor_pay`, `distribute`, `pay_salary`, `cost_alloc`, `revert`) skip until a funding block of the same group succeeded; in a long run every funding block is drawn many times | no faults (long enough run) |
+| `block <name> succeeded` × 26 | `block_run`: every block is drawn with equal weight; the 16 values make a success likely once the group's ledger has funds. Blocks that read balances (`purchase`, `payout`, `buy_item`, `p2p_trade`, `clawback`, `disburse`, `repay`, `provision`, `write_off`, `charge`, `recognize`, `fx`, `vendor_pay`, `distribute`, `pay_salary`, `cost_alloc`, `revert`) skip until a funding block of the same group succeeded; `charge`, `recognize`, `purchase`, `payout`, `disburse`, `provision`, `distribute` and `cost_alloc` are also reached by chaining right after their producer | no faults |
+| `a chained consumer block succeeds after its producer commits` | any chained consumer | no faults |
 | `a block's post-commit volumes are well formed` | any succeeded block | no faults |
 | `a block runs within its pre-drawn values` | any answered `/block` (the largest block uses 5 of the 16 values) | no faults |
 
@@ -3124,8 +3139,8 @@ Sometimes / Reachable: `restore base backup completes`, `a restore cut has a non
 | `restore base backup completes` | `restore_base` | no faults |
 | `a restore cut has a non-empty delta`, `a restore cut fence holds`, `restore_cut completes within its quiet budget` | `restore_cut` (weight 6 in BaseTaken; the delta seed guarantees S > F) | no faults (needs quiet periods: a run of ≥ 10 min) |
 | `an online restore download succeeds`, `a restored cluster serves`, `a restore round trip verifies with a non-empty delta`, `a restore cycle completes within its wall budget` | `restore_step` (online path, 3/4 of plans) | no faults |
-| `a canceled restore download is retried` | `restore_plan` cancel perturbation (1/4) | no faults (needs a download that is still running at the first poll; tiny backups can finish first — then not hit locally) |
-| `a finalize before validate is refused` | `restore_plan` finalize-early perturbation (1/4) | no faults |
+| `a canceled restore download is retried` | `restore_plan` cancel perturbation (1/2 of online plans, after the first or second running poll; it fires only when the job then reports CANCELED and a later download succeeds, so a cancel that lands after the download finished does not count) | no faults (needs a download that is still running at the first poll; tiny backups can finish first — then not hit locally) |
+| `a finalize before validate is refused` | `restore_plan` finalize-early perturbation (1/2 of online plans) | no faults |
 | `an offline bootstrap with validation succeeds`, `an offline bootstrap without validation succeeds` | offline plans (1/4, validate 1/2) | no faults |
 | `a chained restore verifies` | chained plans (1/4) | no faults |
 | `a restore cycle survives a restart of restore-0` | any cycle during which restore-0's container restarts | faults |
@@ -3193,11 +3208,11 @@ none was removed; each is justified here:
 | `the fault pause command exists in Antithesis` | Always | evaluated only under `ANTITHESIS_OUTPUT_DIR` | Antithesis only |
 | `the fault pause command succeeds` | Always | evaluated only under `ANTITHESIS_OUTPUT_DIR` | Antithesis only |
 | `a write attempt hits a preload miss` | Sometimes | `BALANCE_NOT_PRELOADED` / `PRELOAD_UNAVAILABLE` need a leader change or a cache miss under faults | faults |
-| `a write attempt is blocked by clock skew` | Sometimes | `WRITES_BLOCKED_CLOCK_SKEW` needs Antithesis clock faults | faults |
-| `a write attempt is refused as a stale proposal` | Sometimes | `STALE_PROPOSAL` needs a leadership change between plan and apply (more with per-node cache thresholds, see below) | faults + knobs |
-| `a write attempt is refused while an index builds` | Sometimes | the only write-path `INDEX_BUILDING` is a `createQueryCheckpoint` while the audit projection rebuilds after a restart (`admission.go` `checkQueryCheckpointProjectionReady`): reachable, kept. Since run 3d8b6ff1…-67-0 it is an arm of `write::explore_attempt` (every tracked attempt, so the checkpoint creates of task 09 too); before, only index-family attempts were checked, which never get it | faults |
+| `a write attempt is blocked by clock skew` | Sometimes | `WRITES_BLOCKED_CLOCK_SKEW` needs an offset between nodes; Antithesis clock faults move every node together (run 67-0: every sampled jump hit `["ALL"]`), so the health check only sees skew when a jump lands inside one `GetNodeTime` round | faults (rare) |
+| `a write attempt is refused as a stale proposal` | Sometimes | `STALE_PROPOSAL` needs a leadership change between plan and apply (more with per-node cache thresholds, see below); a `lib`-route retry hides it, so it shows on `plain` and `node` routes. Asserted on every `Apply` answer since the run 67-0 triage | faults + knobs |
+| `a write attempt is refused while an index builds` | Sometimes | the only write-path `INDEX_BUILDING` is a `createQueryCheckpoint` while the audit projection rebuilds after a restart (`admission.go` `checkQueryCheckpointProjectionReady`): reachable, kept. Since run 3d8b6ff1…-67-0 it is an arm of `write::explore_attempt`, which `Clients::call_with_op` runs on every `Apply` answer (so the checkpoint creates of task 09 too); before, only index-family attempts were checked, which never get it | faults |
 | `the leader reports a follower in snapshot progress` | Sometimes | a follower more than `RAFT_COMPACTION_MARGIN` entries behind while the leader reports it (`a follower reports an out-of-sync or snapshotting status` was hit once under local faults) | faults + knobs |
-| `a restore cycle survives a restart of restore-0` | Sometimes | needs restore-0 killed mid-cycle | faults |
+| `a restore cycle survives a restart of restore-0` | Sometimes | needs restore-0 killed mid-cycle (a container fault inside a 5–10 minute cycle) | faults (long runs) |
 | `a cluster config change resets the cache epoch` | Reachable | needs per-node `CACHE_ROTATION_THRESHOLD`, which the compose file equalises until the server divergence below is fixed | knobs (disabled) |
 | `a cluster config change was observed between quiet periods` | Sometimes | a leadership change that changes the persisted cluster config between two `cluster_config_convergence` runs | faults + knobs |
 | `a chained restore verifies` | Sometimes | a drawn plan variant (chained, about one cycle in four); a cycle takes 5–10 minutes, so 45 minutes give a handful of cycles | no faults (long runs) |
@@ -3277,6 +3292,28 @@ lists no `workload/internal` path, so the service does not link
   end of the previous period's fault pause when that is later. `exact` weighs
   50 until it completes once in the process (and again after 3 quiet periods
   without a completion), 10 otherwise, instead of 4 (50 after 3).
+- Antithesis run 67-0 coverage triage (timelines of 20–60 s, no quiet phase
+  reached):
+  - Five blocks never succeeded (`lending/provision`, `marketplace/payout`,
+    `payroll/cost_alloc`, `subscription/charge`, `subscription/recognize`):
+    every attempt was `precondition not met`, because each consumer drew its
+    entity independently of the producer that funded one. `block_run` now
+    chains a succeeded producer with its consumer on the same entity (17),
+    with the Sometimes `a chained consumer block succeeds after its producer
+    commits`.
+  - The write-attempt Sometimes (`explore_attempt`) ran only on tracked
+    attempts: `send_untracked` and the rules' direct Applies never reached it,
+    and the run's one `STALE_PROPOSAL` went unasserted while the server's
+    `stale proposal rejected: predicted index mismatch` was hit 3 times. It now
+    runs in `Clients::call_with_op` on every `Apply` answer. Preload misses
+    and clock skew stay rare by construction (table above).
+  - Restore plans draw the cancel and finalize-early perturbations for half of
+    the online cycles (was a quarter), and the cancel lands after the first or
+    second running poll (was up to the fourth): the run completed one download.
+  - `the leader reports a follower in snapshot progress` stays a coverage gap:
+    the leader holds a follower in `Snapshot` only until the follower acks the
+    `MsgSnap`, and `cluster_state` (weight 0.3) polled 119 times, always seeing
+    `Replicate`, while `a follower receives a raft snapshot` was hit 9 times.
 
 ## Server findings reported by task 99 (not masked in the checks)
 

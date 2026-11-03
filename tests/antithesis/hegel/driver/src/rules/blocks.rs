@@ -34,6 +34,16 @@ pub const BLOCK_TIMEOUT: Duration = Duration::from_millis(8000);
 /// Extra HTTP wait beyond the client-side deadline.
 const HTTP_SLACK: Duration = Duration::from_millis(1500);
 
+/// The client-side time a whole chain (the drawn block and its chained
+/// consumers) may use, so the rule stays at about 10 s.
+pub const CHAIN_BUDGET: Duration = BLOCK_TIMEOUT;
+
+/// A chained consumer runs only with at least this much of the chain budget left.
+pub const CHAIN_MIN_LEFT: Duration = Duration::from_millis(2000);
+
+/// How often a run chains consumers after its drawn block succeeds.
+pub const CHAIN_PROBABILITY: f64 = 0.5;
+
 /// The whole setup hook's budget (DESIGN §6.4: setup ≤ 3 minutes).
 const SETUP_BUDGET: Duration = Duration::from_secs(120);
 
@@ -237,9 +247,66 @@ pub fn group_of(name: &str) -> &str {
     name.split('/').next().unwrap_or(name)
 }
 
+/// The consumer chained after a producer block, with values that make it
+/// pick the entity the producer just funded. Every `Intn` / `Int63n` of
+/// `pkg/scenario` takes exactly one value modulo its bound (the client's
+/// `valueRandom`), so the mapping is exact:
+///
+/// - `subscription/fund` → `subscription/charge`, same values: the
+///   subscriber is the first draw of both (`% 50`), and the smallest fund
+///   (5000) covers the largest charge (5000).
+/// - `subscription/charge` → `subscription/recognize`: the charge moved
+///   funds into `revenue:deferred`, which recognize needs.
+/// - `marketplace/deposit` → `marketplace/purchase`, same values: the
+///   customer is the first draw of both (`% 50`); a deposit (≥ 100000) covers
+///   the purchase minimum (1000).
+/// - `marketplace/purchase` → `marketplace/payout`, values rotated by one:
+///   the merchant is purchase's second draw and payout's first (`% 10`).
+/// - `lending/fund_pool` → `lending/disburse` (no balance draw in disburse's
+///   pool check; any loan amount fits a pool of ≥ 100000).
+/// - `lending/disburse` → `lending/provision`, same values: the borrower is
+///   the first draw of both (`% 10`).
+/// - `payroll/fund_clearing` → `payroll/distribute` (fund_clearing draws
+///   nothing and covers every department).
+/// - `payroll/distribute` → `payroll/cost_alloc`, first value mapped to the
+///   allocation that draws from the department just funded:
+///   engineering (0) → 1, sales (1) → 2, operations (2) → 0.
+///
+/// Without chaining, each of these consumers draws its entity independently
+/// of the funding block (1 in 50 for charge, 1 in 10 for payout and
+/// provision), so short Antithesis timelines never saw them succeed.
+pub fn chained_consumer(name: &str, values: &[u64]) -> Option<(&'static str, Vec<u64>)> {
+    let mut v = values.to_vec();
+    let next = match name {
+        "subscription/fund" => "subscription/charge",
+        "subscription/charge" => "subscription/recognize",
+        "marketplace/deposit" => "marketplace/purchase",
+        "marketplace/purchase" => {
+            if !v.is_empty() {
+                v.rotate_left(1);
+            }
+            "marketplace/payout"
+        }
+        "lending/fund_pool" => "lending/disburse",
+        "lending/disburse" => "lending/provision",
+        "payroll/fund_clearing" => "payroll/distribute",
+        "payroll/distribute" => {
+            if let Some(first) = v.first_mut() {
+                *first = (*first % 3 + 1) % 3;
+            }
+            "payroll/cost_alloc"
+        }
+        _ => return None,
+    };
+    Some((next, v))
+}
+
 /// `block_run` (weight 1.5): one block, 16 pre-drawn values, one client.
 /// While its group is not set up yet (the setup hook ran out of budget on
-/// transient failures), the run makes one setup attempt instead.
+/// transient failures), the run makes one setup attempt instead. With
+/// probability `CHAIN_PROBABILITY` a succeeded block is followed, through the
+/// same client, by its chained consumers (`chained_consumer`) while the chain
+/// budget lasts.
 pub fn block_run(d: &Driver, tc: TestCase) {
     d.guarded("block_run", &tc, |d, tc| {
         let n = d.s.clients.len();
@@ -255,6 +322,7 @@ pub fn block_run(d: &Driver, tc: TestCase) {
         let i = draw::weighted(tc, &vec![1.0; BLOCKS.len()])?;
         let values: Vec<u64> = (0..VALUES_PER_RUN).map(|_| tc.draw(gs::integers::<u64>())).collect();
         let client = draw::pick(tc, n);
+        let chain = draw::chance(tc, CHAIN_PROBABILITY);
         let name = BLOCKS[i].0;
         let group = group_of(name);
         if !d.s.ext::<BlocksState>().is_ready(group) {
@@ -265,27 +333,61 @@ pub fn block_run(d: &Driver, tc: TestCase) {
             return Some(());
         }
         // Exec.
-        let resp = post_block(d, client, name, &values)?;
-        report(name, &resp);
+        run_blocks(d, client, name, values, chain);
         Some(())
     });
 }
 
+/// Runs `name` through `client`, then, when `chain` is set, its chained
+/// consumers through the same client while each succeeds and the chain
+/// budget lasts. Returns the names of the blocks sent, in order.
+pub fn run_blocks(d: &Driver, client: usize, name: &'static str, values: Vec<u64>, chain: bool) -> Vec<&'static str> {
+    let deadline = Instant::now() + CHAIN_BUDGET;
+    let mut sent = vec![name];
+    let Some(resp) = post_block(d, client, name, &values, BLOCK_TIMEOUT) else { return sent };
+    let mut class = report(name, &resp);
+    let (mut name, mut values) = (name, values);
+    while chain && class == BlockClass::Succeeded {
+        let Some((next, next_values)) = chained_consumer(name, &values) else { break };
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left < CHAIN_MIN_LEFT {
+            break;
+        }
+        sent.push(next);
+        let Some(resp) = post_block(d, client, next, &next_values, left) else { break };
+        class = report(next, &resp);
+        // A consumer that skips right after its producer committed can be a
+        // concurrent drain (two blocks on one entity), so this is a
+        // Sometimes, not an Always; it is evaluated only on a non-transient
+        // answer.
+        if class != BlockClass::Transient {
+            check_sometimes!(
+                class == BlockClass::Succeeded,
+                "a chained consumer block succeeds after its producer commits",
+                json!({"producer": name, "consumer": next, "code": resp.get("code"), "reason": resp.get("reason"), "skipped": resp.get("skipped")})
+            );
+        }
+        (name, values) = (next, next_values);
+    }
+    sent
+}
+
 /// The `/block` request body.
-pub fn block_body(op: u64, name: &str, values: &[u64]) -> Value {
+pub fn block_body(op: u64, name: &str, values: &[u64], timeout: Duration) -> Value {
     json!({
         "opId": op,
         "name": name,
         "values": values.iter().map(u64::to_string).collect::<Vec<_>>(),
-        "timeoutMs": BLOCK_TIMEOUT.as_millis() as u64,
+        "timeoutMs": timeout.as_millis() as u64,
     })
 }
 
-/// Sends one `/block`. `None` when no answer came (transient).
-fn post_block(d: &Driver, client: usize, name: &str, values: &[u64]) -> Option<Value> {
+/// Sends one `/block` with a client-side deadline of `timeout`. `None` when
+/// no answer came (transient).
+fn post_block(d: &Driver, client: usize, name: &str, values: &[u64], timeout: Duration) -> Option<Value> {
     let op = d.s.clients.next_op_id();
-    let body = block_body(op, name, values);
-    match d.s.clients.transport.post(client, "/block", &body, BLOCK_TIMEOUT + HTTP_SLACK) {
+    let body = block_body(op, name, values, timeout);
+    match d.s.clients.transport.post(client, "/block", &body, timeout + HTTP_SLACK) {
         Ok(v) => {
             d.s.clients.observe_boot(client, v.get("boot").and_then(Value::as_str).unwrap_or(""));
             Some(v)
@@ -556,19 +658,24 @@ mod tests {
         *t.default.lock().unwrap() = Some(json!({"boot": "b", "ok": true, "skipped": false, "exhausted": false, "used": 2, "response": pcv_response(good)}));
         testkit::reset();
         testkit::run_rule(&d, block_run);
-        let body = last_block_call(&t);
+        // The drawn block is the first `/block`; chained consumers may follow.
+        let calls: Vec<Value> = t.calls.lock().unwrap().iter().filter(|c| c.1 == "/block").map(|c| c.2.clone()).collect();
+        let body = &calls[0];
         let name = body["name"].as_str().unwrap();
         assert!(EXPECTED.contains(&name));
         assert_eq!(body["timeoutMs"], 8000);
         let values = body["values"].as_array().unwrap();
         assert_eq!(values.len(), VALUES_PER_RUN);
         assert!(values.iter().all(|v| v.as_str().unwrap().parse::<u64>().is_ok()));
-        let (ok, failed) = literals_of(name);
-        assert_eq!(fired("Reachable", ok), vec![true]);
-        assert!(fired("Unreachable", failed).is_empty());
-        assert_eq!(fired("Always", "a block's post-commit volumes are well formed"), vec![true]);
-        assert_eq!(fired("Sometimes", "a block runs within its pre-drawn values"), vec![true]);
-        assert_eq!(fired("AlwaysOrUnreachable", "a block never runs out of its pre-drawn values"), vec![true]);
+        let n = calls.len();
+        for c in &calls {
+            let (ok, failed) = literals_of(c["name"].as_str().unwrap());
+            assert_eq!(fired("Reachable", ok), vec![true]);
+            assert!(fired("Unreachable", failed).is_empty());
+        }
+        assert_eq!(fired("Always", "a block's post-commit volumes are well formed"), vec![true; n]);
+        assert_eq!(fired("Sometimes", "a block runs within its pre-drawn values"), vec![true; n]);
+        assert_eq!(fired("AlwaysOrUnreachable", "a block never runs out of its pre-drawn values"), vec![true; n]);
     }
 
     #[test]
@@ -578,9 +685,12 @@ mod tests {
         *t.default.lock().unwrap() = Some(json!({"ok": true, "exhausted": true, "used": 16, "response": pcv_response(missing)}));
         testkit::reset();
         testkit::run_rule(&d, block_run);
-        assert_eq!(fired("Always", "a block's post-commit volumes are well formed"), vec![false]);
-        assert_eq!(fired("Sometimes", "a block runs within its pre-drawn values"), vec![false]);
-        assert_eq!(fired("AlwaysOrUnreachable", "a block never runs out of its pre-drawn values"), vec![false]);
+        // One evaluation per block sent (the drawn block and any chained consumer).
+        let n = t.calls.lock().unwrap().iter().filter(|c| c.1 == "/block").count();
+        assert!(n >= 1);
+        assert_eq!(fired("Always", "a block's post-commit volumes are well formed"), vec![false; n]);
+        assert_eq!(fired("Sometimes", "a block runs within its pre-drawn values"), vec![false; n]);
+        assert_eq!(fired("AlwaysOrUnreachable", "a block never runs out of its pre-drawn values"), vec![false; n]);
     }
 
     #[test]
@@ -695,6 +805,115 @@ mod tests {
         testkit::run_rule(&d, block_run);
         assert!(t.calls.lock().unwrap().is_empty());
         assert!(testkit::assertions().iter().all(|a| !a.message.starts_with("block ")));
+    }
+
+    /// A value that `Intn(n)` maps to `k` (the client's one-draw modulo).
+    fn intn(v: u64, n: u64) -> u64 {
+        v % n
+    }
+
+    #[test]
+    fn chained_consumers_pick_the_funded_entity() {
+        let values: Vec<u64> = (0..VALUES_PER_RUN as u64).map(|i| 1_000_003 * (i + 7) + i).collect();
+        // Every producer and consumer is a registered block of one group.
+        for (name, _, _) in BLOCKS {
+            if let Some((next, v)) = chained_consumer(name, &values) {
+                assert!(BLOCKS.iter().any(|b| b.0 == next), "{next}");
+                assert_eq!(group_of(name), group_of(next));
+                assert_eq!(v.len(), VALUES_PER_RUN);
+            }
+        }
+        // fund → charge: the same subscriber (first draw, % 50).
+        let (next, v) = chained_consumer("subscription/fund", &values).unwrap();
+        assert_eq!(next, "subscription/charge");
+        assert_eq!(intn(v[0], 50), intn(values[0], 50));
+        assert_eq!(chained_consumer("subscription/charge", &values).unwrap().0, "subscription/recognize");
+        // deposit → purchase: the same customer (first draw, % 50).
+        let (next, v) = chained_consumer("marketplace/deposit", &values).unwrap();
+        assert_eq!(next, "marketplace/purchase");
+        assert_eq!(intn(v[0], 50), intn(values[0], 50));
+        // purchase → payout: purchase's merchant (second draw) is payout's first.
+        let (next, v) = chained_consumer("marketplace/purchase", &values).unwrap();
+        assert_eq!(next, "marketplace/payout");
+        assert_eq!(intn(v[0], 10), intn(values[1], 10));
+        // fund_pool → disburse → provision: the same borrower (first draw, % 10).
+        assert_eq!(chained_consumer("lending/fund_pool", &values).unwrap().0, "lending/disburse");
+        let (next, v) = chained_consumer("lending/disburse", &values).unwrap();
+        assert_eq!(next, "lending/provision");
+        assert_eq!(intn(v[0], 10), intn(values[0], 10));
+        // fund_clearing → distribute → cost_alloc from the funded department.
+        assert_eq!(chained_consumer("payroll/fund_clearing", &values).unwrap().0, "payroll/distribute");
+        // MultiLedgerPayrollDepartments order and payrollCostAlloc's `from`.
+        let departments = ["engineering", "sales", "operations"];
+        let alloc_from = ["operations", "engineering", "sales"];
+        for k in 0..3u64 {
+            let mut vals = values.clone();
+            vals[0] = 3 * 1_000 + k;
+            let (next, v) = chained_consumer("payroll/distribute", &vals).unwrap();
+            assert_eq!(next, "payroll/cost_alloc");
+            assert_eq!(alloc_from[intn(v[0], 3) as usize], departments[k as usize]);
+        }
+        // Consumers without a chained consumer of their own end the chain.
+        for name in ["subscription/recognize", "marketplace/payout", "lending/provision", "payroll/cost_alloc", "gaming/topup"] {
+            assert!(chained_consumer(name, &values).is_none(), "{name}");
+        }
+    }
+
+    #[test]
+    fn run_blocks_chains_consumers_on_the_same_client() {
+        let (d, t) = block_driver();
+        testkit::reset();
+        let values: Vec<u64> = (0..VALUES_PER_RUN as u64).collect();
+        let sent = run_blocks(&d, 2, "subscription/fund", values.clone(), true);
+        assert_eq!(sent, vec!["subscription/fund", "subscription/charge", "subscription/recognize"]);
+        let calls = t.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 3);
+        assert!(calls.iter().all(|c| c.0 == 2 && c.1 == "/block"));
+        assert_eq!(calls[0].2["timeoutMs"], 8000);
+        assert!(calls[1].2["timeoutMs"].as_u64().unwrap() <= 8000);
+        assert!(calls[1].2["timeoutMs"].as_u64().unwrap() >= CHAIN_MIN_LEFT.as_millis() as u64);
+        assert_eq!(calls[1].2["values"], calls[0].2["values"]);
+        assert_eq!(fired("Sometimes", "a chained consumer block succeeds after its producer commits"), vec![true, true]);
+        for name in &sent {
+            assert_eq!(fired("Reachable", literals_of(name).0), vec![true], "{name}");
+        }
+        // No chain without the draw.
+        let (d, t) = block_driver();
+        testkit::reset();
+        assert_eq!(run_blocks(&d, 0, "subscription/fund", values.clone(), false), vec!["subscription/fund"]);
+        assert_eq!(t.calls.lock().unwrap().len(), 1);
+        assert!(fired("Sometimes", "a chained consumer block succeeds after its producer commits").is_empty());
+    }
+
+    #[test]
+    fn run_blocks_stops_at_the_first_unsucceeded_block() {
+        let values: Vec<u64> = (0..VALUES_PER_RUN as u64).collect();
+        // A skipped consumer: false Sometimes, chain ends.
+        let (d, t) = block_driver();
+        {
+            let mut r = t.replies.lock().unwrap();
+            r.push_back(Ok(json!({"ok": true})));
+            r.push_back(Ok(json!({"ok": false, "skipped": true})));
+        }
+        testkit::reset();
+        assert_eq!(run_blocks(&d, 0, "marketplace/deposit", values.clone(), true), vec!["marketplace/deposit", "marketplace/purchase"]);
+        assert_eq!(fired("Sometimes", "a chained consumer block succeeds after its producer commits"), vec![false]);
+        // A transient consumer: no evaluation.
+        let (d, t) = block_driver();
+        {
+            let mut r = t.replies.lock().unwrap();
+            r.push_back(Ok(json!({"ok": true})));
+            r.push_back(Ok(json!({"ok": false, "code": "Unavailable"})));
+        }
+        testkit::reset();
+        assert_eq!(run_blocks(&d, 0, "lending/disburse", values.clone(), true), vec!["lending/disburse", "lending/provision"]);
+        assert!(fired("Sometimes", "a chained consumer block succeeds after its producer commits").is_empty());
+        // A producer that did not succeed chains nothing.
+        let (d, t) = block_driver();
+        t.replies.lock().unwrap().push_back(Ok(json!({"ok": false, "skipped": true})));
+        testkit::reset();
+        assert_eq!(run_blocks(&d, 0, "payroll/distribute", values, true), vec!["payroll/distribute"]);
+        assert_eq!(t.calls.lock().unwrap().len(), 1);
     }
 
     #[test]
