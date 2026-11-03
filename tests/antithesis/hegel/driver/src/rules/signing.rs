@@ -105,7 +105,8 @@ pub struct RevokeRec {
     pub state: Phase,
 }
 
-/// The derived status of a key (task spec "Model").
+/// The derived status of a key (task spec "Model"; logs and tests).
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KeyStatus {
     Live,
@@ -319,6 +320,7 @@ impl KeyTree {
         self.keys.keys().filter(|id| self.root.as_deref() != Some(id.as_str()) && self.certain_absent(id, now)).cloned().collect()
     }
 
+    #[allow(dead_code)]
     pub fn status(&self, id: &str) -> KeyStatus {
         let start = self.tick + 1;
         if self.certain_live(id, start) {
