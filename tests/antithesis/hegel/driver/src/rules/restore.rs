@@ -192,7 +192,7 @@ pub fn rules() -> Vec<ConcurrentRule<Driver>> {
 }
 
 pub fn quiet_hooks() -> Vec<QuietHook> {
-    vec![QuietHook { name: "restore_cut", budget: Duration::from_secs(60), needs_oracle: false, weight: cut_weight, plan: cut_plan, run: cut_run }]
+    vec![QuietHook { name: "restore_cut", budget: Duration::from_secs(60), needs_oracle: false, weight: cut_weight, completions: 1, plan: cut_plan, run: cut_run }]
 }
 
 // ---------------------------------------------------------------- job context
@@ -514,6 +514,7 @@ fn cut_plan(_d: &Driver, tc: &TestCase) -> HookPlan {
 }
 
 fn cut_run(d: &Driver, ctx: &mut QuietCtx, plan: &HookPlan) {
+    ctx.reached = Some(false);
     let Some(p) = plan.downcast_ref::<CutPlan>() else { return };
     let st = state(&d.s);
     let (gen, f, seeded) = {
@@ -529,6 +530,7 @@ fn cut_run(d: &Driver, ctx: &mut QuietCtx, plan: &HookPlan) {
     let cx = Cx::new(d, ctx.client, gen);
     let completed = take_cut(&cx, f, &p.backoffs, ctx.deadline);
     check_sometimes!(completed, "restore_cut completes within its quiet budget", json!({"gen": gen}));
+    ctx.reached = Some(completed);
 }
 
 /// The cut (restore.md §4.3 step 2). Returns whether it reached an outcome
