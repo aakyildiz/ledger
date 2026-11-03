@@ -7,15 +7,17 @@ oracle validates like any other write (`/write/begin` carries `"signed": true`).
 | Item | Weight | What |
 |---|---|---|
 | setup hook `signing_setup` | – | `POST /pubkey` for the fixed root seed; unsigned `registerSigningKey{keyId:"root-<run>"}` keyed `r-<run>-signing-root`, retried until definitive; an Unauthenticated answer is resolved by listing the keys (our root listed → an earlier attempt committed; not listed → keys of an earlier run exist on a reused volume, and the whole family stays idle); then `createLedger r-sign-<run>` keyed and retried |
-| `signing_keys` | 0.4 | drawn among register (32 drawn seed bytes, id `child-<run>-<N>`, signed by the root or a usable child; weight 0 at 24 usable children), revoke (a usable non-root key, signed by itself or a usable ancestor, `cascade` drawn; an acked cascade is followed by a list), list (drawn route and page size, cursor paging ≤ 4 s), unsigned register probe (pinned) |
+| `signing_keys` | 0.4 | drawn among register (32 drawn seed bytes, id `child-<run>-<N>`, signed by the root or a usable child; weight 0 at 24 usable children or 256 keys in the model), revoke (a usable non-root key, signed by the root with probability 3/4, else by itself or a usable ancestor; `cascade` drawn; an acked cascade is followed by a list), list (drawn route and page size, cursor paging ≤ 4 s and ≤ 512 pages; a repeated cursor makes the traversal inconclusive), unsigned register probe (pinned). Management sends are bounded at 6 s in all (2 s attempts), and a rule body starts nothing 10 s after it began |
 | `signed_write` | 0.6 | 1/3: a forced tx to `r-sign-<run>` signed by a certainly revoked key, pinned (falls through to the tracked write when no key is revoked); else a forced tx (`world` → drawn address, positive amount, `COIN`) on a `ledgerPick`-drawn tracked ledger with the DESIGN §3.2 taper, `WritePlan.sign` = root, dispatched through the oracle |
-| exclusive `require_signatures_window` | 1 | plan: probe node and client, management schedule and backoffs, write payload. run: skipped while `signatures_required` or maintenance is on; Drop guard; `setSigningConfig{true}` signed by root (8 s); if acked, Barrier → horizon → `wait_at_horizon` on the node, unsigned and root-signed writes to `r-sign-<run>` pinned there (probes stop 13 s after the enable started); restore `false` (one key for every attempt) with the rest of the 20 s (≥ 2 s); not definitive → `signatures_required = true` + quiet-blocking job `signing-restore` retrying until definitive, which clears the flag |
+| exclusive `require_signatures_window` | 1 | plan: probe node and client, management schedule and backoffs, write payload. run: skipped while `signatures_required` or maintenance is on; Drop guard; `setSigningConfig{true}` signed by root (8 s in all, last attempt included); if acked, Barrier → horizon → horizon wait on the node, unsigned and root-signed writes to `r-sign-<run>` pinned there (probes stop 13 s after the window started); if the enable got no definitive answer, it is re-sent under the **same key** until definitive (up to the same 13 s), so no delayed attempt can commit after the restore; restore `false` (one key for every attempt) with the rest of the 20 s (≥ 2 s); restore not definitive, or enable still unsettled → `signatures_required = true` + quiet-blocking job `signing-restore`, which first settles the enable (same key, until definitive), then retries the restore until definitive and clears the flag |
 
 Probes that expect Unauthenticated/PermissionDenied (`probe_call`) are raw `Driver::call`s,
 re-sent at most 3 times on unknown/Unavailable/DeadlineExceeded, judging the first success,
 auth-class or definitive answer; anything else is inconclusive (no assertion). Every pinned
 probe runs after `Barrier` → horizon → `wait_at_horizon(node, horizon, exact=false)`
-(safety rule 4); a node that does not reach the horizon in 4 s skips the probe.
+(safety rule 4); a node that does not reach the horizon in 4 s skips the probe. Every call of
+a pinned probe (discovery, Barrier, horizon polls, sends) is capped at the time left before
+the probe's deadline, and none starts with less than 150 ms left.
 
 ## Key-tree model (`KeyTree`)
 
@@ -38,6 +40,13 @@ non-cascading revoke of its parent is not reached); revoking an absent key succe
   orphan).
 - **usable** (signers, revoke candidates): root, or acked, untainted, untouched by any
   revoke on itself or cascade on an ancestor. The root is never revoked.
+- **pruning** (after each revoke): a certainly absent key with no recorded children moves,
+  leaves first, to a `pruned` list (id, seed, tick) capped at 64; settled revokes on keys no
+  longer in the tree are dropped. No remaining key's parent chain passes through a pruned
+  key, so the derivations above are unchanged. A pruned key counts as certainly absent for
+  traversals started at or after its pruning tick, and can still sign the revoked-key
+  probe. Revokes are indexed per key, so the checks cost about keys × depth × revokes per
+  key, not keys × revokes².
 
 ## Porting table
 
@@ -85,13 +94,26 @@ non-cascading revoke of its parent is not reached); revoking an absent key succe
 
 ## Open issues
 
-- An enable attempt still in flight inside the cluster after the restore committed could
-  commit later and leave `requireSignatures` on (there is no read of the flag); tracked
-  writes would then stay unresolved and the quiet periods would report it. Not mitigated.
-- `wait_at_horizon` gates on `lastPersistedIndex`; admission reads `requireSignatures` and
-  the key store from node-local state updated by the same apply. A gap between the two
-  would show as an inconclusive-looking false finding on a lagging node.
+- Admission runs on the leader (`RoutedController.Apply` forwards every Apply,
+  `controller_routed.go:176`; `admit()` waits `waitLeaderReady` first, `admission.go:573`),
+  so safety rule 4's premise (node-local `requireSignatures`) does not hold: the
+  Barrier → horizon → wait on the pinned node adds latency and makes probes inconclusive
+  when the drawn node is slow or partitioned, without adding soundness. Kept as specified;
+  reported to 99.
+- The earlier concern that `lastPersistedIndex` might move before the key store or the
+  flag is closed: both change in `flushGlobal` (`write_set.go:721-752`), before
+  `publishApplied` moves `lastPersistedIndex`.
+- The settle-before-restore fix relies on a late duplicate of a definitively answered
+  enable replaying its idempotency result instead of re-applying (`machine.go:1495-1530`).
+  Not done (optional): an unsigned write after the restore to detect a flag left on.
 
 ## Requests to 99
 
-None.
+- Safety rule 4 / pinning: see the first open issue; 99 may drop the pinning (probes on any
+  route) to raise reachability of the window and revoked-key assertions.
+- Cross-family: while `Shared.signatures_required` is set (the `signing-restore` job is
+  running, rules are running again), only tracked writes are held back. Unsigned
+  `send_untracked` writes of other families (`r-ns-*`, `r-probe-*`, scenario blocks) get
+  Unauthenticated (non-definitive) until the job finishes, and any family that expects
+  success on a Rust-checked ledger then could fail falsely or burn its budgets. 99 should
+  check every family, or have those families skip while `signatures_required()` holds.

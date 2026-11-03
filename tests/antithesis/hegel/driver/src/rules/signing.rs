@@ -26,7 +26,7 @@ use crate::draw;
 use crate::exclusive::{ExclusiveAction, EXCL_RESTORE_BUDGET};
 use crate::jobs::Job;
 use crate::machine::{rule, Driver};
-use crate::nodes::{NodeMap, NodeRef};
+use crate::nodes::{horizon_check, Horizon, NodeMap, NodeRef};
 use crate::quiet::HookPlan;
 use crate::read::{LedgerSel, ViewReq};
 use crate::setup::{SetupHook, Waits};
@@ -37,7 +37,7 @@ use hegel::generators as gs;
 use hegel::stateful::ConcurrentRule;
 use hegel::TestCase;
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -46,16 +46,32 @@ use std::time::{Duration, Instant};
 pub const ROOT_SEED: &[u8; 32] = b"formance-hegel-signing-root-0001";
 /// Above this many usable children the rule stops registering.
 pub const MAX_LIVE_CHILDREN: usize = 24;
-/// `send_untracked` budget of one management request inside a rule.
-pub const MGMT_BUDGET: Duration = Duration::from_secs(6);
-/// Per-attempt deadline of management requests and probes.
+/// At this many keys in the model (pruning keeps certainly revoked leaves
+/// out of it) the rule stops registering.
+pub const MAX_MODEL_KEYS: usize = 256;
+/// Pruned (certainly revoked) keys kept for the list and probe checks.
+pub const MAX_PRUNED: usize = 64;
+/// Whole time of one management request inside a rule, last attempt
+/// included (`send_untracked` may start an attempt just before its budget).
+pub const MGMT_TOTAL: Duration = Duration::from_secs(6);
+/// Per-attempt deadline of management requests inside a rule.
+pub const MGMT_ATTEMPT: Duration = Duration::from_secs(2);
+/// Per-attempt deadline of the window's enable and restore.
 pub const ATTEMPT: Duration = Duration::from_secs(3);
 /// Budget of one paged ListSigningKeys traversal.
 pub const LIST_BUDGET: Duration = Duration::from_secs(4);
-/// Budget of a pinned probe (Barrier, horizon wait, up to 4 sends).
+/// A rule body stops starting work this long after it began (COMMON: about
+/// 10 s per rule).
+pub const RULE_BUDGET: Duration = Duration::from_secs(10);
+/// Budget of a pinned probe (discover, Barrier, horizon wait, up to 4 sends);
+/// every call is capped at what is left.
 pub const PROBE_BUDGET: Duration = Duration::from_secs(9);
-/// Budget of the enable inside the window.
+/// Whole time of the enable inside the window, last attempt included.
 pub const ENABLE_BUDGET: Duration = Duration::from_secs(8);
+/// Maximum pages of one ListSigningKeys traversal (the deadline bounds it too).
+pub const MAX_PAGES: usize = 512;
+/// A call is not started with less than this left before its deadline.
+pub const MIN_CALL: Duration = Duration::from_millis(150);
 /// The window's probes stop this long after the enable started, leaving the
 /// rest of the 20 s for the restore.
 pub const PROBES_UNTIL: Duration = Duration::from_secs(13);
@@ -96,6 +112,8 @@ pub struct KeyRec {
     /// signer or one of the signer's ancestors had started: it may have been
     /// admitted by a lagging node after the cascade, as an orphan.
     pub tainted: bool,
+    /// Ids of the revokes sent on this key (index into `KeyTree::revokes`).
+    pub revokes: Vec<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -107,6 +125,16 @@ pub struct RevokeRec {
     pub state: Phase,
 }
 
+/// A key moved out of the tree once it was certainly absent and had no
+/// recorded children: certainly absent for every traversal started at or
+/// after `since`.
+#[derive(Clone, Debug)]
+pub struct Pruned {
+    pub id: String,
+    pub seed: String,
+    pub since: u64,
+}
+
 /// The derived status of a key (task spec "Model"; logs and tests).
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -116,8 +144,9 @@ pub enum KeyStatus {
     Unknown,
 }
 
-/// The key tree: every key the driver registered, every revoke it sent, and
-/// a logical clock ordering acknowledgements against sends.
+/// The key tree: every key the driver registered that is not yet pruned,
+/// every revoke on those keys, the last `MAX_PRUNED` pruned keys, and a
+/// logical clock ordering acknowledgements against sends.
 ///
 /// Server semantics it follows (`processor_signing.go`, `write_set.go`):
 /// registration is an upsert whose parent is the batch signer; a revoke
@@ -125,14 +154,21 @@ pub enum KeyStatus {
 /// stored parent links of keys still present (a key orphaned by an earlier
 /// non-cascading revoke of its parent is not reached); revoking an absent key
 /// succeeds. Key ids are counters, so no id is ever registered twice.
+///
+/// Size: a certainly absent key with no recorded children is pruned (with
+/// the revokes on it), so no remaining key's parent chain passes through a
+/// pruned key; registration stops at `MAX_MODEL_KEYS` remaining keys (keys
+/// with uncertain outcomes are never pruned).
 #[derive(Default)]
 pub struct KeyTree {
     pub root: Option<String>,
     pub keys: BTreeMap<String, KeyRec>,
-    pub revokes: Vec<RevokeRec>,
+    pub revokes: BTreeMap<u64, RevokeRec>,
+    pub pruned: VecDeque<Pruned>,
     tick: u64,
     next_child: u64,
     next_probe: u64,
+    next_revoke: u64,
 }
 
 impl KeyTree {
@@ -144,7 +180,7 @@ impl KeyTree {
 
     pub fn add_root(&mut self, id: &str, seed: &str, public: &str) {
         let t = self.now();
-        self.keys.insert(id.to_string(), KeyRec { parent: None, seed: seed.into(), public: public.into(), reg: Phase::Acked(t), tainted: false });
+        self.keys.insert(id.to_string(), KeyRec { parent: None, seed: seed.into(), public: public.into(), reg: Phase::Acked(t), tainted: false, revokes: vec![] });
         self.root = Some(id.to_string());
     }
 
@@ -158,8 +194,14 @@ impl KeyTree {
         format!("probe-{run}-{}", self.next_probe)
     }
 
+    /// The signing spec of a key still in the tree (never a pruned one).
     pub fn spec(&self, id: &str) -> Option<SignSpec> {
         self.keys.get(id).map(|k| SignSpec { key_id: id.to_string(), seed: k.seed.clone() })
+    }
+
+    /// The signing spec of a key, pruned ones included (revoked-key probe).
+    pub fn any_spec(&self, id: &str) -> Option<SignSpec> {
+        self.spec(id).or_else(|| self.pruned.iter().find(|p| p.id == id).map(|p| SignSpec { key_id: id.to_string(), seed: p.seed.clone() }))
     }
 
     pub fn root_spec(&self) -> Option<SignSpec> {
@@ -167,7 +209,7 @@ impl KeyTree {
     }
 
     pub fn begin_register(&mut self, id: &str, parent: &str, seed: &str, public: &str) {
-        self.keys.insert(id.to_string(), KeyRec { parent: Some(parent.into()), seed: seed.into(), public: public.into(), reg: Phase::InFlight, tainted: false });
+        self.keys.insert(id.to_string(), KeyRec { parent: Some(parent.into()), seed: seed.into(), public: public.into(), reg: Phase::InFlight, tainted: false, revokes: vec![] });
     }
 
     pub fn end_register(&mut self, id: &str, ok: bool) {
@@ -178,7 +220,7 @@ impl KeyTree {
                 chain.push(p.clone());
                 chain.extend(self.ancestors(&p));
             }
-            chain.iter().any(|c| self.revokes.iter().any(|r| r.cascade && r.target == *c))
+            chain.iter().any(|c| self.revokes_on(c).any(|r| r.cascade))
         };
         if let Some(k) = self.keys.get_mut(id) {
             k.reg = if ok { Phase::Acked(t) } else { Phase::Unknown };
@@ -186,16 +228,21 @@ impl KeyTree {
         }
     }
 
-    /// Records a revoke before its first send; returns its index.
-    pub fn begin_revoke(&mut self, target: &str, cascade: bool) -> usize {
+    /// Records a revoke before its first send; returns its id.
+    pub fn begin_revoke(&mut self, target: &str, cascade: bool) -> u64 {
         let t = self.now();
-        self.revokes.push(RevokeRec { target: target.into(), cascade, started: t, state: Phase::InFlight });
-        self.revokes.len() - 1
+        self.next_revoke += 1;
+        let id = self.next_revoke;
+        self.revokes.insert(id, RevokeRec { target: target.into(), cascade, started: t, state: Phase::InFlight });
+        if let Some(k) = self.keys.get_mut(target) {
+            k.revokes.push(id);
+        }
+        id
     }
 
-    pub fn end_revoke(&mut self, idx: usize, ok: bool) {
+    pub fn end_revoke(&mut self, id: u64, ok: bool) {
         let t = self.now();
-        if let Some(r) = self.revokes.get_mut(idx) {
+        if let Some(r) = self.revokes.get_mut(&id) {
             r.state = if ok { Phase::Acked(t) } else { Phase::Unknown };
         }
     }
@@ -214,13 +261,12 @@ impl KeyTree {
         out
     }
 
-    fn revokes_on<'a>(&'a self, id: &'a str) -> impl Iterator<Item = &'a RevokeRec> + 'a {
-        self.revokes.iter().filter(move |r| r.target == id)
+    fn revokes_on<'a>(&'a self, id: &str) -> impl Iterator<Item = &'a RevokeRec> + 'a {
+        self.keys.get(id).into_iter().flat_map(|k| k.revokes.iter()).filter_map(|i| self.revokes.get(i))
     }
 
     fn cascade_on_ancestor(&self, id: &str) -> bool {
-        let anc = self.ancestors(id);
-        self.revokes.iter().any(|r| r.cascade && anc.contains(&r.target))
+        self.ancestors(id).iter().any(|a| self.revokes_on(a).any(|r| r.cascade))
     }
 
     fn acked_before(p: Phase, t: u64) -> bool {
@@ -234,7 +280,7 @@ impl KeyTree {
             return true;
         }
         let Some(k) = self.keys.get(id) else { return false };
-        matches!(k.reg, Phase::Acked(_)) && !k.tainted && self.revokes_on(id).next().is_none() && !self.cascade_on_ancestor(id)
+        matches!(k.reg, Phase::Acked(_)) && !k.tainted && k.revokes.is_empty() && !self.cascade_on_ancestor(id)
     }
 
     /// Usable non-root keys (revoke candidates; also register signers with the root).
@@ -256,7 +302,7 @@ impl KeyTree {
     /// the traversal). Keys whose registration is unknown are never expected.
     pub fn certain_live(&self, id: &str, start: u64) -> bool {
         let Some(k) = self.keys.get(id) else { return false };
-        Self::acked_before(k.reg, start) && self.revokes_on(id).next().is_none() && !self.cascade_on_ancestor(id)
+        Self::acked_before(k.reg, start) && k.revokes.is_empty() && !self.cascade_on_ancestor(id)
     }
 
     /// Must not be listed by a traversal that started at tick `start`: its
@@ -271,27 +317,32 @@ impl KeyTree {
         if self.revokes_on(id).any(|r| Self::acked_before(r.state, start)) {
             return true;
         }
-        (0..self.revokes.len()).any(|i| self.absent_via(id, i, start))
+        let anc = self.ancestors(id);
+        anc.iter().enumerate().any(|(pos, a)| self.revokes_on(a).any(|r| self.cascade_removed(id, &anc, pos, r, start)))
     }
 
-    /// The cascading revoke `idx` (acknowledged before `start`) removed `id`:
-    /// its target is an ancestor of `id`; `id` and every key between them
+    /// The cascading revoke `rid` (acknowledged before `start`) removed `id`.
+    pub fn absent_via(&self, id: &str, rid: u64, start: u64) -> bool {
+        let Some(r) = self.revokes.get(&rid) else { return false };
+        let anc = self.ancestors(id);
+        let Some(pos) = anc.iter().position(|a| *a == r.target) else { return false };
+        self.cascade_removed(id, &anc, pos, r, start)
+    }
+
+    /// `r`, on `anc[pos]` (an ancestor of `id`), removed `id`: it cascades
+    /// and was acknowledged before `start`; `id` and every key between them
     /// were acknowledged before the revoke started and are untainted, so the
     /// parent links existed when it ran; and no key between them had a
     /// revoke started before the cascade was acknowledged (which could have
     /// orphaned `id` first).
-    pub fn absent_via(&self, id: &str, idx: usize, start: u64) -> bool {
-        let Some(r) = self.revokes.get(idx) else { return false };
+    fn cascade_removed(&self, id: &str, anc: &[String], pos: usize, r: &RevokeRec, start: u64) -> bool {
         let Phase::Acked(acked) = r.state else { return false };
         if !r.cascade || acked >= start || r.target == id {
             return false;
         }
-        let anc = self.ancestors(id);
-        let Some(pos) = anc.iter().position(|a| *a == r.target) else { return false };
         let between = &anc[..pos];
-        let on_path = std::iter::once(id.to_string()).chain(between.iter().cloned());
-        for x in on_path {
-            let Some(k) = self.keys.get(&x) else { return false };
+        for x in std::iter::once(id).chain(between.iter().map(String::as_str)) {
+            let Some(k) = self.keys.get(x) else { return false };
             if !Self::acked_before(k.reg, r.started) || k.tainted {
                 return false;
             }
@@ -302,24 +353,57 @@ impl KeyTree {
     /// The keys a traversal started at `start` must list and must not list.
     pub fn expectations(&self, start: u64) -> (Vec<String>, Vec<String>) {
         let present = self.keys.keys().filter(|id| self.certain_live(id, start)).cloned().collect();
-        let absent = self.keys.keys().filter(|id| self.certain_absent(id, start)).cloned().collect();
+        let mut absent: Vec<String> = self.keys.keys().filter(|id| self.certain_absent(id, start)).cloned().collect();
+        absent.extend(self.pruned.iter().filter(|p| p.since <= start).map(|p| p.id.clone()));
+        absent.sort();
         (present, absent)
     }
 
-    /// The cascade `idx`'s subtree as far as it is certain: its target and
-    /// every key it removed (`absent_via`).
-    pub fn cascade_subtree(&self, idx: usize, start: u64) -> Vec<String> {
-        let Some(r) = self.revokes.get(idx) else { return vec![] };
+    /// The cascade `rid`'s subtree as far as it is certain: its target and
+    /// every key it removed (`absent_via`). Taken before `prune`.
+    pub fn cascade_subtree(&self, rid: u64, start: u64) -> Vec<String> {
+        let Some(r) = self.revokes.get(&rid) else { return vec![] };
         let mut v = vec![r.target.clone()];
-        v.extend(self.keys.keys().filter(|id| self.absent_via(id, idx, start)).cloned());
+        v.extend(self.keys.keys().filter(|id| self.absent_via(id, rid, start)).cloned());
         v
     }
 
     /// Keys certainly revoked now whose seed can still sign (for the
-    /// revoked-key write probe).
+    /// revoked-key write probe), pruned ones included.
     pub fn revoked_keys(&mut self) -> Vec<String> {
         let now = self.now();
-        self.keys.keys().filter(|id| self.root.as_deref() != Some(id.as_str()) && self.certain_absent(id, now)).cloned().collect()
+        let mut v: Vec<String> = self.keys.keys().filter(|id| self.root.as_deref() != Some(id.as_str()) && self.certain_absent(id, now)).cloned().collect();
+        v.extend(self.pruned.iter().map(|p| p.id.clone()));
+        v.sort();
+        v
+    }
+
+    /// Moves certainly absent keys without recorded children out of the
+    /// tree, leaves first, and drops settled revokes on keys no longer in it.
+    pub fn prune(&mut self) {
+        loop {
+            let now = self.now();
+            let parents: BTreeSet<&str> = self.keys.values().filter_map(|k| k.parent.as_deref()).collect();
+            let gone: Vec<String> = self
+                .keys
+                .keys()
+                .filter(|id| self.root.as_deref() != Some(id.as_str()) && !parents.contains(id.as_str()) && self.certain_absent(id, now))
+                .cloned()
+                .collect();
+            if gone.is_empty() {
+                break;
+            }
+            for id in gone {
+                if let Some(k) = self.keys.remove(&id) {
+                    self.pruned.push_back(Pruned { id, seed: k.seed, since: now });
+                }
+            }
+        }
+        while self.pruned.len() > MAX_PRUNED {
+            self.pruned.pop_front();
+        }
+        let keys = &self.keys;
+        self.revokes.retain(|_, r| r.state == Phase::InFlight || keys.contains_key(&r.target));
     }
 
     #[allow(dead_code)]
@@ -327,7 +411,7 @@ impl KeyTree {
         let start = self.tick + 1;
         if self.certain_live(id, start) {
             KeyStatus::Live
-        } else if self.certain_absent(id, start) {
+        } else if self.certain_absent(id, start) || self.pruned.iter().any(|p| p.id == id) {
             KeyStatus::Revoked
         } else {
             KeyStatus::Unknown
@@ -411,38 +495,76 @@ fn resendable(o: &Outcome) -> bool {
     o.is_unknown() || o.code == "Unavailable" || o.code == "DeadlineExceeded"
 }
 
+/// Time left before `deadline`, `None` below `MIN_CALL`.
+pub fn left(deadline: Instant) -> Option<Duration> {
+    let rem = deadline.saturating_duration_since(Instant::now());
+    (rem >= MIN_CALL).then_some(rem)
+}
+
 /// One RPC re-sent at most `PROBE_RESENDS` times on unknown, Unavailable or
-/// DeadlineExceeded (never after `deadline`). Returns the first auth-class,
-/// business or success answer; `None` when the probe is inconclusive.
+/// DeadlineExceeded; no call starts after `deadline` and each call's timeout
+/// is capped at the time left. Returns the first auth-class, business or
+/// success answer; `None` when the probe is inconclusive.
 pub fn probe_call(d: &Driver, route: &Route, method: &str, req: &Value, opts: &CallOpts, deadline: Instant) -> Option<Outcome> {
-    for i in 0..=PROBE_RESENDS {
-        if i > 0 && Instant::now() >= deadline {
-            return None;
-        }
-        let (_, out) = d.call(route, "bucket", method, req.clone(), opts);
+    for _ in 0..=PROBE_RESENDS {
+        let rem = left(deadline)?;
+        let o = opts.clone().timeout(opts.timeout.min(rem));
+        let (_, out) = d.call(route, "bucket", method, req.clone(), &o);
         if auth_or_business(&out) {
             return Some(out);
         }
         if !resendable(&out) {
             return None;
         }
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(100).min(deadline.saturating_duration_since(Instant::now())));
     }
     None
 }
 
-/// A Barrier through `client` (lib route); its commit index.
+/// A Barrier through `client` (lib route); its commit index. Calls are
+/// capped at the time left before `deadline`.
 pub fn barrier_horizon(d: &Driver, client: usize, deadline: Instant) -> Option<u64> {
     for _ in 0..3 {
-        let (_, out) = d.call(&Route::lib(client), "bucket", "Barrier", json!({}), &CallOpts::default().timeout(Duration::from_secs(3)));
+        let rem = left(deadline)?;
+        let (_, out) = d.call(&Route::lib(client), "bucket", "Barrier", json!({}), &CallOpts::default().timeout(Duration::from_secs(3).min(rem)));
         if out.is_ok() {
             return out.response.as_ref().map(|r| u64_field(r, "commitIndex"));
         }
-        if Instant::now() >= deadline {
-            return None;
+    }
+    None
+}
+
+/// `NodeMap::discover` with every call capped at the time left.
+pub fn discover_until(d: &Driver, deadline: Instant) -> Option<NodeMap> {
+    for c in 0..d.s.clients.len() {
+        let rem = left(deadline)?;
+        let (_, out) = d.call(&Route::lib(c), "cluster", "GetClusterState", json!({}), &CallOpts::default().timeout(Duration::from_secs(3).min(rem)));
+        if let Some(resp) = out.response.as_ref().filter(|_| out.is_ok()) {
+            let m = NodeMap::from_cluster_state(resp);
+            if !m.nodes.is_empty() {
+                return Some(m);
+            }
         }
     }
     None
+}
+
+/// `Driver::wait_at_horizon(node, horizon, exact=false)` with every poll
+/// capped at the time left before `deadline`.
+pub fn wait_horizon_until(d: &Driver, node: &NodeRef, horizon: u64, deadline: Instant) -> Option<u64> {
+    loop {
+        let rem = left(deadline)?;
+        let (_, out) = d.call(&Route::node(0, &node.addr), "cluster", "GetClusterState", json!({"nodeId": node.id.to_string()}), &CallOpts::default().timeout(Duration::from_secs(2).min(rem)));
+        if let Some(cs) = out.response.as_ref().filter(|_| out.is_ok()) {
+            if let Horizon::Reached(p) = horizon_check(cs, node.id, horizon, false) {
+                return Some(p);
+            }
+        }
+        if Instant::now() + Duration::from_millis(200) >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
 }
 
 /// The node behind configured address `addr`: by exact service address,
@@ -485,20 +607,23 @@ pub fn pinned_probe(d: &Driver, p: &ProbePlan, req: &Value, sign: Option<SignSpe
         return None;
     }
     let addr = d.s.nodes[p.node_idx % d.s.nodes.len()].clone();
-    let node = resolve_node(&NodeMap::discover(d)?, &addr, d.s.nodes.len())?;
+    let node = resolve_node(&discover_until(d, deadline)?, &addr, d.s.nodes.len())?;
     let horizon = barrier_horizon(d, p.client, deadline)?;
     let wait_until = deadline.min(Instant::now() + Duration::from_secs(4));
-    d.wait_at_horizon(&node, horizon, false, wait_until)?;
+    wait_horizon_until(d, &node, horizon, wait_until)?;
     let opts = CallOpts { timeout: Duration::from_secs(2), max_items: None, consistency: None, sign };
     probe_call(d, &Route::node(p.client, &addr), "Apply", req, &opts, deadline)
 }
 
-/// A paged ListSigningKeys traversal; `None` unless every page completed.
+/// A paged ListSigningKeys traversal; `None` unless every page completed
+/// (at most `MAX_PAGES` pages, before `deadline`). A cursor the server hands
+/// back unchanged is a pagination error, not the end of the list: the
+/// traversal is inconclusive (it would otherwise look like missing keys).
 pub fn list_ids(d: &Driver, route: &Route, page_size: u64, deadline: Instant) -> Option<BTreeSet<String>> {
     let mut cursor = String::new();
     let mut ids = BTreeSet::new();
     let opts = CallOpts::linearizable().timeout(Duration::from_secs(2)).max_items(1000);
-    for _ in 0..64 {
+    for _ in 0..MAX_PAGES {
         let mut o = json!({"pageSize": page_size});
         if !cursor.is_empty() {
             o["cursor"] = json!(cursor);
@@ -512,8 +637,12 @@ pub fn list_ids(d: &Driver, route: &Route, page_size: u64, deadline: Instant) ->
                 ids.insert(id.to_string());
             }
         }
-        if out.next_cursor.is_empty() || out.next_cursor == cursor {
+        if out.next_cursor.is_empty() {
             return Some(ids);
+        }
+        if out.next_cursor == cursor {
+            println!("driver: signing: ListSigningKeys repeated cursor {cursor:?}; traversal inconclusive");
+            return None;
         }
         cursor = out.next_cursor.clone();
         if Instant::now() >= deadline {
@@ -523,12 +652,14 @@ pub fn list_ids(d: &Driver, route: &Route, page_size: u64, deadline: Instant) ->
     None
 }
 
-fn untracked(requests: Vec<Value>, key: String, sign: Option<SignSpec>, schedule: &[Route], backoffs: &[u64], budget: Duration) -> UntrackedSend {
+/// `total` bounds the whole send: `send_untracked` may start an attempt just
+/// before its budget, so the budget is `total` minus one attempt.
+fn untracked(requests: Vec<Value>, key: String, sign: Option<SignSpec>, schedule: &[Route], backoffs: &[u64], total: Duration, attempt: Duration) -> UntrackedSend {
     let mut s = UntrackedSend::new(requests, Some(key));
     s.schedule = schedule.to_vec();
     s.backoffs_ms = backoffs.to_vec();
-    s.attempt_timeout = ATTEMPT;
-    s.budget = budget;
+    s.attempt_timeout = attempt.min(total);
+    s.budget = total.saturating_sub(attempt);
     s.sign = sign;
     s
 }
@@ -560,7 +691,7 @@ pub fn signing_setup(d: &Driver) {
     let reg = json!({"registerSigningKey": {"keyId": root_id, "publicKey": public}});
     let key = format!("r-{}-signing-root", s.run);
     let registered = loop {
-        let r = d.send_untracked(untracked(vec![reg.clone()], key.clone(), None, &lib, &[if cfg!(test) { 50 } else { 250 }], SETUP_BUDGET));
+        let r = d.send_untracked(untracked(vec![reg.clone()], key.clone(), None, &lib, &[if cfg!(test) { 50 } else { 250 }], SETUP_BUDGET + ATTEMPT, ATTEMPT));
         if r.outcome.is_ok() || r.outcome.reason.contains("ALREADY_EXISTS") {
             break true;
         }
@@ -584,7 +715,7 @@ pub fn signing_setup(d: &Driver) {
     let ledger = sign_ledger(&s.run);
     let lkey = format!("r-{}-signing-ledger", s.run);
     loop {
-        let r = d.send_untracked(untracked(vec![json!({"createLedger": {"name": ledger}})], lkey.clone(), None, &lib, &[250], Duration::from_secs(10)));
+        let r = d.send_untracked(untracked(vec![json!({"createLedger": {"name": ledger}})], lkey.clone(), None, &lib, &[250], Duration::from_secs(13), ATTEMPT));
         if r.outcome.is_ok() || r.outcome.reason == "LEDGER_ALREADY_EXISTS" {
             st.ledger_ok.store(true, Ordering::SeqCst);
             w.say(&format!("ledger {ledger}"), "created".into());
@@ -630,11 +761,12 @@ pub fn plan_keys(d: &Driver, tc: &TestCase) -> Option<KeysOp> {
     if !st.root_ok() {
         return None;
     }
-    let (root, children) = {
+    let (root, children, model) = {
         let t = st.tree();
-        (t.root.clone()?, t.usable_children())
+        (t.root.clone()?, t.usable_children(), t.keys.len())
     };
-    let weights = [if children.len() < MAX_LIVE_CHILDREN { 1.0 } else { 0.0 }, if children.is_empty() { 0.0 } else { 1.0 }, 0.6, 0.4];
+    let can_register = children.len() < MAX_LIVE_CHILDREN && model < MAX_MODEL_KEYS;
+    let weights = [if can_register { 1.0 } else { 0.0 }, if children.is_empty() { 0.0 } else { 1.0 }, 0.6, 0.4];
     Some(match draw::weighted(tc, &weights)? {
         0 => {
             let mut signers = vec![root];
@@ -645,8 +777,15 @@ pub fn plan_keys(d: &Driver, tc: &TestCase) -> Option<KeysOp> {
         }
         1 => {
             let target = draw::one_of(tc, &children).clone();
-            let signers = st.tree().revoke_signers(&target);
-            let signer = draw::one_of(tc, &signers).clone();
+            // Prefer the root (3/4): a self-signed revoke whose first attempt
+            // committed can never be acknowledged by a retry (the signature
+            // is checked before the idempotency replay, and the key is gone).
+            let signer = if draw::chance(tc, 0.75) {
+                root
+            } else {
+                let signers = st.tree().revoke_signers(&target);
+                draw::one_of(tc, &signers).clone()
+            };
             let cascade = draw::chance(tc, 0.5);
             KeysOp::Revoke { target, signer, cascade, schedule: draw::schedule(tc, &d.s, 4), backoffs: draw::backoffs(tc, 4), list: ListPlan::draw(tc, d) }
         }
@@ -664,6 +803,7 @@ fn signing_keys(d: &Driver, tc: TestCase) {
 
 pub fn exec_keys(d: &Driver, op: KeysOp) -> Option<()> {
     let st = d.s.ext::<SigningState>();
+    let rule_deadline = Instant::now() + RULE_BUDGET;
     match op {
         KeysOp::Register { signer, seed, client, schedule, backoffs } => {
             let seed = b64(&seed);
@@ -676,7 +816,7 @@ pub fn exec_keys(d: &Driver, op: KeysOp) -> Option<()> {
                 (id, spec)
             };
             let req = json!({"registerSigningKey": {"keyId": id, "publicKey": public}});
-            let r = d.send_untracked(untracked(vec![req], d.s.next_untracked_key(), Some(spec), &schedule, &backoffs, MGMT_BUDGET));
+            let r = d.send_untracked(untracked(vec![req], d.s.next_untracked_key(), Some(spec), &schedule, &backoffs, MGMT_TOTAL, MGMT_ATTEMPT));
             st.tree().end_register(&id, r.outcome.is_ok());
             check_sometimes!(tolerated(&r.outcome), "should be able to register signing key", json!({"keyId": id, "signer": signer, "outcome": r.outcome.summary()}));
         }
@@ -687,16 +827,24 @@ pub fn exec_keys(d: &Driver, op: KeysOp) -> Option<()> {
                 (t.begin_revoke(&target, cascade), spec)
             };
             let req = json!({"revokeSigningKey": {"keyId": target, "cascade": cascade}});
-            let r = d.send_untracked(untracked(vec![req], d.s.next_untracked_key(), Some(spec), &schedule, &backoffs, MGMT_BUDGET));
+            let r = d.send_untracked(untracked(vec![req], d.s.next_untracked_key(), Some(spec), &schedule, &backoffs, MGMT_TOTAL, MGMT_ATTEMPT));
             let ok = r.outcome.is_ok();
-            st.tree().end_revoke(idx, ok);
+            // The cascade's certain subtree is taken before pruning moves it out.
+            let subtree = {
+                let mut t = st.tree();
+                t.end_revoke(idx, ok);
+                let now = t.now();
+                let sub = (ok && cascade).then(|| t.cascade_subtree(idx, now));
+                t.prune();
+                sub
+            };
             check_sometimes!(tolerated(&r.outcome), "should be able to revoke signing key", json!({"keyId": target, "signer": signer, "cascade": cascade, "outcome": r.outcome.summary()}));
-            if ok && cascade {
-                list_and_check(d, &list, Some(idx));
+            if let Some(sub) = subtree {
+                list_and_check(d, &list, Some(sub), rule_deadline);
             }
         }
         KeysOp::List(list) => {
-            list_and_check(d, &list, None);
+            list_and_check(d, &list, None, rule_deadline);
         }
         KeysOp::UnsignedRegister(p) => {
             let (id, public) = {
@@ -720,10 +868,12 @@ pub fn exec_keys(d: &Driver, op: KeysOp) -> Option<()> {
 /// One paged traversal judged against the model: keys certainly live are
 /// listed, keys certainly revoked are not, and after an acknowledged cascade
 /// its certain subtree is gone while every certainly-live key stays.
-pub fn list_and_check(d: &Driver, plan: &ListPlan, cascade: Option<usize>) -> Option<()> {
+pub fn list_and_check(d: &Driver, plan: &ListPlan, cascade: Option<Vec<String>>, rule_deadline: Instant) -> Option<()> {
     let st = d.s.ext::<SigningState>();
+    let deadline = rule_deadline.min(Instant::now() + LIST_BUDGET);
+    left(deadline)?;
     let start = st.tree().now();
-    let listed = list_ids(d, &plan.route, plan.page_size, Instant::now() + LIST_BUDGET)?;
+    let listed = list_ids(d, &plan.route, plan.page_size, deadline)?;
     let t = st.tree();
     let (present, absent) = t.expectations(start);
     let missing: Vec<&String> = present.iter().filter(|k| !listed.contains(*k)).collect();
@@ -740,8 +890,7 @@ pub fn list_and_check(d: &Driver, plan: &ListPlan, cascade: Option<usize>) -> Op
             json!({"listedRevoked": resurrected, "revoked": absent.len(), "pageSize": plan.page_size})
         );
     }
-    if let Some(idx) = cascade {
-        let subtree = t.cascade_subtree(idx, start);
+    if let Some(subtree) = cascade {
         let kept: Vec<&String> = subtree.iter().filter(|k| listed.contains(*k)).collect();
         check_always_or_unreachable!(
             kept.is_empty() && missing.is_empty(),
@@ -806,7 +955,7 @@ fn signed_write(d: &Driver, tc: TestCase) {
 /// pinned to a node past the horizon (safety rule 4).
 pub fn revoked_key_write(d: &Driver, key: &str, p: &ProbePlan, dest: &str, amount: u64) -> Option<()> {
     let st = d.s.ext::<SigningState>();
-    let spec = st.tree().spec(key)?;
+    let spec = st.tree().any_spec(key)?;
     let req = apply_request(&[forced_tx(&sign_ledger(&d.s.run), dest, amount)], Some(&d.s.next_untracked_key()));
     let out = pinned_probe(d, p, &req, Some(spec), Instant::now() + PROBE_BUDGET)?;
     check_always_or_unreachable!(
@@ -826,10 +975,15 @@ pub struct WindowPlan {
     pub backoffs: Vec<u64>,
     pub dest: String,
     pub amount: u64,
+    /// Whole time of the first enable send, last attempt included.
     pub enable_budget: Duration,
+    /// The probes, and the re-sends settling an unacknowledged enable, stop
+    /// this long after the window started.
     pub probes_until: Duration,
     pub budget: Duration,
     pub min_restore: Duration,
+    /// Per-attempt deadline of the enable and the restore.
+    pub attempt: Duration,
 }
 
 pub fn window_plan(d: &Driver, tc: &TestCase) -> HookPlan {
@@ -843,6 +997,7 @@ pub fn window_plan(d: &Driver, tc: &TestCase) -> HookPlan {
         probes_until: PROBES_UNTIL,
         budget: EXCL_RESTORE_BUDGET,
         min_restore: MIN_RESTORE,
+        attempt: ATTEMPT,
     })
 }
 
@@ -864,6 +1019,13 @@ pub struct Restore {
     pub root: SignSpec,
     pub schedule: Vec<Route>,
     pub backoffs: Vec<u64>,
+    pub attempt: Duration,
+    /// The idempotency key of an enable that got no definitive answer: an
+    /// attempt of it may still be in transit and commit after a restore,
+    /// leaving `requireSignatures` on for good. It is re-sent under the same
+    /// key until definitive (later duplicates then replay instead of
+    /// applying) before any restore is sent.
+    pub pending_enable: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -874,8 +1036,9 @@ pub enum RestoreResult {
 }
 
 impl Restore {
-    pub fn once(&self, d: &Driver, budget: Duration) -> RestoreResult {
-        let r = d.send_untracked(untracked(vec![set_config(false)], self.key.clone(), Some(self.root.clone()), &self.schedule, &self.backoffs, budget));
+    /// One restore send bounded by `total` (last attempt included).
+    pub fn once(&self, d: &Driver, total: Duration) -> RestoreResult {
+        let r = d.send_untracked(untracked(vec![set_config(false)], self.key.clone(), Some(self.root.clone()), &self.schedule, &self.backoffs, total, self.attempt));
         if r.outcome.is_ok() {
             RestoreResult::Done
         } else if definitive(&r.outcome) {
@@ -885,42 +1048,71 @@ impl Restore {
             RestoreResult::NotDefinitive
         }
     }
+
+    /// Re-sends the pending enable under its key, bounded by `total`;
+    /// true (and clears it) once an answer was definitive.
+    pub fn settle_enable(&mut self, d: &Driver, total: Duration) -> bool {
+        let Some(key) = self.pending_enable.clone() else { return true };
+        let r = d.send_untracked(untracked(vec![set_config(true)], key, Some(self.root.clone()), &self.schedule, &self.backoffs, total, self.attempt));
+        if definitive(&r.outcome) {
+            self.pending_enable = None;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 /// Restores within what is left of the budget (at least `min`); if that is
-/// not definitive, holds new tracked writes back (`signatures_required`) and
-/// submits a quiet-blocking job that retries until definitive.
+/// not definitive, or an unsettled enable may still land, holds new tracked
+/// writes back (`signatures_required`) and submits a quiet-blocking job that
+/// settles the enable, then retries the restore until definitive.
 pub fn finish_restore(d: &Driver, r: &Restore, deadline: Instant, min: Duration) -> bool {
-    let budget = deadline.saturating_duration_since(Instant::now()).max(min);
-    if r.once(d, budget) == RestoreResult::Done {
-        check_reachable!("the require-signatures window closes", json!({"where": "action"}));
-        return true;
+    if r.pending_enable.is_none() {
+        let total = deadline.saturating_duration_since(Instant::now()).max(min);
+        if r.once(d, total) == RestoreResult::Done {
+            check_reachable!("the require-signatures window closes", json!({"where": "action"}));
+            return true;
+        }
+        println!("driver: signing restore not definitive within the window budget; handing it to a job");
+    } else {
+        // A restore now could be overtaken by the late enable; the job
+        // settles the enable first.
+        println!("driver: signing enable still unsettled at the window budget; handing it and the restore to a job");
     }
     d.s.signatures_required.store(true, Ordering::SeqCst);
     let job = r.clone();
-    println!("driver: signing restore not definitive within the window budget; handing it to a job");
     d.submit_job(Job { name: "signing-restore", blocks_quiet: true, run: Box::new(move |d: &Driver| restore_job(d, job)) });
     false
 }
 
-/// The fallback job: retries the restore until definitive, then clears the
-/// flag. Deterministic backoff, no draws.
+fn job_backoff(k: u32) -> Duration {
+    Duration::from_millis(250u64.saturating_mul(1u64 << k.min(5))).min(Duration::from_secs(5))
+}
+
+/// The fallback job: settles a pending enable (same key, until definitive),
+/// then retries the restore until definitive and clears the flag.
+/// Deterministic backoff, no draws.
 pub fn restore_job(d: &Driver, mut r: Restore) {
     let mut k: u32 = 0;
+    while !r.settle_enable(d, Duration::from_secs(10)) {
+        std::thread::sleep(job_backoff(k));
+        k = k.saturating_add(1);
+    }
+    let mut rounds: u32 = 0;
     loop {
+        rounds = rounds.saturating_add(1);
         match r.once(d, Duration::from_secs(10)) {
             RestoreResult::Done => {
                 d.s.signatures_required.store(false, Ordering::SeqCst);
-                check_reachable!("the require-signatures window closes", json!({"where": "job", "rounds": k + 1}));
+                check_reachable!("the require-signatures window closes", json!({"where": "job", "rounds": rounds}));
                 return;
             }
             // A frozen refusal would replay forever under the same key.
             RestoreResult::Refused => r.key = d.s.next_untracked_key(),
             RestoreResult::NotDefinitive => {}
         }
-        let backoff = Duration::from_millis(250u64.saturating_mul(1u64 << k.min(5))).min(Duration::from_secs(5));
-        std::thread::sleep(backoff);
-        k = k.saturating_add(1);
+        std::thread::sleep(job_backoff(rounds - 1));
     }
 }
 
@@ -951,7 +1143,9 @@ impl Drop for WindowGuard<'_> {
 }
 
 /// The window: enable (signed by the root), probes, restore — the restore is
-/// issued on every path once the guard exists.
+/// issued on every path once the guard exists. An enable without a
+/// definitive answer is re-sent under its key (up to `probes_until`) before
+/// the restore, so no delayed attempt of it can commit after the restore.
 pub fn run_window(d: &Driver, p: &WindowPlan, probes: &dyn Fn(&Driver, &WindowPlan, Instant)) {
     let st = d.s.ext::<SigningState>();
     if !st.root_ok() || d.s.signatures_required() || !d.s.maint_closed() {
@@ -959,24 +1153,39 @@ pub fn run_window(d: &Driver, p: &WindowPlan, probes: &dyn Fn(&Driver, &WindowPl
     }
     let Some(root) = st.tree().root_spec() else { return };
     let started = Instant::now();
-    let guard = WindowGuard {
+    let enable_key = d.s.next_untracked_key();
+    let mut guard = WindowGuard {
         d,
-        restore: Restore { key: d.s.next_untracked_key(), root: root.clone(), schedule: p.schedule.clone(), backoffs: p.backoffs.clone() },
+        restore: Restore {
+            key: d.s.next_untracked_key(),
+            root: root.clone(),
+            schedule: p.schedule.clone(),
+            backoffs: p.backoffs.clone(),
+            attempt: p.attempt,
+            pending_enable: Some(enable_key.clone()),
+        },
         deadline: started + p.budget,
         min: p.min_restore,
         armed: true,
     };
-    let enable = d.send_untracked(untracked(vec![set_config(true)], d.s.next_untracked_key(), Some(root), &p.schedule, &p.backoffs, p.enable_budget));
+    let enable = d.send_untracked(untracked(vec![set_config(true)], enable_key, Some(root), &p.schedule, &p.backoffs, p.enable_budget, p.attempt));
+    if definitive(&enable.outcome) {
+        guard.restore.pending_enable = None;
+    }
     if enable.outcome.is_ok() {
         probes(d, p, started + p.probes_until);
     } else {
-        println!("driver: signing window: enable not acknowledged ({}); restoring", enable.outcome.summary());
+        println!("driver: signing window: enable not acknowledged ({}); settling it, then restoring", enable.outcome.summary());
+        let total = (started + p.probes_until).saturating_duration_since(Instant::now());
+        if guard.restore.pending_enable.is_some() && total >= MIN_CALL {
+            guard.restore.settle_enable(d, total);
+        }
     }
     guard.close();
 }
 
 /// The probes inside the window, pinned to the planned node past the
-/// enable's horizon.
+/// enable's horizon; nothing is sent past `deadline`.
 pub fn window_probes(d: &Driver, p: &WindowPlan, deadline: Instant) {
     let st = d.s.ext::<SigningState>();
     if !st.ledger_ok() {
@@ -990,16 +1199,15 @@ pub fn window_probes(d: &Driver, p: &WindowPlan, deadline: Instant) {
         "an unsigned write is refused while signatures are required",
         json!({"outcome": out.summary(), "peer": out.peer})
     );
+    if left(deadline).is_none() {
+        return;
+    }
     let Some(root) = st.tree().root_spec() else { return };
     let signed = apply_request(&[forced_tx(&ledger, &p.dest, p.amount)], Some(&d.s.next_untracked_key()));
     let addr = d.s.nodes[p.probe.node_idx % d.s.nodes.len()].clone();
     let opts = CallOpts { timeout: Duration::from_secs(2), max_items: None, consistency: None, sign: Some(root) };
-    let out = probe_call(d, &Route::node(p.probe.client, &addr), "Apply", &signed, &opts, deadline);
-    check_sometimes!(
-        out.as_ref().is_some_and(Outcome::is_ok),
-        "a signed write is accepted while signatures are required",
-        json!({"outcome": out.as_ref().map(Outcome::summary)})
-    );
+    let Some(out) = probe_call(d, &Route::node(p.probe.client, &addr), "Apply", &signed, &opts, deadline) else { return };
+    check_sometimes!(out.is_ok(), "a signed write is accepted while signatures are required", json!({"outcome": out.summary()}));
 }
 
 #[cfg(test)]
@@ -1053,6 +1261,7 @@ mod tests {
             probes_until: Duration::from_millis(600),
             budget: Duration::from_millis(800),
             min_restore: Duration::from_millis(100),
+            attempt: Duration::from_millis(100),
         }
     }
     fn config_calls(ft: &testkit::FakeTransport) -> Vec<bool> {
@@ -1320,6 +1529,20 @@ mod tests {
         let st = d.s.ext::<SigningState>();
         assert!(!st.root_ok());
         assert!(st.ledger_ok());
+
+        // Our own first attempt committed but its answer was lost: the retries
+        // are no longer a bootstrap (Unauthenticated), and the list shows our root.
+        let (d, ft, _) = testkit::driver();
+        let mut replies = vec![lost()];
+        replies.extend((0..10).map(|_| err("Unauthenticated")));
+        ft.script("bucket", "Apply", replies);
+        ft.script("bucket", "ListSigningKeys", vec![page(&["root-test"], "")]);
+        signing_setup(&d);
+        let st = d.s.ext::<SigningState>();
+        assert!(st.root_ok(), "our root is listed: the bootstrap succeeded");
+        assert!(st.ledger_ok());
+        assert_eq!(st.tree().status("root-test"), KeyStatus::Live);
+        assert_eq!(ft.calls_of("bucket", "ListSigningKeys").len(), 1);
     }
 
     // ---- the window
@@ -1330,15 +1553,36 @@ mod tests {
         testkit::reset();
         setup_root(&d);
         cluster_default(&ft);
-        // enable ok, both probes fail inconclusively, restore ok.
+        // enable ok, the first (unsigned) probe fails inconclusively (so the
+        // signed one is never sent), restore ok.
         ft.script("bucket", "Apply", vec![ok(json!({})), err("Internal"), ok(json!({}))]);
         run_window(&d, &window_plan_fast(), &window_probes);
         assert_eq!(config_calls(&ft), vec![true, false]);
+        assert_eq!(ft.calls_of("bucket", "Apply").len(), 3);
         let applies = ft.calls_of("bucket", "Apply");
         assert!(applies.iter().filter(|a| a["request"]["unsigned"]["requests"][0].get("setSigningConfig").is_some()).all(|a| a["sign"]["keyId"] == "root-test"));
         assert!(testkit::fired("the require-signatures window closes"));
         assert!(!d.s.signatures_required());
         assert!(!testkit::fired("an unsigned write is refused while signatures are required"));
+
+        // Both probes run and the signed one fails inconclusively: still restored.
+        let (d, ft, _) = testkit::driver();
+        testkit::reset();
+        setup_root(&d);
+        cluster_default(&ft);
+        ft.script("bucket", "Apply", vec![ok(json!({})), err("Unauthenticated"), err("Internal"), ok(json!({}))]);
+        let mut p = window_plan_fast();
+        p.probes_until = Duration::from_secs(5);
+        p.budget = Duration::from_secs(6);
+        run_window(&d, &p, &window_probes);
+        let applies = ft.calls_of("bucket", "Apply");
+        assert_eq!(applies.len(), 4, "enable, unsigned probe, signed probe, restore");
+        assert_eq!(applies[2]["sign"]["keyId"], "root-test");
+        assert_eq!(config_calls(&ft), vec![true, false]);
+        assert!(testkit::fired("an unsigned write is refused while signatures are required"));
+        assert!(!testkit::fired("a signed write is accepted while signatures are required"), "an inconclusive probe asserts nothing");
+        assert!(testkit::fired("the require-signatures window closes"));
+        assert!(!d.s.signatures_required());
     }
 
     #[test]
@@ -1382,7 +1626,62 @@ mod tests {
         run_window(&d, &p, &window_probes);
         let cfg = config_calls(&ft);
         assert!(cfg.contains(&true) && cfg.last() == Some(&false));
+        // The enable was re-sent under its key until definitive, before any restore.
+        let first_false = cfg.iter().position(|c| !c).unwrap();
+        assert!(cfg[first_false..].iter().all(|c| !c), "no enable after the first restore: {cfg:?}");
+        assert_eq!(enable_keys(&ft).len(), 1);
         assert!(!d.s.signatures_required());
+        assert!(testkit::fired("the require-signatures window closes"));
+    }
+
+    fn enable_keys(ft: &testkit::FakeTransport) -> BTreeSet<String> {
+        ft.calls_of("bucket", "Apply")
+            .iter()
+            .filter(|a| a["request"]["unsigned"]["requests"][0]["setSigningConfig"]["requireSignatures"] == json!(true))
+            .map(|a| a["request"]["unsigned"]["idempotencyKey"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn an_unsettled_enable_is_settled_by_the_job_before_the_restore() {
+        let (d, ft, _) = testkit::driver();
+        testkit::reset();
+        setup_root(&d);
+        // Every attempt is lost: the enable never settles inside the window.
+        ft.set_default("bucket", "Apply", lost());
+        let t0 = Instant::now();
+        run_window(&d, &window_plan_fast(), &window_probes);
+        assert!(t0.elapsed() < Duration::from_secs(3));
+        assert!(d.s.signatures_required(), "new tracked writes are held back");
+        assert_eq!(d.s.blocking_jobs(), 1);
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(config_calls(&ft).iter().all(|c| *c), "no restore while the enable may still land: {:?}", config_calls(&ft));
+        assert!(config_calls(&ft).len() >= 2, "the job keeps re-sending the enable");
+        ft.set_default("bucket", "Apply", ok(json!({})));
+        testkit::wait_until(Duration::from_secs(20), || !d.s.signatures_required());
+        testkit::wait_until(Duration::from_secs(5), || d.s.blocking_jobs() == 0);
+        let cfg = config_calls(&ft);
+        let first_false = cfg.iter().position(|c| !c).unwrap();
+        assert!(cfg[first_false..].iter().all(|c| !c), "{cfg:?}");
+        assert_eq!(enable_keys(&ft).len(), 1, "one key for every enable attempt");
+        let a = testkit::assertions();
+        let closes: Vec<_> = a.iter().filter(|x| x.message == "the require-signatures window closes").collect();
+        assert_eq!(closes.len(), 1);
+        assert_eq!(closes[0].details["where"], "job");
+    }
+
+    #[test]
+    fn a_refused_enable_needs_no_settling() {
+        let (d, ft, _) = testkit::driver();
+        testkit::reset();
+        setup_root(&d);
+        let refused = FakeReply::Outcome(Outcome::from_json(&json!({"ok": false, "code": "FailedPrecondition", "reason": "ACCOUNT_TYPE_NOT_FOUND", "message": "x"})));
+        assert!(definitive(match &refused { FakeReply::Outcome(o) => o, _ => unreachable!() }));
+        ft.script("bucket", "Apply", vec![refused, ok(json!({}))]);
+        run_window(&d, &window_plan_fast(), &window_probes);
+        assert_eq!(config_calls(&ft), vec![true, false]);
+        assert!(!d.s.signatures_required());
+        assert!(testkit::fired("the require-signatures window closes"));
     }
 
     #[test]
@@ -1453,5 +1752,127 @@ mod tests {
         assert_eq!(ROOT_SEED.len(), 32);
         let r = resolve_node(&NodeMap::from_cluster_state(&json!({"nodes": [{"id": "1", "serviceAddress": "127.0.0.1:9000"}]})), "localhost:9000", 1);
         assert_eq!(r.unwrap().id, 1);
+    }
+
+    // ---- bounds
+
+    #[test]
+    fn pruning_keeps_the_model_small_and_the_absent_checks() {
+        let mut t = KeyTree::default();
+        t.add_root("r", "s", "p");
+        // A cascaded subtree is pruned as a whole, leaves first.
+        reg(&mut t, "a", "r", true);
+        reg(&mut t, "b", "a", true);
+        reg(&mut t, "c", "b", true);
+        let i = t.begin_revoke("a", true);
+        t.end_revoke(i, true);
+        let now = t.now();
+        let sub = t.cascade_subtree(i, now);
+        assert_eq!(sub, s(&["a", "b", "c"]));
+        t.prune();
+        assert_eq!(t.keys.keys().cloned().collect::<Vec<_>>(), s(&["r"]));
+        assert!(t.revokes.is_empty(), "settled revokes on pruned keys are dropped");
+        let later = t.now();
+        assert_eq!(t.expectations(later), (s(&["r"]), s(&["a", "b", "c"])));
+        assert_eq!(t.status("b"), KeyStatus::Revoked);
+        assert_eq!(t.any_spec("b").unwrap().key_id, "b");
+        assert!(t.spec("b").is_none(), "a pruned key never signs as a usable key");
+        assert_eq!(t.revoked_keys(), s(&["a", "b", "c"]));
+        // A list started before the pruning does not count them.
+        assert!(t.expectations(now).1.is_empty());
+
+        // A revoked key with a live orphan child stays (its chain is needed).
+        reg(&mut t, "p", "r", true);
+        reg(&mut t, "o", "p", true);
+        let i = t.begin_revoke("p", false);
+        t.end_revoke(i, true);
+        t.prune();
+        assert!(t.keys.contains_key("p") && t.keys.contains_key("o"));
+        let now = t.now();
+        assert!(t.certain_live("o", now));
+        // An unknown registration is never pruned; an in-flight revoke on a
+        // pruned key is kept until it settles.
+        reg(&mut t, "u", "r", false);
+        reg(&mut t, "v", "r", true);
+        let iv1 = t.begin_revoke("v", false);
+        let iv2 = t.begin_revoke("v", false);
+        t.end_revoke(iv1, true);
+        t.prune();
+        assert!(t.keys.contains_key("u") && !t.keys.contains_key("v"));
+        assert!(t.revokes.contains_key(&iv2));
+        t.end_revoke(iv2, false);
+        t.prune();
+        assert!(!t.revokes.contains_key(&iv2));
+
+        // Many register/revoke cycles: bounded tree, bounded pruned list.
+        for n in 0..500 {
+            let id = format!("k{n}");
+            reg(&mut t, &id, "r", true);
+            let i = t.begin_revoke(&id, n % 2 == 0);
+            t.end_revoke(i, true);
+            t.prune();
+        }
+        assert!(t.keys.len() <= 6, "{}", t.keys.len());
+        assert!(t.revokes.len() <= 4, "{}", t.revokes.len());
+        assert_eq!(t.pruned.len(), MAX_PRUNED);
+        assert_eq!(t.revoked_keys().len(), MAX_PRUNED + 1, "pruned ones plus p");
+    }
+
+    #[test]
+    fn a_repeated_cursor_is_inconclusive() {
+        let (d, ft, _) = testkit::driver();
+        testkit::reset();
+        setup_root(&d);
+        ft.script("bucket", "ListSigningKeys", vec![page(&["child-x"], "c1"), page(&["child-y"], "c1")]);
+        assert!(list_ids(&d, &Route::plain(0), 1, Instant::now() + Duration::from_secs(2)).is_none());
+        exec_keys(&d, KeysOp::List(ListPlan { route: Route::plain(0), page_size: 1 }));
+        // The second traversal got the default answer (whatever it is) or a
+        // repeated cursor; either way no false "missing" finding on the root.
+        ft.script("bucket", "ListSigningKeys", vec![page(&[], "c1"), page(&[], "c1")]);
+        testkit::reset();
+        exec_keys(&d, KeysOp::List(ListPlan { route: Route::plain(0), page_size: 1 }));
+        assert!(!testkit::fired("registered key should appear in ListSigningKeys"));
+    }
+
+    #[test]
+    fn probes_send_nothing_past_their_deadline_and_cap_timeouts() {
+        let (d, ft, _) = testkit::driver();
+        testkit::reset();
+        setup_root(&d);
+        cluster_default(&ft);
+        let p = ProbePlan { node_idx: 0, client: 0 };
+        let req = json!({});
+        // Less than MIN_CALL left: no call at all (not even discovery).
+        assert!(pinned_probe(&d, &p, &req, None, Instant::now() + Duration::from_millis(50)).is_none());
+        assert!(ft.calls().is_empty(), "{:?}", ft.calls());
+        // With 1 s left every call's timeout is capped at what is left.
+        ft.script("bucket", "Apply", vec![err("Unauthenticated")]);
+        let out = pinned_probe(&d, &p, &req, None, Instant::now() + Duration::from_secs(1)).unwrap();
+        assert_eq!(out.code, "Unauthenticated");
+        assert!(ft.calls().len() >= 4, "discover, Barrier, horizon poll, Apply");
+        for c in ft.calls() {
+            assert!(c["timeoutMs"].as_u64().unwrap() <= 1000, "{c}");
+        }
+        // A discovery that eats the budget leaves no time for the Barrier.
+        ft.script("cluster", "GetClusterState", vec![FakeReply::Delayed(Duration::from_millis(400), Outcome::unknown("timeout"))]);
+        let before = ft.calls_of("bucket", "Barrier").len();
+        let t0 = Instant::now();
+        assert!(pinned_probe(&d, &p, &req, None, Instant::now() + Duration::from_millis(450)).is_none());
+        assert!(t0.elapsed() < Duration::from_millis(900));
+        assert_eq!(ft.calls_of("bucket", "Barrier").len(), before);
+    }
+
+    #[test]
+    fn untracked_sends_fit_their_total() {
+        let s = untracked(vec![], "k".into(), None, &[], &[], ENABLE_BUDGET, ATTEMPT);
+        assert_eq!(s.budget + s.attempt_timeout, ENABLE_BUDGET);
+        let s = untracked(vec![], "k".into(), None, &[], &[], MGMT_TOTAL, MGMT_ATTEMPT);
+        assert_eq!(s.budget + s.attempt_timeout, MGMT_TOTAL);
+        let s = untracked(vec![], "k".into(), None, &[], &[], Duration::from_secs(1), ATTEMPT);
+        assert_eq!((s.budget, s.attempt_timeout), (Duration::ZERO, Duration::from_secs(1)));
+        // Revoke then list stays inside the rule budget.
+        assert!(MGMT_TOTAL + LIST_BUDGET <= RULE_BUDGET);
+        assert!(PROBE_BUDGET <= RULE_BUDGET);
+        assert!(PROBES_UNTIL + ATTEMPT <= EXCL_RESTORE_BUDGET);
     }
 }
