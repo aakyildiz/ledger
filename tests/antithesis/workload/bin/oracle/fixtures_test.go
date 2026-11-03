@@ -134,6 +134,8 @@ func TestFixtures_RequestsRoundTrip(t *testing.T) {
 // values present on both sides are compared.
 var mapPaths = map[string]bool{
 	"error.details": true, "expect": true, "providers": true, "next": true,
+	// Provider content is provider-defined (task 15 usage: per-ledger counters).
+	"providers.*": true, "providers.*.*": true,
 	"views[].fieldTypes.account": true, "views[].fieldTypes.transaction": true, "views[].fieldTypes.ledger": true,
 	"views[].indexes[].id": true, "entries[].req": true, "entries[].resp": true,
 	"verdict.violations[].details": true,
