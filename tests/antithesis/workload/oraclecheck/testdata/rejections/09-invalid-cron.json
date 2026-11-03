@@ -1,0 +1,6 @@
+{
+  "name": "09-set-schedule-invalid-cron",
+  "setup": [],
+  "requests": [{"setQueryCheckpointSchedule": {"cron": "invalid checkpoint cron"}}],
+  "expectReason": "INVALID_CRON_EXPRESSION"
+}
