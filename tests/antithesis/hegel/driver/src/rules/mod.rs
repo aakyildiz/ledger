@@ -36,6 +36,7 @@ pub mod smoke;
 // ==== 16-signing mods ====
 // ==== end 16-signing mods ====
 // ==== 17-scenario-blocks mods ====
+pub mod blocks;
 // ==== end 17-scenario-blocks mods ====
 // ==== 18-restore mods ====
 // ==== end 18-restore mods ====
@@ -74,6 +75,7 @@ pub fn rules() -> Vec<ConcurrentRule<Driver>> {
     // ==== 16-signing rules ====
     // ==== end 16-signing rules ====
     // ==== 17-scenario-blocks rules ====
+    v.extend(blocks::rules());
     // ==== end 17-scenario-blocks rules ====
     // ==== 18-restore rules ====
     // ==== end 18-restore rules ====
@@ -235,6 +237,7 @@ pub fn setup_hooks() -> Vec<crate::setup::SetupHook> {
     // ==== 16-signing setup_hooks ====
     // ==== end 16-signing setup_hooks ====
     // ==== 17-scenario-blocks setup_hooks ====
+    v.extend(blocks::setup_hooks());
     // ==== end 17-scenario-blocks setup_hooks ====
     // ==== 18-restore setup_hooks ====
     // ==== end 18-restore setup_hooks ====
