@@ -159,7 +159,7 @@ func ledgerSection(t *oc.Tracker, epoch, _ uint64, raw json.RawMessage) (any, []
 		d["why"] = why
 		d["items"] = len(items)
 		evs = append(evs, oc.Violation(id, d))
-	} else {
+	} else if !oc.HasFinding(evs) {
 		if st.verified[sk] == nil {
 			st.verified[sk] = map[string]bool{}
 		}
