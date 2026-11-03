@@ -22,7 +22,7 @@ const (
 	EvAssetIndexAccountQueryOutside   oc.EventID = "oracle: asset-index account query outside model"
 	EvLogQueryOutsideModel            oc.EventID = "oracle: log query outside model"
 	EvLogPageViolatesOrdering         oc.EventID = "oracle: log page violates its own ordering"
-	EvUnsignedLogCarriesSignature     oc.EventID = "oracle: a log of an unsigned tracked bulk carries a response signature"
+	EvLogPageCarriesSignature         oc.EventID = "oracle: log page carries a response signature"
 	EvListAccountsUnexpectedError     oc.EventID = "oracle: ListAccounts returned unexpected error"
 	EvListTransactionsUnexpectedError oc.EventID = "oracle: ListTransactions returned unexpected error"
 	EvListLogsUnexpectedError         oc.EventID = "oracle: ListLogs returned unexpected error"

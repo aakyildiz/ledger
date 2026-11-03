@@ -31,11 +31,14 @@ func ValidateListTransactions(c *oc.ReadCtx) []oc.Event {
 	o := c.Outcome
 
 	if !o.OK {
-		if e, done := handleMalformedCursorError(malformed, targetTransactions, req.Cursor, o); done {
-			return append(evs, e...)
-		}
+		// NotFound first, as on ListLogs: a ledger deleted concurrently may
+		// be checked ahead of the cursor's decoding, and an unexplained
+		// NotFound is still a finding.
 		if o.IsNotFound() {
 			return append(evs, c.LedgerNotFoundExplained(ledger)...)
+		}
+		if e, done := handleMalformedCursorError(malformed, targetTransactions, req.Cursor, o); done {
+			return append(evs, e...)
 		}
 		if unsupported {
 			if rpcError(o).Code == codesInvalidArgument {

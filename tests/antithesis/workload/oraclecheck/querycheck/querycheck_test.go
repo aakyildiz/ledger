@@ -256,6 +256,14 @@ func TestListTransactions_LedgerNotFound(t *testing.T) {
 		findings(ValidateListTransactions(ctx(s, "ListTransactions", req, fail("NotFound", "LEDGER_NOT_FOUND", nil)))))
 	require.Equal(t, []oc.EventID{EvListTransactionsUnexpectedError},
 		findings(ValidateListTransactions(ctx(s, "ListTransactions", req, fail("Internal", "", nil)))))
+
+	// A malformed cursor on a missing (deleted) ledger: NotFound is judged
+	// by the ledger's lifecycle, not as the cursor's refusal.
+	bad := listReq(t, "absent", nil, 5, "not-a-cursor", false)
+	require.Empty(t, findings(ValidateListTransactions(ctx(s, "ListTransactions", bad, fail("NotFound", "LEDGER_NOT_FOUND", nil)))))
+	bad = listReq(t, L, nil, 5, "not-a-cursor", false)
+	require.Equal(t, []oc.EventID{oc.EvLedgerNotFoundUnexplained},
+		findings(ValidateListTransactions(ctx(s, "ListTransactions", bad, fail("NotFound", "LEDGER_NOT_FOUND", nil)))))
 }
 
 func TestPageSizeCoverage(t *testing.T) {
@@ -352,6 +360,33 @@ func TestListAccounts_IndexedAndAssetGating(t *testing.T) {
 	require.Contains(t, ids(evs), oc.EventID(CoverageIndexID(match.AssetIndexCanonical)))
 }
 
+// A has-asset page covers every account that ever touched the asset, so an
+// account whose balance went back to zero must still be served.
+func TestListAccounts_HasAssetEverTouchedUniverse(t *testing.T) {
+	t.Parallel()
+	s := session(t)
+	// t-0:1 held 7 USD/2; it sends all of it away.
+	require.Empty(t, testutil.Findings(s.Write(false, oracletest.TxReq("t-0:1", "t-0:3", "USD/2", 7))))
+	require.Empty(t, testutil.Findings(s.Write(false, oracletest.CreateIndexReq(match.AssetIndexID()))))
+
+	window := match.AssetWindow(s.T.Model().Ledger(L), "USD", 2, "", 5, false)
+	require.Contains(t, window, "t-0:1", "a drained account stays in the has-asset universe")
+	var served, without []*commonpb.Account
+	for _, a := range window {
+		acct := matchtest.RenderAccount(s.T.Model(), L, a, false)
+		served = append(served, acct)
+		if a != "t-0:1" {
+			without = append(without, acct)
+		}
+	}
+	req := acctReq(t, match.FilterHasAsset("USD", 2), 5, "", false)
+	evs := ValidateListAccounts(ctx(s, "ListAccounts", req, page(t, served, "")))
+	require.Empty(t, findings(evs))
+	require.Contains(t, ids(evs), EvAssetIndexAccountQueryServed)
+	require.Equal(t, []oc.EventID{EvAssetIndexAccountQueryOutside},
+		findings(ValidateListAccounts(ctx(s, "ListAccounts", req, page(t, without, "")))))
+}
+
 // ---- ListLogs ----
 
 func logReq(t *testing.T, ledger string, filter *commonpb.QueryFilter, pageSize uint32, cursor string, reverse bool) json.RawMessage {
@@ -394,13 +429,17 @@ func TestListLogs_SelfStructure(t *testing.T) {
 	require.Equal(t, []oc.EventID{EvLogPageViolatesOrdering},
 		findings(ValidateListLogs(ctx(s, "ListLogs", logReq(t, L, nil, 3, token("2"), false), page(t, logs, "")))))
 
-	// A signature on a log of an unsigned tracked bulk.
-	signed := proto.Clone(logs[0]).(*commonpb.Log)
-	signed.ResponseSignature = &signaturepb.SignedLog{}
-	signed.Sequence = 1
-	rows := append([]*commonpb.Log{signed}, logs[1:]...)
-	require.Equal(t, []oc.EventID{EvUnsignedLogCarriesSignature},
-		findings(ValidateListLogs(ctx(s, "ListLogs", logReq(t, L, nil, 3, "", false), page(t, rows, "")))))
+	// Any response signature is a finding: no node runs with
+	// --response-signing-key, whatever bulk the row belongs to and whether
+	// the oracle can attribute it at all (sequence 0 here).
+	for _, seq := range []uint64{1, 0} {
+		signed := proto.Clone(logs[0]).(*commonpb.Log)
+		signed.ResponseSignature = &signaturepb.SignedLog{}
+		signed.Sequence = seq
+		rows := append([]*commonpb.Log{signed}, logs[1:]...)
+		require.Equal(t, []oc.EventID{EvLogPageCarriesSignature},
+			findings(ValidateListLogs(ctx(s, "ListLogs", logReq(t, L, nil, 3, "", false), page(t, rows, "")))), "sequence %d", seq)
+	}
 }
 
 func TestListLogs_GatingMalformedRefused(t *testing.T) {

@@ -93,30 +93,19 @@ func LogPageOrderViolation(ids []uint64, afterSeq uint64, reverse bool, pageSize
 	return false
 }
 
-// signedRowOfUnsignedBulk returns the first served row carrying a response
-// signature whose committing bulk the oracle knows and knows to be unsigned
-// (task 16 signs only some bulks, with the root key). Rows whose bulk the
-// oracle cannot attribute yet are not judged.
-func signedRowOfUnsignedBulk(t *oc.Tracker, page []match.ServerLogRow) (match.ServerLogRow, string, bool) {
-	var bulks map[uint64]oc.CommittedBulk
+// signedRow returns the first served row carrying a response signature
+// (M/queries_logs.go:758-771). Log.response_signature is the server signing
+// its own responses with --response-signing-key, which no workload node is
+// configured with; request signatures (task 16) travel on the applied
+// proposal, not in this field, and are not judged here.
+func signedRow(page []match.ServerLogRow) (match.ServerLogRow, bool) {
 	for _, row := range page {
-		if !row.Signed || row.Sequence == 0 {
-			continue
-		}
-		if bulks == nil {
-			bulks = t.CommittedBulks()
-		}
-		for _, b := range bulks {
-			if row.Sequence < b.MinSeq || row.Sequence > b.MaxSeq || b.Wid == "" {
-				continue
-			}
-			if rec, ok := t.Record(b.Wid); ok && !rec.Signed {
-				return row, b.Wid, true
-			}
+		if row.Signed {
+			return row, true
 		}
 	}
 
-	return match.ServerLogRow{}, "", false
+	return match.ServerLogRow{}, false
 }
 
 // validateLogQuery (M/queries_logs.go): self-structure first, then the shared
@@ -132,9 +121,9 @@ func validateLogQuery(c *oc.ReadCtx, req ListRequest, afterSeq uint64, logs []*c
 			"reverse": req.Reverse, "pageSize": req.PageSize, "serverIds": joinUint64(ids),
 		})}
 	}
-	if row, wid, bad := signedRowOfUnsignedBulk(c.T, page); bad {
-		return []oc.Event{oc.Violation(EvUnsignedLogCarriesSignature, map[string]any{
-			"ledger": ledger, "logId": row.ID, "sequence": row.Sequence, "wid": wid,
+	if row, bad := signedRow(page); bad {
+		return []oc.Event{oc.Violation(EvLogPageCarriesSignature, map[string]any{
+			"ledger": ledger, "logId": row.ID, "sequence": row.Sequence,
 		})}
 	}
 

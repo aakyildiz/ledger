@@ -500,12 +500,9 @@ impl LogDatePlan {
             return json!({});
         }
         let at = |p: u32, off: u64| {
-            let d = dates[p as usize % dates.len()];
-            if off > d {
-                0
-            } else {
-                d + off - LOG_DATE_JITTER
-            }
+            // d ± jitter, clamped at 0 (M/queries_logs.go:105-113 guarded on
+            // off > d, which underflowed for off <= d < jitter - off).
+            dates[p as usize % dates.len()].saturating_add(off).saturating_sub(LOG_DATE_JITTER)
         };
         let mut m = Map::new();
         if self.has_min {
@@ -1072,7 +1069,7 @@ fn children_of(f: &Value) -> Vec<&Value> {
     f.pointer("/not/filter").into_iter().collect()
 }
 
-fn child_mut<'a>(f: &'a mut Value, i: usize) -> Option<&'a mut Value> {
+fn child_mut(f: &mut Value, i: usize) -> Option<&mut Value> {
     if f.pointer("/and/filters").is_some() {
         return f.pointer_mut("/and/filters").and_then(|a| a.get_mut(i));
     }
@@ -1177,6 +1174,32 @@ mod tests {
         assert_eq!(effective_page_size(1001), 1000);
     }
 
+    /// An enum field serialized as a number: enums in range go by name
+    /// (`role_name`, `enum_value`), so a number is an out-of-range value.
+    fn has_numeric_enum(f: &Value) -> bool {
+        match f {
+            Value::Object(m) => m.iter().any(|(k, v)| ((k == "role" || k == "field") && v.is_number()) || has_numeric_enum(v)),
+            Value::Array(a) => a.iter().any(has_numeric_enum),
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn numeric_enum_detector() {
+        assert!(has_numeric_enum(&json!({"and": {"filters": [{"builtinUint": {"field": 8}}]}})));
+        assert!(has_numeric_enum(&json!({"address": {"role": 2147483647}})));
+        assert!(!has_numeric_enum(&json!({"address": {"role": "ADDRESS_ROLE_ANY", "hardcodedPrefix": ":3,"}})));
+    }
+
+    #[test]
+    fn log_date_jitter_never_underflows() {
+        let p = LogDatePlan { has_min: true, min_pick: 0, min_off: 500, min_ex: false, want_max: false, max_pick: 0, max_off: 0, max_ex: false };
+        // off <= d < jitter - off: the old guard subtracted past zero.
+        assert_eq!(p.resolve(&[600]), json!({"min": "100"}));
+        assert_eq!(p.resolve(&[400]), json!({"min": "0"}));
+        assert_eq!(p.resolve(&[10_000]), json!({"min": "9500"}));
+    }
+
     #[test]
     fn malformed_cursor_menu_and_rate() {
         let seen = Mutex::new((0u32, 0u32, BTreeSet::new()));
@@ -1235,10 +1258,10 @@ mod tests {
                     if has_param(&f) {
                         c.insert("param");
                     }
-                    let s = f.to_string();
-                    if s.contains("2147483647") || s.contains(":3,") || s.contains(":3}") || s.contains(":8,") {
+                    if has_numeric_enum(&f) {
                         c.insert("enum-out-of-range");
                     }
+                    let s = f.to_string();
                     if s.contains("{}") {
                         c.insert("unset-oneof");
                     }
@@ -1246,7 +1269,7 @@ mod tests {
             }
         });
         let c = classes.lock().unwrap();
-        for want in ["keep", "root", "unset", "wrap", "leaf", "tree", "chain", "past-max-depth", "param", "unset-oneof"] {
+        for want in ["keep", "root", "unset", "wrap", "leaf", "tree", "chain", "past-max-depth", "param", "unset-oneof", "enum-out-of-range"] {
             assert!(c.contains(want), "missing shape class {want}: {c:?}");
         }
     }
@@ -1303,36 +1326,47 @@ mod tests {
     }
 
     /// The deterministic builder cases of `06/filters/builders.json` and a
-    /// sample of generator output in `06/filters/generated.json`: the Go test
-    /// `TestFilterFixtures_ClientAccepts` unmarshals every one with the
-    /// client's protojson options. `UPDATE_FIXTURES=1` rewrites them; without
-    /// it the builder file must match the builders exactly.
+    /// fixed-seed sample of generator output in `06/filters/generated.json`:
+    /// the Go test `TestFilterFixtures_ClientAccepts` unmarshals every one
+    /// with the client's protojson options. `UPDATE_FIXTURES=1` rewrites
+    /// them; without it both files must match the current builders and
+    /// generators exactly, so the Go acceptance test cannot go stale.
     #[test]
     fn filter_fixtures() {
         let dir = fixtures_dir().join("filters");
-        let builders = json!({"cases": builder_cases()});
-        let path = dir.join("builders.json");
+        let builders = serde_json::to_string_pretty(&json!({"cases": builder_cases()})).unwrap() + "\n";
+        let generated = serde_json::to_string(&json!({"cases": generated_sample()})).unwrap() + "\n";
+        let (bpath, gpath) = (dir.join("builders.json"), dir.join("generated.json"));
         if std::env::var("UPDATE_FIXTURES").is_ok() {
             std::fs::create_dir_all(&dir).unwrap();
-            std::fs::write(&path, serde_json::to_string_pretty(&builders).unwrap() + "\n").unwrap();
-            let c = ctx();
-            let out = Mutex::new(Vec::new());
-            testkit::with_tc_n(200, |tc| {
-                let mut o = out.lock().unwrap();
-                for (target, plan) in [("ACCOUNTS", gen_account_filter(tc)), ("TRANSACTIONS", gen_transaction_filter(tc)), ("LOGS", gen_log_filter(tc, 0))] {
-                    let absent = matches!(plan, Plan::Universe);
-                    if let Some(f) = draw_shape(tc, absent).apply(plan.resolve(&c)) {
-                        o.push(json!({"target": target, "filter": f}));
-                    }
-                }
-            });
-            let gen = json!({"cases": *out.lock().unwrap()});
-            std::fs::write(dir.join("generated.json"), serde_json::to_string(&gen).unwrap() + "\n").unwrap();
+            std::fs::write(&bpath, &builders).unwrap();
+            std::fs::write(&gpath, &generated).unwrap();
         }
         // Compared as text: the depth-chain case nests past serde_json's
         // parser recursion limit.
-        let got = std::fs::read_to_string(&path).expect("06/filters/builders.json");
-        assert_eq!(got, serde_json::to_string_pretty(&builders).unwrap() + "\n", "rerun with UPDATE_FIXTURES=1 and the Go fixture test");
+        let got = std::fs::read_to_string(&bpath).expect("06/filters/builders.json");
+        assert_eq!(got, builders, "rerun with UPDATE_FIXTURES=1 and the Go fixture test");
+        let got = std::fs::read_to_string(&gpath).expect("06/filters/generated.json");
+        assert!(got == generated, "06/filters/generated.json is stale: rerun with UPDATE_FIXTURES=1 and the Go fixture test");
+    }
+
+    /// 200 fixed-seed generator draws per target, resolved against [`ctx`].
+    fn generated_sample() -> Vec<Value> {
+        let c = ctx();
+        let out = Mutex::new(Vec::new());
+        let settings = hegel::Settings::new().test_cases(200).seed(Some(6)).database(hegel::Database::Disabled);
+        hegel::Hegel::new(|tc: TestCase| {
+            let mut o = out.lock().unwrap();
+            for (target, plan) in [("ACCOUNTS", gen_account_filter(&tc)), ("TRANSACTIONS", gen_transaction_filter(&tc)), ("LOGS", gen_log_filter(&tc, 0))] {
+                let absent = matches!(plan, Plan::Universe);
+                if let Some(f) = draw_shape(&tc, absent).apply(plan.resolve(&c)) {
+                    o.push(json!({"target": target, "filter": f}));
+                }
+            }
+        })
+        .settings(settings)
+        .run();
+        out.into_inner().unwrap()
     }
 
     fn builder_cases() -> Vec<Value> {

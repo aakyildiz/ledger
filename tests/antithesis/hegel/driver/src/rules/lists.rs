@@ -210,8 +210,11 @@ fn log_kind(l: &Value) -> String {
     l.pointer("/payload/apply/log/data").and_then(Value::as_object).and_then(|m| m.keys().next().cloned()).unwrap_or_else(|| "?".into())
 }
 
-/// Budget of one traversal (the whole rule stays under ~10 s).
+/// Budget of one traversal (the whole rule stays under ~10 s): no page
+/// starts after it, and a page's timeout never runs past it.
 const TRAVERSE_BUDGET: Duration = Duration::from_secs(8);
+/// A page is not started with less than this left of the budget.
+const TRAVERSE_MIN_PAGE: Duration = Duration::from_millis(250);
 const TRAVERSE_PAGE_TIMEOUT: Duration = Duration::from_secs(2);
 const TRAVERSE_MAX_PAGES: u64 = 8;
 
@@ -230,21 +233,34 @@ impl Traversal {
     pub fn clean(&self) -> bool {
         !self.pages.is_empty() && self.pages.iter().all(|p| p.is_ok() && p.complete)
     }
+
+    /// Clean, and the last page ended the listing (empty `nextCursor`): the
+    /// clean EOF the old drivers reached before asserting. A traversal cut
+    /// short at its page cap or time budget is a prefix and is not judged.
+    pub fn clean_eof(&self) -> bool {
+        self.clean() && self.pages.last().is_some_and(|p| p.next_cursor.is_empty())
+    }
 }
 
 /// The clean-EOF pagination properties, evaluated only when every page was
-/// complete. Ascending transaction ids is `reverse=true` (the endpoint
+/// complete and the traversal reached the end of the listing (as the old
+/// drivers did, so the verbatim literals keep their meaning; a prefix cut
+/// short at the page cap or budget only feeds "a listing spans several
+/// pages"). Ascending transaction ids is `reverse=true` (the endpoint
 /// inverts the flag); log ids ascend for `reverse=false`.
 pub fn check_traversal(t: &Traversal) {
     if !t.clean() {
         return;
     }
     let effective = filters::effective_page_size(t.requested_page_size) as usize;
-    let bounded = t.pages.iter().all(|p| p.items.as_ref().map_or(0, Vec::len) <= effective);
     let lens: Vec<usize> = t.pages.iter().map(|p| p.items.as_ref().map_or(0, Vec::len)).collect();
     let details = json!({"logs": t.logs, "reverse": t.reverse, "requested": t.requested_page_size, "effective": effective, "pages": lens});
-    check_always!(bounded, "clean-EOF list pagination respects the requested page size", details);
     check_sometimes!(t.pages.len() > 1 && t.pages.iter().take(t.pages.len() - 1).all(|p| !p.next_cursor.is_empty()), "a listing spans several pages", details);
+    if !t.clean_eof() {
+        return;
+    }
+    let bounded = lens.iter().all(|n| *n <= effective);
+    check_always!(bounded, "clean-EOF list pagination respects the requested page size", details);
     let items = t.pages.iter().flat_map(|p| p.items.clone().unwrap_or_default());
     if t.logs {
         let seqs: Vec<u64> = items.map(|l| l.get("sequence").and_then(u64_of).unwrap_or(0)).collect();
@@ -284,11 +300,12 @@ pub fn list_traverse(d: &Driver, tc: TestCase) {
         let mut t = Traversal { logs, reverse, requested_page_size: page_size, pages: vec![] };
         let mut ledger: Option<String> = None;
         let mut cursor = String::new();
-        let opts = list_opts(page_size).timeout(TRAVERSE_PAGE_TIMEOUT);
         for _ in 0..max_pages {
-            if started.elapsed() >= TRAVERSE_BUDGET {
+            let left = TRAVERSE_BUDGET.saturating_sub(started.elapsed());
+            if left < TRAVERSE_MIN_PAGE {
                 break;
             }
+            let opts = list_opts(page_size).timeout(left.min(TRAVERSE_PAGE_TIMEOUT));
             let sel = match &ledger {
                 Some(l) => LedgerSel::Name(l.clone()),
                 None => LedgerSel::Pick(pick),
@@ -364,6 +381,13 @@ mod tests {
         check_traversal(&Traversal { logs: true, reverse: false, requested_page_size: 2, pages: vec![page(vec![log(9), log(7)], "")] });
         assert_eq!(fired_cond("ListLogs pagination yields strictly monotone log sequences in the requested direction"), vec![false]);
 
+        // Clean pages that stop short of the end (page cap or budget): a
+        // prefix, not a clean EOF, so no clean-EOF property is evaluated.
+        testkit::reset();
+        check_traversal(&Traversal { logs: false, reverse: true, requested_page_size: 1, pages: vec![page(vec![tx(2), tx(1)], "c"), page(vec![tx(2)], "c")] });
+        assert_eq!(fired_cond("a listing spans several pages"), vec![true]);
+        assert!(testkit::assertions().iter().all(|a| a.message == "a listing spans several pages"));
+
         // An incomplete page: nothing is evaluated.
         testkit::reset();
         let mut p = page(vec![tx(2), tx(1)], "");
@@ -406,31 +430,58 @@ mod tests {
                 assert_eq!(b["maxItems"].as_u64().unwrap(), filters::effective_page_size(ps) + ITEM_SLACK);
             }
         }
-        // Some transactions read aims at the seeded reference or a malformed cursor.
-        let tx_reqs: Vec<String> = fo.calls("/read/end").into_iter().filter(|e| e["kind"] == "ListTransactions").map(|e| e["request"].to_string()).collect();
-        assert!(tx_reqs.iter().any(|r| r.contains("o-test-ref3") || r.contains("TX_BUILTIN_INDEX") || r.contains("cursor")));
+        // The reference leaf is seeded from the seek view.
+        assert!(seeded_reference(&d, &fo), "no ListTransactions request carried the seek view's reference");
         assert!(fo.open_reads().is_empty());
         assert!(d.s.registry.snapshot().is_empty());
     }
 
+    /// Whether some ListTransactions request filtered on the seek view's
+    /// reference, over more cases if the first batch drew none (the
+    /// reference leaf is one arm of `genTransactionFilter`).
+    fn seeded_reference(d: &Driver, fo: &testkit::FakeOracle) -> bool {
+        for _ in 0..5 {
+            let hit = fo.calls("/read/end").into_iter().filter(|e| e["kind"] == "ListTransactions").any(|e| e["request"].to_string().contains("o-test-ref3"));
+            if hit {
+                return true;
+            }
+            run_many(d, list_transactions, 100);
+        }
+        false
+    }
+
+    /// Every page answers with a next cursor, so each traversal runs to its
+    /// drawn page cap; over many cases some traversal must span several
+    /// pages, and every page after the first follows the cursor on the
+    /// first page's ledger.
     #[test]
     fn list_traverse_follows_next_cursors_one_ticket_per_page() {
         let (d, ft, fo) = testkit::driver();
-        fo.set_live(vec!["o-test-l1".into()]);
-        let tok1 = filters::page_token("2");
-        let tok2 = filters::page_token("4");
+        fo.set_live(vec!["o-test-l1".into(), "o-test-l2".into(), "o-test-l3".into()]);
+        let tok = filters::page_token("2");
         for m in ["ListTransactions", "ListLogs"] {
-            ft.script("bucket", m, vec![FakeReply::Outcome(page(vec![tx(1), tx(2)], &tok1)), FakeReply::Outcome(page(vec![tx(3), tx(4)], &tok2))]);
-            ft.set_default("bucket", m, FakeReply::Outcome(page(vec![], "")));
+            ft.set_default("bucket", m, FakeReply::Outcome(page(vec![tx(1), tx(2)], &tok)));
         }
-        testkit::run_rule(&d, list_traverse);
+        run_many(&d, list_traverse, 40);
         let calls: Vec<Value> = ft.calls().into_iter().filter(|c| c["service"] == "bucket").collect();
         let ends = fo.calls("/read/end");
         assert_eq!(calls.len(), ends.len(), "one read ticket per page");
-        assert!(!calls.is_empty() && calls.len() <= 8);
-        if calls.len() > 1 {
-            assert_eq!(calls[1]["request"]["options"]["cursor"], json!(tok1));
-            assert_eq!(calls[0]["request"]["ledger"], calls[1]["request"]["ledger"]);
+        // Split into traversals: each starts with the cursor-less page.
+        let mut runs: Vec<Vec<&Value>> = vec![];
+        for c in &calls {
+            if c["request"]["options"].get("cursor").is_none() {
+                runs.push(vec![]);
+            }
+            runs.last_mut().expect("a traversal starts without a cursor").push(c);
+        }
+        assert!(runs.iter().all(|r| !r.is_empty() && r.len() as u64 <= TRAVERSE_MAX_PAGES));
+        assert!(runs.iter().any(|r| r.len() >= 2), "no traversal followed a cursor: {:?}", runs.iter().map(Vec::len).collect::<Vec<_>>());
+        for r in &runs {
+            for c in &r[1..] {
+                assert_eq!(c["request"]["options"]["cursor"], json!(tok));
+                assert_eq!(c["request"]["ledger"], r[0]["request"]["ledger"]);
+                assert_eq!(c["method"], r[0]["method"]);
+            }
         }
         assert!(fo.open_reads().is_empty());
     }

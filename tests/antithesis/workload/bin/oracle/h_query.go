@@ -45,8 +45,8 @@ func init() {
 	registerAsserter(qc.EvLogPageViolatesOrdering, func(_ bool, d map[string]any) {
 		assert.Unreachable("oracle: log page violates its own ordering", d)
 	})
-	registerAsserter(qc.EvUnsignedLogCarriesSignature, func(_ bool, d map[string]any) {
-		assert.Unreachable("oracle: a log of an unsigned tracked bulk carries a response signature", d)
+	registerAsserter(qc.EvLogPageCarriesSignature, func(_ bool, d map[string]any) {
+		assert.Unreachable("oracle: log page carries a response signature", d)
 	})
 	registerAsserter(qc.EvListAccountsUnexpectedError, func(_ bool, d map[string]any) {
 		assert.Unreachable("oracle: ListAccounts returned unexpected error", d)

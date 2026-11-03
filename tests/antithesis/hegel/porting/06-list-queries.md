@@ -8,7 +8,9 @@ Fixtures: `HG/protocol-fixtures/06/page_tokens.json` (written by the Go test
 `HG/protocol-fixtures/06/filters/{builders,generated}.json` (written by the Rust test
 `filter_fixtures` with `UPDATE_FIXTURES=1`, unmarshalled by the Go test
 `TestFilterFixtures_ClientAccepts` with the client's strict protojson options; the builder
-cases also pin the oracle's refused-filter classification).
+cases also pin the oracle's refused-filter classification, not the server's). Without
+`UPDATE_FIXTURES`, `filter_fixtures` fails when either file differs from the current
+builders or from the fixed-seed (seed 6) generator sample, so the Go test cannot go stale.
 
 Rules: `list_accounts` (2), `list_transactions` (3), `list_logs` (1.5), `list_traverse` (0.7).
 Every draw happens before `/read/begin`: filters are pre-drawn plans whose view-dependent
@@ -55,7 +57,7 @@ resolved against the views of the same ticket; there are no post-begin draws at 
 | M/queries_logs.go:686-693 | Unreachable: malformed log cursor returned results | `oracle: malformed log cursor returned results` | h_query.go |
 | M/queries_logs.go:680 | Unreachable: ListLogs returned unexpected error | `oracle: ListLogs returned unexpected error` | h_query.go |
 | M/queries_logs.go:741 | Unreachable: log page violates its own ordering | `oracle: log page violates its own ordering` | h_query.go |
-| M/queries_logs.go:758 | Unreachable: log page carries a response signature | **renamed** `oracle: a log of an unsigned tracked bulk carries a response signature`: signing exists now (task 16 signs some tracked bulks with the root key), so a signature is a finding only on a log whose committing bulk the oracle knows (`CommittedBulks` → `Record(wid).Signed`) and knows to be unsigned | h_query.go (querycheck `signedRowOfUnsignedBulk`) |
+| M/queries_logs.go:758 | Unreachable: log page carries a response signature | `oracle: log page carries a response signature` (verbatim, unconditional). The spec asked for a rename to "a log of an unsigned tracked bulk carries a response signature", but `Log.response_signature` is the server signing its own responses with `ledger run --response-signing-key` (docs/ops/signing.md "Response Signing"), not client request signing (task 16, which travels on the applied proposal). No compose node sets a response key, so any response signature stays a finding; see Requests to 99 | h_query.go (querycheck `signedRow`) |
 | M/queries_logs.go:780,782,785 | Reachable: log query gated on a missing index / log query served results / reverse log query served results | `oracle: …` same suffixes | h_query.go |
 | M/queries_logs.go:808 | Unreachable: log query outside model | `oracle: log query outside model`; the diagnostic re-reads (`recheckLogIDs`, `recheckLogKinds`) moved to Rust (`lists.rs recheck_logs`, printed after a `log query outside model` verdict) because the oracle never dials the cluster | h_query.go |
 | M/coverage.go:110-178 | Raw Sometimes: `coverage index <canonical> served a model-verified page` (one per workload index), `coverage a metadata-field index served a model-verified page on accounts|transactions`, `coverage a query was served while a retype window was open` | `oracle: coverage …` same suffixes, registered with `RegisterCoverage` in h_query.go, evaluated on every index-backed validated outcome (needs task 07 to be true) | h_query.go, querycheck/coverage.go |
@@ -78,7 +80,6 @@ resolved against the views of the same ticket; there are no post-begin draws at 
 
 ## New properties
 
-- `oracle: a log of an unsigned tracked bulk carries a response signature` (Unreachable; renamed, see above).
 - `ListLogs pagination yields strictly monotone log sequences in the requested direction` (Always; renamed).
 
 No other new literal. All oracle literals are `oracle: ` + the `M/` suffix.
@@ -131,11 +132,34 @@ No other new literal. All oracle literals are `oracle: ` + the `M/` suffix.
   types but no stored values, so string leaves aim at the generator's own metadata value pool
   (3/4) instead of a committed sample, and numeric centres are drawn in `0..1023`.
 - **`list_traverse` is unfiltered** (as the old traversal drivers were), page size from
-  `draw::page_size`, 1–8 pages, 2 s per page, stops at 8 s.
+  `draw::page_size`, 1–8 pages, 2 s per page; no page starts with less than 250 ms of the
+  8 s budget left, and the last page's timeout is cut to what is left, so the rule ends
+  near 8 s plus one `/read/begin` and `/read/end`.
+- **The clean-EOF literals run on shared tracked ledgers.** The old drivers owned their
+  ledgers; here the traversal reads a tracked ledger other rules write to. The verbatim
+  literals are evaluated only when every page was complete *and* the last page had an
+  empty `nextCursor` (the clean EOF the old drivers reached), never on a prefix cut short
+  by the page cap or the time budget. Concurrent writes do not break the properties: a
+  page's size bound holds at any time, and id cursors exclude everything already served,
+  so duplicates or out-of-order ids across pages remain findings. `a listing spans several
+  pages` is still evaluated on clean prefixes.
+- **Response signatures stay an unconditional finding** (spec asked for "a log of an
+  unsigned tracked bulk"). `Log.response_signature` is the server signing its own
+  responses (`ledger run --response-signing-key`, docs/ops/signing.md "Response Signing"),
+  unrelated to request signing; no compose node sets that key, so the old literal and rule
+  are kept verbatim.
 - The client may stream `effective + 64` items, so a page that overshoots the page size still
   arrives `complete` and is judged (the old driver capped at `page + 1`, which hid overshoot).
 
 ## Requests to 99
+
+- The spec's premise for renaming `log page carries a response signature` (task 16's request
+  signing makes response signatures legal) does not hold: request signatures never reach
+  `Log.response_signature`. If a later task does start a node with
+  `--response-signing-key`, this check must change to comparing `KeyId` with the server key
+  from Discovery, not to a per-bulk rule.
+- The clean-EOF literals are kept verbatim on shared tracked ledgers, gated on reaching
+  the end of the listing (see Deviations); confirm that meaning is acceptable, or rename.
 
 - Every assertion of the "reachable only with task 07 merged" block of `h_query.go` and the
   `oracle: coverage …` probes: check reachability in the integrated build (DESIGN §9.2 item 4).
