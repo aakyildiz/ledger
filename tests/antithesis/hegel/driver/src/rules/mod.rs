@@ -30,6 +30,7 @@ pub mod smoke;
 // ==== 13-numscript mods ====
 // ==== end 13-numscript mods ====
 // ==== 14-rust-probes mods ====
+pub mod probes;
 // ==== end 14-rust-probes mods ====
 // ==== 15-convergence mods ====
 // ==== end 15-convergence mods ====
@@ -68,6 +69,7 @@ pub fn rules() -> Vec<ConcurrentRule<Driver>> {
     // ==== 13-numscript rules ====
     // ==== end 13-numscript rules ====
     // ==== 14-rust-probes rules ====
+    v.extend(probes::rules());
     // ==== end 14-rust-probes rules ====
     // ==== 15-convergence rules ====
     // ==== end 15-convergence rules ====
@@ -149,6 +151,7 @@ pub fn quiet_hooks() -> Vec<crate::quiet::QuietHook> {
     // ==== 13-numscript quiet_hooks ====
     // ==== end 13-numscript quiet_hooks ====
     // ==== 14-rust-probes quiet_hooks ====
+    v.extend(probes::quiet_hooks());
     // ==== end 14-rust-probes quiet_hooks ====
     // ==== 15-convergence quiet_hooks ====
     // ==== end 15-convergence quiet_hooks ====
@@ -229,6 +232,7 @@ pub fn setup_hooks() -> Vec<crate::setup::SetupHook> {
     // ==== 13-numscript setup_hooks ====
     // ==== end 13-numscript setup_hooks ====
     // ==== 14-rust-probes setup_hooks ====
+    v.extend(probes::setup_hooks());
     // ==== end 14-rust-probes setup_hooks ====
     // ==== 15-convergence setup_hooks ====
     // ==== end 15-convergence setup_hooks ====
