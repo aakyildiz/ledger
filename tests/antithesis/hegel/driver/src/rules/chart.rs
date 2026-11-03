@@ -139,6 +139,22 @@ pub fn pick_chart_ledger(d: &Driver, tc: &TestCase) -> Option<(String, Value)> {
     Some((ledger, view))
 }
 
+/// `compose_bulk` over this family's generators, one slot at a time with
+/// the generator list rotated by a drawn offset. `draw::weighted` draws a
+/// 32-bit integer that hegel biases toward small values, so without the
+/// rotation the first generator takes nearly every slot (observed in the
+/// native smoke: no enforcement order in 180 s).
+pub fn compose_chart(d: &Driver, tc: &TestCase, ledger: &str, view: &Value, len: usize) -> Vec<Value> {
+    let mut out = Vec::with_capacity(len);
+    for _ in 0..len {
+        let mut gens = order_gens();
+        let k = draw::pick(tc, gens.len());
+        gens.rotate_left(k);
+        out.extend(compose_bulk(d, tc, &gens, ledger, view, 1));
+    }
+    out
+}
+
 /// `compose_bulk` over this family's three generators (1–3 orders) on one
 /// non-l2 live ledger (DESIGN §9.2 item 5).
 pub fn chart_bulk(d: &Driver, tc: TestCase) {
@@ -148,7 +164,7 @@ pub fn chart_bulk(d: &Driver, tc: TestCase) {
         }
         let (ledger, view) = pick_chart_ledger(d, tc)?;
         let len = draw::int_in(tc, 1, 3) as usize;
-        let reqs = compose_bulk(d, tc, &order_gens(), &ledger, &view, len);
+        let reqs = compose_chart(d, tc, &ledger, &view, len);
         if reqs.is_empty() {
             return None;
         }

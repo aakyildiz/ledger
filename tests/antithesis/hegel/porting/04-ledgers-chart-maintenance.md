@@ -121,6 +121,17 @@ Branch `hegel/04-ledgers-chart-maintenance`. Rust: `rules/ledgers.rs`, `rules/ch
 `chart_bulk` therefore never satisfies the promotion probe: it needs task 02's `tx_bulk` (or 03's
 metadata rules) on a promoted `o-<run>-m<N>` ledger.
 
+## Native smoke
+
+`RULES=ledger_lifecycle,chart_bulk,ledger_delete_race,ledger_recreate_probe,maintenance_window,get_ledger,list_ledgers,schema_status,smoke_tx run_native.sh 180`:
+PASS, 0 findings, ~2800 tracked writes; every must-hit of this task hit (maintenance enable,
+disable, both probes, `a write attempt hits maintenance mode`, the recreate-probe literals, all
+apply-surface probes) except `oracle: coverage mirror promotion and write recovery verified`
+(needs task 02; an earlier run hit it through `smoke_tx` on a promoted mirror). The run was made
+inside `unshare -rn` (private loopback, so the fixed UDP ports 7777/7778 do not collide with
+other native runs on the machine) and with `HEALTH_WAL_THRESHOLD=HEALTH_DATA_THRESHOLD=0.995`
+exported, because the shared disk was above the server's 80 % write-block threshold.
+
 ## Requests to 99
 
 - `oracle: coverage mirror promotion and write recovery verified` needs task 02/03 writes on a
@@ -130,3 +141,12 @@ metadata rules) on a promoted `o-<run>-m<N>` ledger.
 - The ten `ledger_recreate_probe` Always literals check `code == NotFound` as the old driver did
   (`MD/parallel_driver_ledger_recreate`); the task spec's "without ErrorInfo" would strengthen
   the old literal, so it is not added.
+- `draw::weighted` (00c) draws a 32-bit integer that hegel biases toward small values, so the
+  first positive weight wins almost every draw (first native run: 0 enforcement orders out of
+  ~150 chart bulks). `chart_bulk` works around it by rotating its generator list by a drawn
+  offset per slot (`chart::compose_chart`); `compose_bulk` users in other families (task 02's
+  `tx_bulk`) are affected the same way. Suggest `weighted` use a small-range draw (e.g. a
+  cumulative pick over an integer scale of 1000) or `chance` chains.
+- Rule-owned ledgers accumulate as tombstones in the model (each `ledger_delete_race` /
+  `ledger_recreate_probe` run leaves one or two deleted `o-<run>-own<N>`); at weight 0.4 each this
+  is several hundred per hour. Watch `LiveLedgers`/candidate-search cost in long runs.

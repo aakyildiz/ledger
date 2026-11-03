@@ -536,10 +536,11 @@ pub enum Target {
 }
 
 fn draw_target(tc: &TestCase, absent_pct: f64, deleted_pct: f64) -> Target {
-    let r = draw::int_in(tc, 0, 9999) as f64 / 100.0;
-    if r < absent_pct {
+    // `chance` (weighted booleans) rather than a wide integer, which hegel
+    // biases toward small values.
+    if draw::chance(tc, absent_pct / 100.0) {
         Target::Absent
-    } else if r < absent_pct + deleted_pct {
+    } else if draw::chance(tc, deleted_pct / (100.0 - absent_pct)) {
         Target::Deleted
     } else {
         Target::Live

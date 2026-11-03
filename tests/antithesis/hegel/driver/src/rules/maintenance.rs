@@ -18,7 +18,7 @@ use crate::oracle::OracleError;
 use crate::setup::SetupHook;
 use crate::shared::MaintState;
 use crate::wire::{create_tx_request, Posting};
-use crate::write::{compose_bulk, FollowUp, UntrackedSend, WritePlan, WriteResult};
+use crate::write::{FollowUp, UntrackedSend, WritePlan, WriteResult};
 use hegel::stateful::ConcurrentRule;
 use hegel::TestCase;
 use serde_json::{json, Value};
@@ -232,9 +232,8 @@ pub fn maintenance_window(d: &Driver, tc: TestCase) {
         let mut writes = Vec::new();
         if k > 0 {
             if let Some((ledger, view)) = super::chart::pick_chart_ledger(d, tc) {
-                let gens = super::chart::order_gens();
                 for _ in 0..k {
-                    let reqs = compose_bulk(d, tc, &gens, &ledger, &view, 1);
+                    let reqs = super::chart::compose_chart(d, tc, &ledger, &view, 1);
                     if !reqs.is_empty() {
                         let mut p = WritePlan::drawn("chart", reqs, d, tc);
                         p.hint = json!({"gen": "maintenance_concurrent"});
