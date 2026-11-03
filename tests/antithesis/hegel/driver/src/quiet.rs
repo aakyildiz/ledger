@@ -21,12 +21,21 @@ pub const P_LOW: f64 = 1.0 / 5000.0;
 pub const P_HIGH: f64 = 1.0 / 10.0;
 pub const QUIET_MIN_GAP: Duration = Duration::from_secs(60);
 pub const QUIET_MAX_GAP: Duration = Duration::from_secs(240);
-/// The gaps of the first `FIRST_QUIETS` quiet periods of a process while no
-/// `exact` check has completed: an Antithesis timeline is often only a few
-/// minutes long, and `exact` needs Q1–Q4 plus up to its 150 s budget.
+/// The gaps of the first `FIRST_QUIETS` quiet periods of a process while an
+/// eligible flavour has not completed yet: an Antithesis timeline is often
+/// only 10–15 minutes long and fits about three quiet periods at the normal
+/// gaps, while there are eight flavours (and `exact` needs Q1–Q4 plus up to
+/// its 150 s budget).
 pub const FIRST_MIN_GAP: Duration = Duration::from_secs(30);
 pub const FIRST_MAX_GAP: Duration = Duration::from_secs(120);
-pub const FIRST_QUIETS: u64 = 2;
+pub const FIRST_QUIETS: u64 = 5;
+/// The weight of each pending flavour once `exact` is no longer pending (see
+/// `flavour_weights`): the pending flavours share the draw evenly, whatever
+/// their base weight.
+pub const PENDING_WEIGHT: f64 = 1.0;
+/// Runs (Q5 reached) after which a flavour that has not completed stops
+/// being pending.
+pub const PENDING_RUNS: u64 = 2;
 /// The head pause at Q0 (covers Q1–Q4).
 pub const Q0_PAUSE_SECS: u64 = 100;
 pub const Q1_DEADLINE: Duration = Duration::from_secs(45);
@@ -110,10 +119,10 @@ pub fn elapsed_probability(elapsed: Duration, min_gap: Duration, max_gap: Durati
 }
 
 /// The trigger gaps: the short ones for the first `FIRST_QUIETS` quiet
-/// periods while no `exact` check has completed, the normal ones after.
+/// periods while an eligible flavour has not completed, the normal ones after.
 pub fn trigger_gaps(s: &Shared) -> (Duration, Duration) {
     let started = s.next_epoch.load(std::sync::atomic::Ordering::SeqCst).saturating_sub(1);
-    if !s.exact_completed() && started < FIRST_QUIETS {
+    if started < FIRST_QUIETS && any_pending(s, &crate::rules::quiet_hooks()) {
         (FIRST_MIN_GAP, FIRST_MAX_GAP)
     } else {
         (QUIET_MIN_GAP, QUIET_MAX_GAP)
@@ -140,10 +149,69 @@ pub fn pause_faults(s: &Shared, secs: u64) {
     }
 }
 
-/// The flavour weights: `weight(&Shared)`, 0 for `needs_oracle` hooks in
-/// degraded mode.
-pub fn flavour_weights(s: &Shared, hooks: &[QuietHook]) -> Vec<f64> {
+/// Per process: the flavours that completed a run within their budget, and
+/// the runs (Q5 reached) of each flavour. Recorded by `run_quiet`; `exact`
+/// counts as completed only through `Shared::exact_completed`, which also
+/// needs every phase done.
+#[derive(Default)]
+pub struct FlavourRuns(std::sync::Mutex<(BTreeSet<&'static str>, std::collections::BTreeMap<&'static str, u64>)>);
+
+pub fn flavour_completed(s: &Shared, name: &str) -> bool {
+    if name == "exact" {
+        return s.exact_completed();
+    }
+    s.ext::<FlavourRuns>().0.lock().unwrap_or_else(|e| e.into_inner()).0.contains(name)
+}
+
+pub fn flavour_runs(s: &Shared, name: &str) -> u64 {
+    s.ext::<FlavourRuns>().0.lock().unwrap_or_else(|e| e.into_inner()).1.get(name).copied().unwrap_or(0)
+}
+
+fn record_run(s: &Shared, name: &'static str, completed: bool) {
+    let r = s.ext::<FlavourRuns>();
+    let mut g = r.0.lock().unwrap_or_else(|e| e.into_inner());
+    *g.1.entry(name).or_insert(0) += 1;
+    if completed {
+        g.0.insert(name);
+    }
+}
+
+/// The base weights: `weight(&Shared)`, 0 for `needs_oracle` hooks in
+/// degraded mode (0 = not eligible now).
+fn base_weights(s: &Shared, hooks: &[QuietHook]) -> Vec<f64> {
     hooks.iter().map(|h| if h.needs_oracle && !s.oracle_ok() { 0.0 } else { (h.weight)(s).max(0.0) }).collect()
+}
+
+/// A flavour is pending while it is eligible, has not completed in this
+/// process and ran fewer than `PENDING_RUNS` times (so a flavour that never
+/// completes does not hold the schedule).
+fn pending(s: &Shared, h: &QuietHook, base: f64) -> bool {
+    base > 0.0 && !flavour_completed(s, h.name) && flavour_runs(s, h.name) < PENDING_RUNS
+}
+
+/// Whether an eligible flavour is still pending.
+pub fn any_pending(s: &Shared, hooks: &[QuietHook]) -> bool {
+    hooks.iter().zip(base_weights(s, hooks)).any(|(h, w)| pending(s, h, w))
+}
+
+/// The flavour weights, in three stages per process:
+///
+/// 1. while `exact` is pending, the base weights (`exact` dominates them:
+///    it feeds every oracle quiet check);
+/// 2. then, while any flavour is pending, `PENDING_WEIGHT` for each pending
+///    flavour and 0 for the others: every flavour gets its turn within the
+///    few quiet periods of a typical timeline, at most `PENDING_RUNS` each
+///    (run 076d255c…-67-0: 144 of 165 draws were `exact`, and
+///    `numscript_state` and `stats_convergence` were never drawn);
+/// 3. then the base weights again (`exact` 10, 50 when overdue).
+pub fn flavour_weights(s: &Shared, hooks: &[QuietHook]) -> Vec<f64> {
+    let base = base_weights(s, hooks);
+    let pend: Vec<bool> = hooks.iter().zip(&base).map(|(h, w)| pending(s, h, *w)).collect();
+    let exact_first = hooks.iter().zip(&pend).any(|(h, p)| h.name == "exact" && *p);
+    if exact_first || !pend.contains(&true) {
+        return base;
+    }
+    pend.iter().map(|p| if *p { PENDING_WEIGHT } else { 0.0 }).collect()
 }
 
 /// The invariant.
@@ -325,7 +393,9 @@ pub fn run_quiet(d: &Driver, hook: Option<&QuietHook>, plan: Option<HookPlan>) {
             pause_faults(s, h.budget.as_secs() + t.pause_margin_secs);
             ctx.deadline = Instant::now() + h.budget;
             (h.run)(d, &mut ctx, plan);
-            Instant::now() <= ctx.deadline
+            let done = Instant::now() <= ctx.deadline;
+            record_run(s, h.name, done);
+            done
         }
         _ => true,
     };
@@ -381,18 +451,116 @@ mod tests {
         assert!(mid > P_LOW && mid < P_HIGH);
     }
 
+    fn complete_all(s: &Shared) {
+        s.exact_completed.store(true, Ordering::SeqCst);
+        for h in crate::rules::quiet_hooks() {
+            record_run(s, h.name, true);
+        }
+    }
+
     #[test]
-    fn the_first_quiet_periods_use_short_gaps_until_exact_completes() {
+    fn the_first_quiet_periods_use_short_gaps_while_a_flavour_is_pending() {
         let (d, _, _) = testkit::driver();
         let s = &d.s;
         assert_eq!(trigger_gaps(s), (FIRST_MIN_GAP, FIRST_MAX_GAP));
         s.next_epoch.store(1 + FIRST_QUIETS - 1, Ordering::SeqCst);
         assert_eq!(trigger_gaps(s), (FIRST_MIN_GAP, FIRST_MAX_GAP));
         s.next_epoch.store(1 + FIRST_QUIETS, Ordering::SeqCst);
-        assert_eq!(trigger_gaps(s), (QUIET_MIN_GAP, QUIET_MAX_GAP), "bounded: a failing exact does not keep the short gaps");
+        assert_eq!(trigger_gaps(s), (QUIET_MIN_GAP, QUIET_MAX_GAP), "bounded: a failing flavour does not keep the short gaps");
         s.next_epoch.store(1, Ordering::SeqCst);
         s.exact_completed.store(true, Ordering::SeqCst);
-        assert_eq!(trigger_gaps(s), (QUIET_MIN_GAP, QUIET_MAX_GAP));
+        assert_eq!(trigger_gaps(s), (FIRST_MIN_GAP, FIRST_MAX_GAP), "exact done, the other flavours are still pending");
+        complete_all(s);
+        assert_eq!(trigger_gaps(s), (QUIET_MIN_GAP, QUIET_MAX_GAP), "every flavour completed");
+    }
+
+    #[test]
+    fn exact_dominates_until_done_then_pending_flavours_take_turns() {
+        let (d, _, _) = testkit::driver();
+        let s = &d.s;
+        let hooks = crate::rules::quiet_hooks();
+        let idx = |n: &str| hooks.iter().position(|h| h.name == n).unwrap();
+        let w = flavour_weights(s, &hooks);
+        assert_eq!(w, base_weights(s, &hooks), "exact pending: the base weights");
+        assert_eq!(w[idx("exact")], crate::rules::quiet_exact::OVERDUE_WEIGHT);
+        // One failed exact run: still pending.
+        record_run(s, "exact", false);
+        assert_eq!(flavour_weights(s, &hooks), base_weights(s, &hooks));
+
+        s.exact_completed.store(true, Ordering::SeqCst);
+        let w = flavour_weights(s, &hooks);
+        assert_eq!(w[idx("exact")], 0.0, "exact completed: it waits for the pending flavours");
+        assert_eq!(w[idx("restore_cut")], 0.0, "an ineligible flavour stays out of the draw");
+        for n in ["numscript_state", "stats_convergence", "cross_node_identity", "cluster_config_convergence", "quiesce_and_absence", "eventually_correct"] {
+            assert_eq!(w[idx(n)], PENDING_WEIGHT, "{n}");
+        }
+        // A completed flavour leaves; a failing one leaves after PENDING_RUNS runs.
+        record_run(s, "numscript_state", true);
+        record_run(s, "stats_convergence", false);
+        let w = flavour_weights(s, &hooks);
+        assert_eq!((w[idx("numscript_state")], w[idx("stats_convergence")]), (0.0, PENDING_WEIGHT));
+        record_run(s, "stats_convergence", false);
+        assert_eq!(flavour_weights(s, &hooks)[idx("stats_convergence")], 0.0);
+        assert_eq!(flavour_runs(s, "stats_convergence"), PENDING_RUNS);
+        assert!(!flavour_completed(s, "stats_convergence"));
+        complete_all(s);
+        assert!(!any_pending(s, &hooks));
+        assert_eq!(flavour_weights(s, &hooks), base_weights(s, &hooks), "nothing pending: the base weights");
+
+        // An exact that never completes stops dominating after PENDING_RUNS runs.
+        let (d, _, _) = testkit::driver();
+        record_run(&d.s, "exact", false);
+        record_run(&d.s, "exact", false);
+        let w = flavour_weights(&d.s, &hooks);
+        assert_eq!((w[idx("exact")], w[idx("numscript_state")]), (0.0, PENDING_WEIGHT));
+
+        // Degraded mode: exact is out, so the pending Rust flavours take turns at once.
+        let (d, _, _) = testkit::driver();
+        d.s.enter_degraded("test");
+        let w = flavour_weights(&d.s, &hooks);
+        assert_eq!((w[idx("exact")], w[idx("stats_convergence")], w[idx("numscript_state")]), (0.0, 0.0, PENDING_WEIGHT));
+    }
+
+    /// A process's schedule: exact first (usually), then every other
+    /// eligible flavour within a bounded number of quiet periods, whatever
+    /// the draws (also the all-minimal ones) and whether the runs complete.
+    /// Run 076d255c…-67-0 never drew `numscript_state` nor
+    /// `stats_convergence` in 165 quiet periods.
+    #[test]
+    fn every_flavour_is_drawn_within_a_bounded_number_of_quiet_periods() {
+        let hooks = crate::rules::quiet_hooks();
+        let eligible: Vec<&str> = {
+            let (d, _, _) = testkit::driver();
+            hooks.iter().zip(base_weights(&d.s, &hooks)).filter(|(_, w)| *w > 0.0).map(|(h, _)| h.name).collect()
+        };
+        assert!(eligible.contains(&"numscript_state") && eligible.contains(&"stats_convergence"), "{eligible:?}");
+        let bound = PENDING_RUNS as usize * eligible.len();
+        let firsts = std::sync::Mutex::new(Vec::new());
+        testkit::with_tc_n(200, |tc| {
+            let (d, _, _) = testkit::driver();
+            let s = &d.s;
+            let mut drawn = BTreeSet::new();
+            let mut periods = 0;
+            while any_pending(s, &hooks) {
+                assert!(periods < bound, "{periods} periods, drawn {drawn:?}");
+                let i = draw::weighted(tc, &flavour_weights(s, &hooks)).unwrap();
+                if periods == 0 {
+                    firsts.lock().unwrap().push(hooks[i].name);
+                }
+                periods += 1;
+                drawn.insert(hooks[i].name);
+                // A drawn run completes half of the time.
+                let done = draw::chance(tc, 0.5);
+                if hooks[i].name == "exact" && done {
+                    s.exact_completed.store(true, Ordering::SeqCst);
+                }
+                record_run(s, hooks[i].name, done);
+            }
+            assert_eq!(drawn.len(), eligible.len(), "{drawn:?}");
+        });
+        let firsts = firsts.into_inner().unwrap();
+        let exact = firsts.iter().filter(|n| **n == "exact").count();
+        assert!(exact * 4 > firsts.len() * 3, "exact leads the first period: {exact} of {}", firsts.len());
     }
 
     #[test]
@@ -414,7 +582,7 @@ mod tests {
         assert_eq!(P_HIGH, 1.0 / 10.0);
         assert_eq!(QUIET_MIN_GAP, Duration::from_secs(60));
         assert_eq!(QUIET_MAX_GAP, Duration::from_secs(240));
-        assert_eq!((FIRST_MIN_GAP, FIRST_MAX_GAP, FIRST_QUIETS), (Duration::from_secs(30), Duration::from_secs(120), 2));
+        assert_eq!((FIRST_MIN_GAP, FIRST_MAX_GAP, FIRST_QUIETS), (Duration::from_secs(30), Duration::from_secs(120), 5));
         assert!(FIRST_MIN_GAP < FIRST_MAX_GAP && FIRST_MAX_GAP <= QUIET_MAX_GAP && QUIET_MIN_GAP < QUIET_MAX_GAP);
         // An `exact` drawn at the end of the first gap (Q0 pause, which bounds
         // Q1–Q4, plus its budget) finishes within 6.5 minutes of workload.
@@ -435,8 +603,10 @@ mod tests {
     fn a_full_quiet_period_runs_the_hook_inside_the_epoch() {
         let (d, _, fo) = testkit::driver();
         testkit::reset();
+        assert!(!flavour_completed(&d.s, "test"));
         run_quiet(&d, Some(&hook(run_counts)), Some(Box::new(5u32)));
         assert_eq!(ran(&d), 1);
+        assert!(flavour_completed(&d.s, "test"), "a run within budget marks the flavour completed");
         assert_eq!(fo.calls("/quiet/begin").len(), 1);
         assert_eq!(fo.calls("/quiet/end").len(), 1);
         assert!(!fo.is_quiet());
@@ -455,6 +625,7 @@ mod tests {
         fo.set_status_override(Some((1, 0)));
         run_quiet(&d, Some(&hook(run_counts)), Some(Box::new(5u32)));
         assert_eq!(ran(&d), 0, "the hook does not run");
+        assert!(!flavour_completed(&d.s, "test"));
         assert!(fo.calls("/quiet/begin").is_empty());
         assert!(testkit::assertions().iter().any(|a| a.message == "every handed-off write resolves during a quiet period" && !a.cond));
         assert!(d.s.oracle_ok());

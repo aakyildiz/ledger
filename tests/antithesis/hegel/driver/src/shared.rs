@@ -233,8 +233,8 @@ pub struct Shared {
     pub last_exclusive_end: Mutex<Instant>,
     pub quiets_since_exact: AtomicU64,
     /// An `exact` quiet check has completed in this process (set by task
-    /// 11's hook). Until then `exact` dominates the flavour draw and the
-    /// first quiet periods use the shorter trigger gaps.
+    /// 11's hook). Until then (for at most two runs) `exact` dominates the
+    /// flavour draw (`quiet::flavour_weights`).
     pub exact_completed: AtomicBool,
     /// When the last fault pause issued by a quiet period runs out (`None`
     /// before the first one, or without the pause command). The trigger

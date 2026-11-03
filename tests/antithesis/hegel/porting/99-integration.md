@@ -98,6 +98,19 @@ lists no `workload/internal` path, so the service does not link
   end of the previous period's fault pause when that is later. `exact` weighs
   50 until it completes once in the process (and again after 3 quiet periods
   without a completion), 10 otherwise, instead of 4 (50 after 3).
+- Quiet flavour schedule (run `076d255c6630d44a96dafcde7bb68f03-67-0`, 48
+  compute hours, timelines of about 3 quiet periods in 800 s): 144 of the 165
+  quiet periods drew `exact`, and `numscript_state` and `stats_convergence`
+  were never drawn, so none of their properties was reached. The draw now
+  goes in three stages per process (`quiet::flavour_weights`): the base
+  weights while `exact` is pending (`exact` dominates), then only the pending
+  flavours, evenly (weight 1 each, everything else 0), then the base weights
+  again. A flavour is pending while it is eligible, has not completed a run
+  within its budget in the process (`exact`: all its phases done) and ran
+  fewer than 2 times, so a failing flavour cannot hold the schedule and even
+  hegel's minimal draws reach every flavour within 2 runs each. The short
+  30 s/120 s trigger gaps apply to the first 5 quiet periods while a flavour
+  is pending (was: the first 2 while `exact` had not completed).
 - Antithesis run 67-0 coverage triage (timelines of 20–60 s, no quiet phase
   reached):
   - Five blocks never succeeded (`lending/provision`, `marketplace/payout`,

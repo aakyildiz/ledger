@@ -44,7 +44,9 @@ pub fn quiet_hooks() -> Vec<QuietHook> {
 
 /// The weight while `exact` is overdue (the other flavours weigh about 11
 /// together): before the first completed check of the process, and once
-/// `OVERDUE_AFTER` quiet periods passed without one.
+/// `OVERDUE_AFTER` quiet periods passed without one. Between the two, the
+/// flavours that have not completed yet take turns and `exact` waits
+/// (`quiet::flavour_weights`).
 pub const OVERDUE_WEIGHT: f64 = 50.0;
 /// The weight otherwise.
 pub const BASE_WEIGHT: f64 = 10.0;
