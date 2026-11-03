@@ -6,7 +6,8 @@
 //! Numscript rule of the retired `H/main.rs:800-817`, with the retired
 //! `H/model.rs` status machinery re-homed in `numscript/model.rs`.
 //!
-//! Rules: `ns_save` (0.5), `ns_read` (0.5), `ns_exec` (1.0). Setup hook
+//! Rules: `ns_save` (0.5), `ns_read` (0.5), `ns_exec` (1.0), `ns_unresolved`
+//! (0.15, the keyed preparation-gap path). Setup hook
 //! `numscript_setup`. Quiet hook `numscript_state` (30 s, weight 0.5, no oracle).
 mod model;
 mod semver;
@@ -40,7 +41,7 @@ const SETUP_STEP: Duration = Duration::from_secs(40);
 const READ_BUDGET: Duration = Duration::from_secs(8);
 
 pub fn rules() -> Vec<ConcurrentRule<Driver>> {
-    vec![rule("ns_save", 0.5, ns_save), rule("ns_read", 0.5, ns_read), rule("ns_exec", 1.0, ns_exec)]
+    vec![rule("ns_save", 0.5, ns_save), rule("ns_read", 0.5, ns_read), rule("ns_exec", 1.0, ns_exec), rule("ns_unresolved", 0.15, ns_unresolved)]
 }
 
 pub fn setup_hooks() -> Vec<SetupHook> {
@@ -676,6 +677,61 @@ pub fn ns_exec(d: &Driver, tc: TestCase) {
     });
 }
 
+// ------------------------------------------------------------- ns_unresolved
+
+/// The whole retry budget of one `ns_unresolved` send (every attempt is
+/// refused as retryable, so the send always runs to its budget).
+const UNRESOLVED_BUDGET: Duration = Duration::from_secs(3);
+
+/// An inline script whose destination comes from `meta(@<cfg>, "dest")` of an
+/// account that never has that key: dependency resolution fails after a
+/// mutable metadata read, so it can never commit.
+pub fn unresolved_script(cfg: &str) -> String {
+    format!("vars {{\n  account $dst = meta(@{cfg}, \"dest\")\n}}\nsend [COIN 1] (\n  source = @world\n  destination = $dst\n)\n")
+}
+
+/// The keyed-retry path of a preparation gap (EN-1406, EN-1557): with an
+/// idempotency key, admission cannot tell a failed resolution from the replay
+/// of a frozen outcome, so it forwards the order marked `preload_unavailable`
+/// and the FSM, finding no frozen outcome, answers the retryable
+/// `PRELOAD_UNAVAILABLE` without auditing or freezing it
+/// (`admission.go` `classifyResolutionFailure`, `machine.go`); without a key
+/// it fails fast with `DEPENDENCY_DISCOVERY_FAILED`. The other templates of
+/// this family never read state while resolving, so this rule is the only
+/// source of `a write attempt hits a preload miss` (`write::explore_attempt`
+/// sees every attempt). The `cfg` account is fresh per send and nothing ever
+/// writes its metadata, so a commit is a finding.
+pub fn ns_unresolved(d: &Driver, tc: TestCase) {
+    d.guarded("ns_unresolved", &tc, |d, tc| {
+        let st = d.s.ext::<NsState>();
+        let li = draw::pick(tc, LEDGERS);
+        let keyed = draw::chance(tc, 0.75);
+        let schedule = draw::schedule(tc, &d.s, 4);
+        let backoffs = draw::backoffs(tc, 4);
+        let ledger = {
+            let g = lock(&st);
+            let l = g.get(li)?;
+            if !l.ready {
+                return None;
+            }
+            l.name.clone()
+        };
+        let n = st.next_ref.fetch_add(1, Ordering::SeqCst);
+        let reference = format!("r-{}-nsu{n}", d.s.run);
+        let cfg = format!("ns-cfg:{n}");
+        let req = json!({"apply": {"ledger": ledger, "action": {"createTransaction": {"reference": reference, "script": {"plain": unresolved_script(&cfg), "vars": {}}}}}});
+        let mut send = UntrackedSend::new(vec![req], keyed.then(|| d.s.next_untracked_key()));
+        send.schedule = schedule;
+        send.backoffs_ms = backoffs;
+        send.budget = UNRESOLVED_BUDGET;
+        let r = d.send_untracked(send);
+        let reasons: Vec<&str> = r.attempts.iter().map(|a| a.reason.as_str()).collect();
+        let details = json!({"ledger": ledger, "reference": reference, "keyed": keyed, "outcome": r.outcome.summary(), "reasons": reasons});
+        check_always!(!r.outcome.is_ok(), "a numscript whose meta() source is absent never commits", details);
+        Some(())
+    });
+}
+
 // ------------------------------------------------------------- quiet hook
 
 fn quiet_plan(_d: &Driver, tc: &TestCase) -> HookPlan {
@@ -949,6 +1005,37 @@ mod tests {
     }
 
     #[test]
+    fn ns_unresolved_sends_a_meta_read_that_never_resolves() {
+        let (d, ft, _) = testkit::driver();
+        setup(&d);
+        testkit::reset();
+        let unavailable = FakeReply::Outcome(Outcome::from_json(&json!({"ok": false, "code": "Unavailable", "reason": "PRELOAD_UNAVAILABLE", "message": "preload unavailable"})));
+        ft.set_default("bucket", "Apply", unavailable);
+        // Each keyed send retries the retryable refusal for its whole 3 s budget.
+        for _ in 0..3 {
+            testkit::run_rule(&d, ns_unresolved);
+        }
+        let calls = ft.calls_of("bucket", "Apply");
+        let probes: Vec<&Value> = calls.iter().skip(4).collect();
+        assert!(!probes.is_empty());
+        for c in &probes {
+            let ct = &c["request"]["unsigned"]["requests"][0]["apply"]["action"]["createTransaction"];
+            let plain = ct["script"]["plain"].as_str().unwrap();
+            assert!(plain.contains("account $dst = meta(@ns-cfg:") && plain.contains(", \"dest\")"), "{plain}");
+            assert!(ct["reference"].as_str().unwrap().starts_with("r-test-nsu"));
+        }
+        assert!(testkit::fired("a write attempt hits a preload miss"));
+        let rec: Vec<_> = testkit::assertions().into_iter().filter(|r| r.message == "a numscript whose meta() source is absent never commits").collect();
+        assert!(!rec.is_empty() && rec.iter().all(|r| r.cond));
+
+        // A commit is a finding.
+        testkit::reset();
+        ft.set_default("bucket", "Apply", ok(json!({"logs": []})));
+        testkit::run_rule(&d, ns_unresolved);
+        assert!(testkit::assertions().iter().any(|r| r.message == "a numscript whose meta() source is absent never commits" && !r.cond));
+    }
+
+    #[test]
     fn ns_exec_records_and_checks_transactions() {
         let (d, ft, _) = testkit::driver();
         setup(&d);
@@ -1185,7 +1272,7 @@ mod tests {
     #[test]
     fn registrations() {
         let names: Vec<String> = rules().into_iter().map(|r| r.name).collect();
-        assert_eq!(names, vec!["ns_save", "ns_read", "ns_exec"]);
+        assert_eq!(names, vec!["ns_save", "ns_read", "ns_exec", "ns_unresolved"]);
         let h = &quiet_hooks()[0];
         assert_eq!((h.name, h.budget, h.needs_oracle), ("numscript_state", Duration::from_secs(30), false));
         assert!(crate::rules::quiet_hooks().iter().any(|h| h.name == "numscript_state"));
