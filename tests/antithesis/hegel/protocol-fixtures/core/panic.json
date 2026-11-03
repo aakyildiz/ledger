@@ -1,0 +1,66 @@
+{
+  "endpoint": "POST /read/end",
+  "request": {
+    "ticket": 923,
+    "kind": "GetAccount",
+    "request": {
+      "address": "t-3:42",
+      "ledger": "o-18f6c2a1b3d4e-l3"
+    },
+    "outcome": {
+      "ok": true,
+      "response": {
+        "address": "t-3:42",
+        "firstUsage": {
+          "data": "1793836800500000"
+        },
+        "insertionDate": {
+          "data": "1793836800500000"
+        },
+        "metadata": {
+          "tier": {
+            "stringValue": "gold"
+          }
+        },
+        "updatedAt": {
+          "data": "1793836800500000"
+        },
+        "volumes": [
+          {
+            "asset": "COIN",
+            "volumes": {
+              "balance": {
+                "magnitude": {
+                  "magnitude": "ZA=="
+                }
+              },
+              "input": {
+                "magnitude": "ZA=="
+              },
+              "output": {}
+            }
+          }
+        ]
+      }
+    },
+    "route": {
+      "client": 2,
+      "route": "plain",
+      "node": "",
+      "consistency": "linearizable"
+    },
+    "hint": {},
+    "params": {}
+  },
+  "status": 500,
+  "response": {
+    "bootId": "1793836800123456789",
+    "error": {
+      "code": "panic",
+      "message": "checker panicked: runtime error: index out of range [3] with length 3",
+      "details": {
+        "endpoint": "POST /read/end"
+      }
+    }
+  }
+}

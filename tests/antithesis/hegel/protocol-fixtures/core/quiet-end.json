@@ -1,0 +1,14 @@
+{
+  "endpoint": "POST /quiet/end",
+  "request": {
+    "epoch": 7
+  },
+  "status": 200,
+  "response": {
+    "bootId": "1793836800123456789",
+    "summary": {
+      "sections": 3,
+      "violations": 0
+    }
+  }
+}

@@ -1,0 +1,34 @@
+{
+  "endpoint": "POST /write/end",
+  "request": {
+    "ticket": 917,
+    "outcome": {
+      "ok": false,
+      "code": "Unavailable",
+      "reason": "STALE_PROPOSAL",
+      "message": "proposal is stale, retry",
+      "peer": "ledger-0:8888",
+      "elapsedMs": 9
+    },
+    "attempts": 2,
+    "via": {
+      "opId": 5521,
+      "client": 2,
+      "route": "plain",
+      "late": false
+    }
+  },
+  "status": 400,
+  "response": {
+    "bootId": "1793836800123456789",
+    "error": {
+      "code": "protocol",
+      "message": "the outcome is not definitive",
+      "details": {
+        "ticket": 917,
+        "code": "Unavailable",
+        "reason": "STALE_PROPOSAL"
+      }
+    }
+  }
+}

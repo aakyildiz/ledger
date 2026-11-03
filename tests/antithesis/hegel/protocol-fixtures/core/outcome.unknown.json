@@ -1,0 +1,10 @@
+{
+  "endpoint": "outcome",
+  "request": null,
+  "status": 200,
+  "response": {
+    "unknown": "timeout"
+  },
+  "definitive": false,
+  "transient": true
+}

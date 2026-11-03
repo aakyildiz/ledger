@@ -1,0 +1,193 @@
+{
+  "endpoint": "POST /view",
+  "request": {
+    "views": [
+      {
+        "name": "ledgers"
+      },
+      {
+        "name": "ledger",
+        "ledger": "o-18f6c2a1b3d4e-l1"
+      },
+      {
+        "name": "seek",
+        "ledgerPick": 2,
+        "table": "txs",
+        "probe": "40"
+      },
+      {
+        "name": "seek",
+        "ledgerPick": 2,
+        "table": "txByRef",
+        "probe": "o-18f6c2a1b3d4e-ref9"
+      },
+      {
+        "name": "seek",
+        "ledgerPick": 2,
+        "table": "accountMeta",
+        "probe": "t-3:4"
+      },
+      {
+        "name": "seek",
+        "ledgerPick": 2,
+        "table": "txMeta",
+        "probe": "12",
+        "filter": "has-metadata"
+      },
+      {
+        "name": "seek",
+        "ledger": "o-18f6c2a1b3d4e-l3",
+        "table": "volumes",
+        "probe": "users:zz",
+        "filter": "transient"
+      },
+      {
+        "name": "replayable"
+      },
+      {
+        "name": "stamps",
+        "ledgerPick": 2
+      }
+    ]
+  },
+  "status": 200,
+  "response": {
+    "bootId": "1793836800123456789",
+    "version": 4711,
+    "views": [
+      {
+        "trackedPrefix": "o-18f6c2a1b3d4e-",
+        "live": [
+          "o-18f6c2a1b3d4e-l1",
+          "o-18f6c2a1b3d4e-l2",
+          "o-18f6c2a1b3d4e-l3"
+        ],
+        "deleted": [
+          "o-18f6c2a1b3d4e-l4"
+        ],
+        "mirror": [
+          "o-18f6c2a1b3d4e-m1"
+        ],
+        "maintenance": false,
+        "nextLedger": 5
+      },
+      {
+        "ledger": "o-18f6c2a1b3d4e-l1",
+        "name": "o-18f6c2a1b3d4e-l1",
+        "live": true,
+        "mode": "LEDGER_MODE_NORMAL",
+        "txCount": 812,
+        "logCount": 1290,
+        "defaultMode": "CHART_ENFORCEMENT_STRICT",
+        "types": [
+          {
+            "name": "t-0",
+            "pattern": "t-0:{id}",
+            "persistence": "ACCOUNT_TYPE_EPHEMERAL"
+          }
+        ],
+        "ledgerMetaKeys": [
+          "region"
+        ],
+        "fieldTypes": {
+          "account": {
+            "tier": "METADATA_TYPE_STRING"
+          },
+          "transaction": {
+            "score": "METADATA_TYPE_INT64"
+          },
+          "ledger": {}
+        },
+        "indexes": [
+          {
+            "canonical": "metadata:TARGET_TYPE_ACCOUNT:tier",
+            "id": {
+              "metadata": {
+                "key": "tier"
+              }
+            },
+            "state": "ambiguous"
+          }
+        ],
+        "preparedQueries": [
+          "pq-by-tier"
+        ]
+      },
+      {
+        "ledger": "o-18f6c2a1b3d4e-l3",
+        "found": true,
+        "wrapped": true,
+        "entry": {
+          "id": "3",
+          "reference": "o-18f6c2a1b3d4e-ref2",
+          "reverted": false,
+          "postingCount": 1,
+          "force": false
+        }
+      },
+      {
+        "ledger": "o-18f6c2a1b3d4e-l3",
+        "found": true,
+        "wrapped": false,
+        "entry": {
+          "reference": "o-18f6c2a1b3d4e-ref12",
+          "id": "57"
+        }
+      },
+      {
+        "ledger": "o-18f6c2a1b3d4e-l3",
+        "found": true,
+        "wrapped": false,
+        "entry": {
+          "address": "t-3:42",
+          "key": "tier"
+        }
+      },
+      {
+        "ledger": "o-18f6c2a1b3d4e-l3",
+        "found": true,
+        "wrapped": false,
+        "entry": {
+          "id": "57",
+          "key": "tier"
+        }
+      },
+      {
+        "ledger": "o-18f6c2a1b3d4e-l3",
+        "found": false,
+        "wrapped": false,
+        "entry": null
+      },
+      {
+        "entries": [
+          {
+            "wid": "w101",
+            "key": "o-18f6c2a1b3d4e-k40",
+            "status": "committed",
+            "reason": "",
+            "stage": ""
+          },
+          {
+            "wid": "w118",
+            "key": "o-18f6c2a1b3d4e-k52",
+            "status": "failed",
+            "reason": "INSUFFICIENT_FUNDS",
+            "stage": "fsm"
+          }
+        ]
+      },
+      {
+        "ledger": "o-18f6c2a1b3d4e-l3",
+        "txDates": [
+          "1793836800499000",
+          "1793836800500000"
+        ],
+        "logDates": [
+          "1793836800499000",
+          "1793836800500000"
+        ],
+        "maxLogSeq": "1290"
+      }
+    ]
+  }
+}

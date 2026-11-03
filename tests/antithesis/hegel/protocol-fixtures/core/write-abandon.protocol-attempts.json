@@ -1,0 +1,19 @@
+{
+  "endpoint": "POST /write/abandon",
+  "request": {
+    "ticket": 918,
+    "attempts": 2
+  },
+  "status": 400,
+  "response": {
+    "bootId": "1793836800123456789",
+    "error": {
+      "code": "protocol",
+      "message": "a ticket with attempts must be handed to a resolver",
+      "details": {
+        "ticket": 918,
+        "attempts": 2
+      }
+    }
+  }
+}

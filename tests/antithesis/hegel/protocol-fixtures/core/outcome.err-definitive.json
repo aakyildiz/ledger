@@ -1,0 +1,19 @@
+{
+  "endpoint": "outcome",
+  "request": null,
+  "status": 200,
+  "response": {
+    "ok": false,
+    "code": "FailedPrecondition",
+    "reason": "INSUFFICIENT_FUNDS",
+    "message": "insufficient funds: account world:COIN",
+    "metadata": {
+      "account": "t-3:7",
+      "asset": "COIN"
+    },
+    "peer": "ledger-2:8888",
+    "elapsedMs": 21
+  },
+  "definitive": true,
+  "transient": false
+}

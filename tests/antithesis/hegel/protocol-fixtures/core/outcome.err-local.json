@@ -1,0 +1,14 @@
+{
+  "endpoint": "outcome",
+  "request": null,
+  "status": 200,
+  "response": {
+    "ok": false,
+    "code": "ResourceExhausted",
+    "message": "grpc: received message larger than max (70000000 vs. 67108864)",
+    "local": true,
+    "elapsedMs": 412
+  },
+  "definitive": false,
+  "transient": false
+}

@@ -1,0 +1,27 @@
+{
+  "endpoint": "POST /read/begin",
+  "request": {
+    "rid": "r457",
+    "kind": "GetAccount",
+    "views": [
+      {
+        "name": "seek",
+        "ledgerPick": 77,
+        "table": "volumes",
+        "probe": "t-0:1"
+      }
+    ],
+    "params": {}
+  },
+  "status": 200,
+  "response": {
+    "bootId": "1793836800123456789",
+    "ticket": 3,
+    "version": 0,
+    "views": [
+      {
+        "ledger": null
+      }
+    ]
+  }
+}

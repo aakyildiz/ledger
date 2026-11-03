@@ -1,0 +1,21 @@
+{
+  "endpoint": "POST /setup",
+  "request": {
+    "runId": "18f6c2ff00112",
+    "trackedPrefix": "o-18f6c2ff00112-",
+    "queryCheckpointLimit": "10",
+    "liveTarget": 4
+  },
+  "status": 409,
+  "response": {
+    "bootId": "1793836800123456789",
+    "error": {
+      "code": "setup",
+      "message": "setup already done with a different runId",
+      "details": {
+        "runId": "18f6c2a1b3d4e",
+        "requestedRunId": "18f6c2ff00112"
+      }
+    }
+  }
+}

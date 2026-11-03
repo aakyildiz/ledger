@@ -1,0 +1,35 @@
+{
+  "endpoint": "POST /write/end",
+  "request": {
+    "ticket": 916,
+    "outcome": {
+      "ok": false,
+      "code": "FailedPrecondition",
+      "reason": "INSUFFICIENT_FUNDS",
+      "message": "insufficient funds: account world:COIN",
+      "metadata": {
+        "account": "t-3:7",
+        "asset": "COIN"
+      },
+      "peer": "ledger-2:8888",
+      "elapsedMs": 21
+    },
+    "attempts": 1,
+    "via": {
+      "opId": 5520,
+      "client": 0,
+      "route": "node:ledger-2:8888",
+      "late": false
+    }
+  },
+  "status": 200,
+  "response": {
+    "bootId": "1793836800123456789",
+    "status": "validated",
+    "verdict": {
+      "ok": true,
+      "skipped": false,
+      "violations": []
+    }
+  }
+}

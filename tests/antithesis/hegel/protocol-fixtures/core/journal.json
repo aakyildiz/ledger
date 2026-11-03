@@ -1,0 +1,90 @@
+{
+  "endpoint": "GET /journal?from=41&limit=2",
+  "request": null,
+  "status": 200,
+  "response": {
+    "bootId": "1793836800123456789",
+    "entries": [
+      {
+        "n": 41,
+        "boot": "1793836800123456789",
+        "ep": "POST /write/begin",
+        "req": {
+          "wid": "w123",
+          "idempotencyKey": "o-18f6c2a1b3d4e-k77",
+          "requests": [
+            {
+              "apply": {
+                "action": {
+                  "createTransaction": {
+                    "metadata": {
+                      "tier": {
+                        "stringValue": "gold"
+                      }
+                    },
+                    "postings": [
+                      {
+                        "amount": {
+                          "v0": "100"
+                        },
+                        "asset": "COIN",
+                        "destination": "t-3:42",
+                        "source": "world"
+                      }
+                    ],
+                    "reference": "o-18f6c2a1b3d4e-ref12"
+                  }
+                },
+                "ledger": "o-18f6c2a1b3d4e-l3"
+              }
+            }
+          ],
+          "trackKey": true,
+          "role": "original",
+          "family": "tx",
+          "signed": false,
+          "hint": {
+            "gen": "transfer"
+          }
+        },
+        "status": 200,
+        "resp": {
+          "bootId": "1793836800123456789",
+          "ticket": 912,
+          "version": 4711,
+          "predicted": {
+            "ok": true,
+            "reason": ""
+          }
+        },
+        "violations": [],
+        "ms": 12871
+      },
+      {
+        "n": 42,
+        "boot": "1793836800123456789",
+        "ep": "POST /quiet/section",
+        "req": {
+          "elided": true,
+          "sha256": "3b5d5c3712955042212316173ccf37be800ac1a3e5b8f6b1d4e6f2c1a7b8c9d0",
+          "bytes": 1180000
+        },
+        "status": 200,
+        "resp": {
+          "bootId": "1793836800123456789",
+          "verdict": {
+            "ok": true,
+            "skipped": false,
+            "violations": []
+          },
+          "next": {
+            "from": "18240"
+          }
+        },
+        "violations": [],
+        "ms": 12873
+      }
+    ],
+    "next": 43
+  }
+}

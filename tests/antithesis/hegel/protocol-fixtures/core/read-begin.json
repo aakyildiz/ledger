@@ -1,0 +1,83 @@
+{
+  "endpoint": "POST /read/begin",
+  "request": {
+    "rid": "r456",
+    "kind": "GetAccount",
+    "views": [
+      {
+        "name": "ledger",
+        "ledgerPick": 3141593
+      },
+      {
+        "name": "seek",
+        "ledgerPick": 3141593,
+        "table": "volumes",
+        "probe": "t-3:42"
+      }
+    ],
+    "params": {}
+  },
+  "status": 200,
+  "response": {
+    "bootId": "1793836800123456789",
+    "ticket": 913,
+    "version": 4711,
+    "views": [
+      {
+        "ledger": "o-18f6c2a1b3d4e-l3",
+        "name": "o-18f6c2a1b3d4e-l3",
+        "live": true,
+        "mode": "LEDGER_MODE_NORMAL",
+        "txCount": 57,
+        "logCount": 812,
+        "defaultMode": "CHART_ENFORCEMENT_AUDIT",
+        "types": [
+          {
+            "name": "t-3",
+            "pattern": "t-3:{id}",
+            "persistence": "ACCOUNT_TYPE_NORMAL"
+          }
+        ],
+        "ledgerMetaKeys": [
+          "region"
+        ],
+        "fieldTypes": {
+          "account": {
+            "tier": "METADATA_TYPE_STRING"
+          },
+          "transaction": {
+            "score": "METADATA_TYPE_INT64"
+          },
+          "ledger": {}
+        },
+        "indexes": [
+          {
+            "canonical": "metadata:TARGET_TYPE_ACCOUNT:tier",
+            "id": {
+              "metadata": {
+                "key": "tier"
+              }
+            },
+            "state": "active"
+          }
+        ],
+        "preparedQueries": [
+          "pq-by-tier"
+        ]
+      },
+      {
+        "ledger": "o-18f6c2a1b3d4e-l3",
+        "found": true,
+        "wrapped": false,
+        "entry": {
+          "address": "t-3:42",
+          "asset": "COIN",
+          "color": "",
+          "input": "100",
+          "output": "0",
+          "persistence": "ACCOUNT_TYPE_NORMAL"
+        }
+      }
+    ]
+  }
+}

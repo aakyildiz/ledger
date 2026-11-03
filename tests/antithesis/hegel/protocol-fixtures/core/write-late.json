@@ -1,0 +1,112 @@
+{
+  "endpoint": "POST /write/late",
+  "request": {
+    "ticket": 912,
+    "outcome": {
+      "ok": true,
+      "response": {
+        "logs": [
+          {
+            "payload": {
+              "apply": {
+                "ledgerName": "o-18f6c2a1b3d4e-l3",
+                "log": {
+                  "data": {
+                    "createdTransaction": {
+                      "transaction": {
+                        "id": "57",
+                        "insertedAt": {
+                          "data": "1793836800500000"
+                        },
+                        "metadata": {
+                          "tier": {
+                            "stringValue": "gold"
+                          }
+                        },
+                        "postCommitVolumes": {
+                          "volumesByAccount": {
+                            "t-3:42": {
+                              "volumes": [
+                                {
+                                  "asset": "COIN",
+                                  "volumes": {
+                                    "input": {
+                                      "magnitude": "ZA=="
+                                    },
+                                    "output": {}
+                                  }
+                                }
+                              ]
+                            },
+                            "world": {
+                              "volumes": [
+                                {
+                                  "asset": "COIN",
+                                  "volumes": {
+                                    "input": {},
+                                    "output": {
+                                      "magnitude": "ZA=="
+                                    }
+                                  }
+                                }
+                              ]
+                            }
+                          }
+                        },
+                        "postings": [
+                          {
+                            "amount": {
+                              "v0": "100"
+                            },
+                            "asset": "COIN",
+                            "destination": "t-3:42",
+                            "source": "world"
+                          }
+                        ],
+                        "reference": "o-18f6c2a1b3d4e-ref12",
+                        "timestamp": {
+                          "data": "1793836800500000"
+                        },
+                        "updatedAt": {
+                          "data": "1793836800500000"
+                        }
+                      }
+                    }
+                  },
+                  "date": {
+                    "data": "1793836800500000"
+                  },
+                  "id": "812",
+                  "newKeptVolumes": [
+                    {
+                      "account": "t-3:42",
+                      "asset": "COIN"
+                    }
+                  ]
+                }
+              }
+            },
+            "sequence": "1290"
+          }
+        ]
+      },
+      "peer": "ledger-1:8888",
+      "elapsedMs": 37
+    },
+    "via": {
+      "opId": 5530,
+      "client": 2,
+      "route": "plain",
+      "late": true
+    }
+  },
+  "status": 200,
+  "response": {
+    "bootId": "1793836800123456789",
+    "verdict": {
+      "ok": true,
+      "skipped": false,
+      "violations": []
+    }
+  }
+}

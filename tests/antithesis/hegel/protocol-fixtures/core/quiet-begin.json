@@ -1,0 +1,45 @@
+{
+  "endpoint": "POST /quiet/begin",
+  "request": {
+    "epoch": 7
+  },
+  "status": 200,
+  "response": {
+    "bootId": "1793836800123456789",
+    "epoch": 7,
+    "version": 4711,
+    "auditCursor": "18233",
+    "ledgers": {
+      "live": [
+        "o-18f6c2a1b3d4e-l1",
+        "o-18f6c2a1b3d4e-l2",
+        "o-18f6c2a1b3d4e-l3"
+      ],
+      "deleted": [
+        "o-18f6c2a1b3d4e-l4"
+      ]
+    },
+    "expect": {
+      "o-18f6c2a1b3d4e-l1": {
+        "txCount": 812,
+        "logCount": 1290
+      },
+      "o-18f6c2a1b3d4e-l2": {
+        "txCount": 9,
+        "logCount": 14
+      },
+      "o-18f6c2a1b3d4e-l3": {
+        "txCount": 57,
+        "logCount": 812
+      }
+    },
+    "providers": {
+      "usage": {
+        "o-18f6c2a1b3d4e-l3": {
+          "transactions": "57",
+          "accounts": "12"
+        }
+      }
+    }
+  }
+}

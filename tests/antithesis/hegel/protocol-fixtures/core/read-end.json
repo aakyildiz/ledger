@@ -1,0 +1,72 @@
+{
+  "endpoint": "POST /read/end",
+  "request": {
+    "ticket": 913,
+    "kind": "GetAccount",
+    "request": {
+      "address": "t-3:42",
+      "ledger": "o-18f6c2a1b3d4e-l3"
+    },
+    "outcome": {
+      "ok": true,
+      "response": {
+        "address": "t-3:42",
+        "firstUsage": {
+          "data": "1793836800500000"
+        },
+        "insertionDate": {
+          "data": "1793836800500000"
+        },
+        "metadata": {
+          "tier": {
+            "stringValue": "gold"
+          }
+        },
+        "updatedAt": {
+          "data": "1793836800500000"
+        },
+        "volumes": [
+          {
+            "asset": "COIN",
+            "volumes": {
+              "balance": {
+                "magnitude": {
+                  "magnitude": "ZA=="
+                }
+              },
+              "input": {
+                "magnitude": "ZA=="
+              },
+              "output": {}
+            }
+          }
+        ]
+      },
+      "peer": "ledger-0:8888",
+      "elapsedMs": 4
+    },
+    "route": {
+      "client": 2,
+      "route": "plain",
+      "node": "",
+      "consistency": "linearizable"
+    },
+    "hint": {
+      "absentLedger": false,
+      "collapsed": false
+    },
+    "params": {}
+  },
+  "status": 200,
+  "response": {
+    "bootId": "1793836800123456789",
+    "verdict": {
+      "ok": true,
+      "skipped": false,
+      "violations": []
+    },
+    "coverage": [
+      "oracle: model outcome verified"
+    ]
+  }
+}

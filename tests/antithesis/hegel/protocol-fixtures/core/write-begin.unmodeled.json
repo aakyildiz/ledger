@@ -1,0 +1,39 @@
+{
+  "endpoint": "POST /write/begin",
+  "request": {
+    "wid": "w124",
+    "idempotencyKey": "o-18f6c2a1b3d4e-k78",
+    "requests": [
+      {
+        "apply": {
+          "action": {
+            "createTransaction": {
+              "script": {
+                "plain": "send [COIN 10] (\n  source = @world\n  destination = @t-3:7\n)\n"
+              }
+            }
+          },
+          "ledger": "o-18f6c2a1b3d4e-l3"
+        }
+      }
+    ],
+    "trackKey": false,
+    "role": "original",
+    "family": "tx",
+    "signed": false,
+    "hint": {}
+  },
+  "status": 400,
+  "response": {
+    "bootId": "1793836800123456789",
+    "error": {
+      "code": "unmodeled",
+      "message": "request 0: a createTransaction with a script is not modeled",
+      "details": {
+        "wid": "w124",
+        "index": 0,
+        "arm": "apply.createTransaction.script"
+      }
+    }
+  }
+}

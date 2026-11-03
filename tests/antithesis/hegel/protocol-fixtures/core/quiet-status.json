@@ -1,0 +1,12 @@
+{
+  "endpoint": "GET /quiet/status",
+  "request": null,
+  "status": 200,
+  "response": {
+    "bootId": "1793836800123456789",
+    "inflight": 0,
+    "reads": 0,
+    "pending": 0,
+    "quiet": false
+  }
+}

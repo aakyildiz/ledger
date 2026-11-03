@@ -1,0 +1,16 @@
+{
+  "endpoint": "POST /setup",
+  "request": {
+    "runId": "18f6c2a1b3d4e",
+    "trackedPrefix": "o-18f6c2a1b3d4e-",
+    "queryCheckpointLimit": "10",
+    "liveTarget": 4
+  },
+  "status": 200,
+  "response": {
+    "bootId": "1793836800123456789",
+    "runId": "18f6c2a1b3d4e",
+    "trackedPrefix": "o-18f6c2a1b3d4e-",
+    "version": 0
+  }
+}

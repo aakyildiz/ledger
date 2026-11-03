@@ -1,0 +1,16 @@
+{
+  "endpoint": "POST /write/abandon",
+  "request": {
+    "ticket": 914,
+    "attempts": 0
+  },
+  "status": 200,
+  "response": {
+    "bootId": "1793836800123456789",
+    "verdict": {
+      "ok": true,
+      "skipped": false,
+      "violations": []
+    }
+  }
+}

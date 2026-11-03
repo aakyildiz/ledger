@@ -1,0 +1,77 @@
+{
+  "endpoint": "POST /read/end",
+  "request": {
+    "ticket": 921,
+    "kind": "GetAccount",
+    "request": {
+      "address": "t-3:42",
+      "ledger": "o-18f6c2a1b3d4e-l3"
+    },
+    "outcome": {
+      "ok": true,
+      "response": {
+        "address": "t-3:42",
+        "firstUsage": {
+          "data": "1793836800500000"
+        },
+        "insertionDate": {
+          "data": "1793836800500000"
+        },
+        "metadata": {
+          "tier": {
+            "stringValue": "gold"
+          }
+        },
+        "updatedAt": {
+          "data": "1793836800500000"
+        },
+        "volumes": [
+          {
+            "asset": "COIN",
+            "volumes": {
+              "balance": {
+                "magnitude": {
+                  "magnitude": "yA=="
+                }
+              },
+              "input": {
+                "magnitude": "yA=="
+              },
+              "output": {}
+            }
+          }
+        ]
+      },
+      "peer": "ledger-1:8888",
+      "elapsedMs": 5
+    },
+    "route": {
+      "client": 2,
+      "route": "lib",
+      "node": "",
+      "consistency": "linearizable"
+    },
+    "hint": {},
+    "params": {}
+  },
+  "status": 200,
+  "response": {
+    "bootId": "1793836800123456789",
+    "verdict": {
+      "ok": false,
+      "skipped": false,
+      "violations": [
+        {
+          "id": "oracle: account read outside model",
+          "details": {
+            "ledger": "o-18f6c2a1b3d4e-l3",
+            "address": "t-3:42",
+            "maxTicket": 925,
+            "candidates": 2
+          }
+        }
+      ]
+    },
+    "coverage": []
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "endpoint": "GET /health",
+  "request": null,
+  "status": 200,
+  "response": {
+    "bootId": "1793836800123456789",
+    "ready": true
+  }
+}

@@ -1,0 +1,29 @@
+{
+  "endpoint": "POST /write/begin",
+  "request": {
+    "wid": "w142",
+    "idempotencyKey": "o-18f6c2a1b3d4e-k92",
+    "requests": [
+      {
+        "createQueryCheckpoint": {}
+      }
+    ],
+    "trackKey": false,
+    "role": "original",
+    "family": "checkpoints",
+    "signed": false,
+    "hint": {}
+  },
+  "status": 409,
+  "response": {
+    "bootId": "1793836800123456789",
+    "error": {
+      "code": "serialized",
+      "message": "a query checkpoint create is still undrained",
+      "details": {
+        "hook": "checkpoint",
+        "blockingTicket": 920
+      }
+    }
+  }
+}

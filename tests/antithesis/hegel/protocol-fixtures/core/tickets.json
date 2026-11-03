@@ -1,0 +1,15 @@
+{
+  "endpoint": "GET /tickets",
+  "request": null,
+  "status": 200,
+  "response": {
+    "bootId": "1793836800123456789",
+    "inflight": [
+      912,
+      914
+    ],
+    "reads": [
+      913
+    ]
+  }
+}

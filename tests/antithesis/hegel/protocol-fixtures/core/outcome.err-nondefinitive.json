@@ -1,0 +1,15 @@
+{
+  "endpoint": "outcome",
+  "request": null,
+  "status": 200,
+  "response": {
+    "ok": false,
+    "code": "Unavailable",
+    "reason": "STALE_PROPOSAL",
+    "message": "proposal is stale, retry",
+    "peer": "ledger-0:8888",
+    "elapsedMs": 9
+  },
+  "definitive": false,
+  "transient": true
+}

@@ -1,0 +1,50 @@
+{
+  "endpoint": "POST /write/begin",
+  "request": {
+    "wid": "w125",
+    "idempotencyKey": "o-18f6c2a1b3d4e-k77",
+    "requests": [
+      {
+        "apply": {
+          "action": {
+            "createTransaction": {
+              "metadata": {
+                "tier": {
+                  "stringValue": "gold"
+                }
+              },
+              "postings": [
+                {
+                  "amount": {
+                    "v0": "250"
+                  },
+                  "asset": "COIN",
+                  "destination": "t-3:42",
+                  "source": "world"
+                }
+              ],
+              "reference": "o-18f6c2a1b3d4e-ref12"
+            }
+          },
+          "ledger": "o-18f6c2a1b3d4e-l3"
+        }
+      }
+    ],
+    "trackKey": true,
+    "role": "conflict",
+    "of": "w123",
+    "family": "idempotency",
+    "signed": false,
+    "hint": {}
+  },
+  "status": 200,
+  "response": {
+    "bootId": "1793836800123456789",
+    "ticket": 915,
+    "version": 4712,
+    "predicted": {
+      "ok": false,
+      "reason": "IDEMPOTENCY_KEY_CONFLICT"
+    }
+  }
+}

@@ -1,0 +1,96 @@
+{
+  "endpoint": "outcome",
+  "request": null,
+  "status": 200,
+  "response": {
+    "ok": true,
+    "items": [
+      {
+        "id": "57",
+        "insertedAt": {
+          "data": "1793836800500000"
+        },
+        "metadata": {
+          "tier": {
+            "stringValue": "gold"
+          }
+        },
+        "postCommitVolumes": {
+          "volumesByAccount": {
+            "t-3:42": {
+              "volumes": [
+                {
+                  "asset": "COIN",
+                  "volumes": {
+                    "input": {
+                      "magnitude": "ZA=="
+                    },
+                    "output": {}
+                  }
+                }
+              ]
+            },
+            "world": {
+              "volumes": [
+                {
+                  "asset": "COIN",
+                  "volumes": {
+                    "input": {},
+                    "output": {
+                      "magnitude": "ZA=="
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        },
+        "postings": [
+          {
+            "amount": {
+              "v0": "100"
+            },
+            "asset": "COIN",
+            "destination": "t-3:42",
+            "source": "world"
+          }
+        ],
+        "reference": "o-18f6c2a1b3d4e-ref12",
+        "timestamp": {
+          "data": "1793836800500000"
+        },
+        "updatedAt": {
+          "data": "1793836800500000"
+        }
+      },
+      {
+        "id": "56",
+        "insertedAt": {
+          "data": "1793836800499000"
+        },
+        "postings": [
+          {
+            "amount": {
+              "v0": "5"
+            },
+            "asset": "COIN",
+            "destination": "t-3:7",
+            "source": "world"
+          }
+        ],
+        "timestamp": {
+          "data": "1793836800499000"
+        },
+        "updatedAt": {
+          "data": "1793836800499000"
+        }
+      }
+    ],
+    "complete": true,
+    "nextCursor": "eyJpZCI6IjU2In0",
+    "peer": "ledger-0:8888",
+    "elapsedMs": 12
+  },
+  "definitive": true,
+  "transient": false
+}

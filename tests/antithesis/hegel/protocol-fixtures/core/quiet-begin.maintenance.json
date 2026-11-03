@@ -1,0 +1,17 @@
+{
+  "endpoint": "POST /quiet/begin",
+  "request": {
+    "epoch": 8
+  },
+  "status": 409,
+  "response": {
+    "bootId": "1793836800123456789",
+    "error": {
+      "code": "not_quiet",
+      "message": "the drained model has maintenance mode on",
+      "details": {
+        "reason": "maintenance"
+      }
+    }
+  }
+}

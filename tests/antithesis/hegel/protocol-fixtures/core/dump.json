@@ -1,0 +1,34 @@
+{
+  "endpoint": "GET /dump",
+  "request": null,
+  "status": 200,
+  "response": {
+    "bootId": "1793836800123456789",
+    "version": 4711,
+    "fingerprint": "9f2c41d07ab8e3165c2d0e94f1a7b3c8",
+    "ledgers": [
+      {
+        "name": "o-18f6c2a1b3d4e-l1",
+        "live": true,
+        "txCount": 812,
+        "logCount": 1290
+      },
+      {
+        "name": "o-18f6c2a1b3d4e-l4",
+        "live": false,
+        "txCount": 3,
+        "logCount": 5
+      }
+    ],
+    "inflight": [
+      912,
+      914
+    ],
+    "pending": [
+      910
+    ],
+    "reads": [
+      913
+    ]
+  }
+}

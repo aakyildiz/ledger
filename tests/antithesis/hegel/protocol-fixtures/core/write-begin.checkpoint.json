@@ -1,0 +1,28 @@
+{
+  "endpoint": "POST /write/begin",
+  "request": {
+    "wid": "w130",
+    "idempotencyKey": "o-18f6c2a1b3d4e-k80",
+    "requests": [
+      {
+        "createQueryCheckpoint": {}
+      }
+    ],
+    "trackKey": false,
+    "role": "original",
+    "family": "checkpoints",
+    "signed": false,
+    "hint": {}
+  },
+  "status": 200,
+  "response": {
+    "bootId": "1793836800123456789",
+    "ticket": 920,
+    "version": 4711,
+    "predicted": {
+      "ok": true,
+      "reason": "",
+      "checkpointId": "7"
+    }
+  }
+}
