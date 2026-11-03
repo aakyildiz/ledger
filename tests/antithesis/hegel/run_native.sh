@@ -263,7 +263,7 @@ print(f"  oracle: {writes} /write/end, {reads} /read/end ({(writes + reads) / ma
       f"{eps.get('POST /write/begin', 0)} /write/begin, {eps.get('POST /view', 0)} /view")
 print(f"  quiet periods: {quiet_begins} /quiet/begin, {quiet_ends} /quiet/end (Q6)")
 print(f"  'oracle: model outcome verified' hits: {verified.get('hits', 0)}")
-print(f"  hegel re-entries: {drv.count('hegel callback entered again')}; slow rules: {drv.count('driver: slow rule')}")
+print(f"  hegel test cases (logged every 50th): {drv.count('hegel test case #')}; slow rules: {drv.count('driver: slow rule')}")
 print(f"  assertions seen: {len(asserts)}; findings: {len(failures)}")
 print(f"  journal: {jpath}")
 for m in whitelisted:
