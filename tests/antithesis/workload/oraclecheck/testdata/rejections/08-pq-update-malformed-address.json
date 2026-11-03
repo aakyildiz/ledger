@@ -1,0 +1,37 @@
+{
+  "name": "08-pq-update-malformed-address",
+  "setup": [
+    {
+      "createLedger": {
+        "name": "o-rej-l1",
+        "defaultEnforcementMode": "CHART_ENFORCEMENT_AUDIT"
+      }
+    },
+    {
+      "createPreparedQuery": {
+        "ledger": "o-rej-l1",
+        "query": {
+          "name": "q-1",
+          "target": "QUERY_TARGET_ACCOUNTS",
+          "filter": {
+            "address": {
+              "paramPrefix": "p0"
+            }
+          }
+        }
+      }
+    }
+  ],
+  "requests": [
+    {
+      "updatePreparedQuery": {
+        "ledger": "o-rej-l1",
+        "name": "q-1",
+        "filter": {
+          "address": {}
+        }
+      }
+    }
+  ],
+  "expectReason": "FILTER_COMPILATION_ERROR"
+}

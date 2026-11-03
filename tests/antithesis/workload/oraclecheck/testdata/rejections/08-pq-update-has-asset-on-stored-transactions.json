@@ -1,0 +1,40 @@
+{
+  "name": "08-pq-update-has-asset-on-stored-transactions",
+  "setup": [
+    {
+      "createLedger": {
+        "name": "o-rej-l1",
+        "defaultEnforcementMode": "CHART_ENFORCEMENT_AUDIT"
+      }
+    },
+    {
+      "createPreparedQuery": {
+        "ledger": "o-rej-l1",
+        "query": {
+          "name": "q-1",
+          "target": "QUERY_TARGET_TRANSACTIONS",
+          "filter": {
+            "address": {
+              "hardcodedPrefix": "users:"
+            }
+          }
+        }
+      }
+    }
+  ],
+  "requests": [
+    {
+      "updatePreparedQuery": {
+        "ledger": "o-rej-l1",
+        "name": "q-1",
+        "filter": {
+          "accountHasAsset": {
+            "assetBase": "USD",
+            "precision": 2
+          }
+        }
+      }
+    }
+  ],
+  "expectReason": "FILTER_COMPILATION_ERROR"
+}
