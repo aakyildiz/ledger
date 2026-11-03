@@ -1,18 +1,22 @@
 //! Task 07: indexes, typed metadata, driver-polled readiness, retype
 //! windows, index introspection and inspection.
 //!
-//! Rules: `index_bootstrap`, `schema_bulk`, `index_op`,
+//! Rules: `index_bootstrap`, `metadata_index_bootstrap`, `schema_bulk`, `index_op`,
 //! `typed_metadata_cycle`, `index_poll`, `index_introspect`,
 //! `inspect_index`. Order gens: `schema_set`, `schema_remove`.
 //! Every tracked verdict comes from the oracle (`indexcheck`); the driver
 //! re-asserts only the deterministic `MD/parallel_driver_typed_metadata`
-//! literals on its rule-owned key, and the `INDEX_BUILDING` write
-//! exploration.
+//! literals on its rule-owned key. The `INDEX_BUILDING` write exploration
+//! lives in `write::explore_attempt`, on every tracked attempt (the only
+//! write-path `INDEX_BUILDING` is a `createQueryCheckpoint` while the audit
+//! projection rebuilds).
 use crate::clients::{CallOpts, Outcome, Route};
 use crate::draw;
 use crate::machine::{rule, Driver};
+use crate::rules::filters::{active_metadata_index_keys, Target};
+use crate::rules::lists::KeyListPlan;
 use crate::read::{unresolved, LedgerSel, ViewReq};
-use crate::write::{AttemptRecord, BulkCtx, OrderGen, WritePlan, WriteResult, IN_RULE_BUDGET};
+use crate::write::{BulkCtx, OrderGen, WritePlan, WriteResult, IN_RULE_BUDGET};
 use hegel::stateful::ConcurrentRule;
 use hegel::TestCase;
 use serde_json::{json, Value};
@@ -26,6 +30,7 @@ const FAMILY: &str = "indexes";
 pub fn rules() -> Vec<ConcurrentRule<Driver>> {
     vec![
         rule("index_bootstrap", 1.0, index_bootstrap),
+        rule("metadata_index_bootstrap", 1.0, metadata_index_bootstrap),
         rule("schema_bulk", 0.6, schema_bulk),
         rule("index_op", 1.0, index_op),
         rule("typed_metadata_cycle", 0.5, typed_metadata_cycle),
@@ -154,21 +159,9 @@ fn ledger_of(v: &Value) -> Option<String> {
     v.get("ledger").and_then(Value::as_str).map(str::to_string)
 }
 
-/// The family's exploration on the attempt log of each of its writes
-/// (DESIGN §4.9: `INDEX_BUILDING` belongs to task 07).
-fn explore_attempts(attempts: &[AttemptRecord]) {
-    for a in attempts {
-        if a.reason == "INDEX_BUILDING" {
-            check_sometimes!(true, "a write attempt is refused while an index builds", json!({"code": a.code}));
-        }
-    }
-}
-
 fn dispatch_one(d: &Driver, plan: WritePlan) -> Option<WriteResult> {
     let unit = d.s.slots.try_acquire_up_to(1)?.take_one()?;
-    let res = d.dispatch(plan, unit);
-    explore_attempts(res.attempts());
-    Some(res)
+    Some(d.dispatch(plan, unit))
 }
 
 // ---------------------------------------------------------------- order gens
@@ -229,15 +222,155 @@ pub fn index_bootstrap(d: &Driver, tc: TestCase) {
     });
 }
 
+// ---------------------------------------------------------------- metadata_index_bootstrap
+
+/// The metadata indexes kept on `o-<run>-l1`: (target, key, declared type).
+/// Non-reserved, so list queries can filter on them and the per-target
+/// metadata-index coverage probes and retype windows become reachable early
+/// in every timeline.
+pub const META_INDEX_SEEDS: [(&str, &str, &str); 2] = [("TARGET_TYPE_ACCOUNT", "k0", "METADATA_TYPE_STRING"), ("TARGET_TYPE_TRANSACTION", "k1", "METADATA_TYPE_INT64")];
+
+/// Set once every seed index existed in the model (or its create reached a
+/// definitive success / `INDEX_ALREADY_EXISTS`).
+#[derive(Default)]
+pub struct MetaIndexBootstrap {
+    pub done: AtomicBool,
+}
+
+fn has_index(lv: &Value, canonical: &str) -> bool {
+    lv["indexes"].as_array().is_some_and(|a| a.iter().any(|e| e["canonical"] == canonical))
+}
+
+/// The steps still missing on l1 (pure): per seed whose index the model
+/// lacks, a `setMetadataFieldType` (unless already declared with the seed's
+/// type), then a `createIndex`, each its own tracked write (a create must
+/// see the declaration committed).
+pub fn meta_bootstrap_steps(ledger: &str, lv: &Value) -> Vec<Value> {
+    let field = |t: &str| if t == "TARGET_TYPE_ACCOUNT" { "account" } else { "transaction" };
+    let mut out = Vec::new();
+    for (t, k, ty) in META_INDEX_SEEDS {
+        if has_index(lv, &format!("metadata:{t}:{k}")) {
+            continue;
+        }
+        if lv["fieldTypes"][field(t)][k] != ty {
+            out.push(set_field_type(ledger, t, k, ty));
+        }
+        out.push(create_index(ledger, metadata_index_id(t, k)));
+    }
+    out
+}
+
+/// Declares and indexes the seed keys on l1 as separate tracked writes:
+/// `chance(1/2)` per run until done, then `chance(1/8)` to re-create a seed
+/// index a drop or a field-type removal took away.
+pub fn metadata_index_bootstrap(d: &Driver, tc: TestCase) {
+    d.guarded("metadata_index_bootstrap", &tc, |d, tc| {
+        if !d.s.oracle_ok() {
+            return None;
+        }
+        let st = d.s.ext::<MetaIndexBootstrap>();
+        let p = if st.done.load(Ordering::SeqCst) { 1.0 / 8.0 } else { 0.5 };
+        if !draw::chance(tc, p) {
+            return None;
+        }
+        let ledger = format!("{}l1", d.s.tracked_prefix());
+        let views = d.view(&[ViewReq::ledger(LedgerSel::Name(ledger.clone()))])?;
+        let lv = views.first()?;
+        if unresolved(lv) {
+            return None;
+        }
+        // Every step's plan is drawn before the first write (as in
+        // `typed_metadata_cycle`), so the draws do not depend on outcomes.
+        let plans: Vec<(bool, WritePlan)> = meta_bootstrap_steps(&ledger, lv)
+            .into_iter()
+            .enumerate()
+            .map(|(i, req)| {
+                let create = req.get("createIndex").is_some();
+                let mut plan = WritePlan::drawn(FAMILY, vec![req], d, tc);
+                plan.hint = json!({"gen": "metadata_index_bootstrap", "step": i});
+                (create, plan)
+            })
+            .collect();
+        let deadline = Instant::now() + CHAIN_BUDGET;
+        for (create, plan) in plans {
+            let now = Instant::now();
+            if now >= deadline {
+                return None;
+            }
+            let unit = d.s.slots.try_acquire_up_to(1)?.take_one()?;
+            let ticket = d.begin_write(plan, unit).ok()?;
+            let res = ticket.run((deadline - now).min(IN_RULE_BUDGET));
+            let out = res.outcome()?; // a handoff ends the attempt
+            if !(out.ok || (create && out.reason == "INDEX_ALREADY_EXISTS")) {
+                return None;
+            }
+        }
+        st.done.store(true, Ordering::SeqCst);
+        Some(())
+    });
+}
+
 // ---------------------------------------------------------------- schema_bulk
 
-/// The family's local bulk: 1–2 orders of its own gens on a drawn ledger.
+/// The types a retype probe re-declares an indexed key to (when it does not
+/// re-declare the current type).
+const RETYPE_TYPES: [&str; 4] = ["METADATA_TYPE_STRING", "METADATA_TYPE_INT64", "METADATA_TYPE_BOOL", "METADATA_TYPE_UINT64"];
+
+/// A retype of a declared key with an active, non-reserved metadata index
+/// (pure): the target, the key and the `setMetadataFieldType`. `same`
+/// re-declares the current type (a window opens either way, model.go
+/// `applySetMetadataFieldType`).
+pub fn plan_retype(ledger: &str, lv: &Value, seed: u32, same: bool, ty: &str) -> Option<(Target, String, Value)> {
+    let mut cands: Vec<(&str, String, String)> = Vec::new();
+    for t in INDEXABLE_TARGETS {
+        let field = if t == "TARGET_TYPE_ACCOUNT" { "account" } else { "transaction" };
+        let declared = declared_keys(lv, t);
+        for k in active_metadata_index_keys(lv, t) {
+            if declared.contains(&k) {
+                let cur = lv["fieldTypes"][field][k.as_str()].as_str().unwrap_or("").to_string();
+                cands.push((t, k, cur));
+            }
+        }
+    }
+    if cands.is_empty() {
+        return None;
+    }
+    let (t, k, cur) = &cands[seed as usize % cands.len()];
+    let new_ty = if same && !cur.is_empty() { cur.as_str() } else { ty };
+    let target = if *t == "TARGET_TYPE_ACCOUNT" { Target::Accounts } else { Target::Transactions };
+    Some((target, k.clone(), set_field_type(ledger, t, k, new_ty)))
+}
+
+/// The family's local bulk: 1–2 orders of its own gens on a drawn ledger;
+/// 1/4 of the time first a retype probe on l1: re-declare the type of a key
+/// with an active metadata index, then list on that key right away, so a
+/// page is served while its retype window is open.
 pub fn schema_bulk(d: &Driver, tc: TestCase) {
     d.guarded("schema_bulk", &tc, |d, tc| {
         if !d.s.oracle_ok() {
             return None;
         }
         let pick = draw::ledger_pick(tc);
+        let retype = draw::chance(tc, 0.25);
+        if retype {
+            let seed = draw::int_in(tc, 0, u32::MAX as u64) as u32;
+            let same = draw::chance(tc, 0.5);
+            let ty = *draw::one_of(tc, &RETYPE_TYPES);
+            let probe = KeyListPlan::draw(d, tc);
+            let ledger = format!("{}l1", d.s.tracked_prefix());
+            let views = d.view(&[ViewReq::ledger(LedgerSel::Name(ledger.clone()))])?;
+            let lv = views.first()?;
+            if !unresolved(lv) {
+                if let Some((target, key, req)) = plan_retype(&ledger, lv, seed, same, ty) {
+                    let mut plan = WritePlan::drawn(FAMILY, vec![req], d, tc);
+                    plan.hint = json!({"gen": "schema_bulk", "retype": key});
+                    if dispatch_one(d, plan)?.is_success() {
+                        probe.run(d, &ledger, target, &key);
+                    }
+                    return Some(());
+                }
+            }
+        }
         let views = d.view(&[ViewReq::ledger(LedgerSel::Pick(pick))])?;
         let lv = views.first()?;
         let ledger = ledger_of(lv)?;
@@ -265,6 +398,12 @@ pub fn plan_index_op(tc: &TestCase, ledger: &str, ledger_view: &Value, gaps: &[V
     let p_create = if gaps.is_empty() { 1.0 / 8.0 } else { 1.0 / 3.0 };
     let pool = index_pool(ledger_view);
     if draw::chance(tc, p_create) {
+        // Metadata gaps first (3/4): the builtins are bootstrapped, and a
+        // metadata index is what the field-leaf queries need.
+        let meta: Vec<&Value> = gaps.iter().filter(|g| g["id"].get("metadata").is_some()).collect();
+        if !meta.is_empty() && draw::chance(tc, 0.75) {
+            return create_index(ledger, meta[draw::pick(tc, meta.len())]["id"].clone());
+        }
         if !gaps.is_empty() {
             return create_index(ledger, gaps[draw::pick(tc, gaps.len())]["id"].clone());
         }
@@ -450,7 +589,6 @@ pub fn typed_metadata_cycle(d: &Driver, tc: TestCase) {
             let unit = d.s.slots.try_acquire_up_to(1)?.take_one()?;
             let ticket = d.begin_write(plan, unit).ok()?;
             let res = ticket.run((deadline - now).min(IN_RULE_BUDGET));
-            explore_attempts(res.attempts());
             let out = res.outcome()?.clone(); // a handoff ends the cycle
             check_step(check, &out, json!({"ledger": ledger, "n": n, "step": i, "outcome": out.summary()}));
             if !out.ok {
@@ -936,10 +1074,148 @@ mod tests {
     }
 
     #[test]
-    fn index_building_attempts_are_explored() {
-        testkit::reset();
-        explore_attempts(&[AttemptRecord { op_id: 1, class: crate::clients::OutcomeClass::NonDefinitive, code: "Unavailable".into(), reason: "INDEX_BUILDING".into() }]);
-        assert!(testkit::fired("a write attempt is refused while an index builds"));
+    fn meta_bootstrap_steps_follow_the_model() {
+        let empty = json!({"fieldTypes": {"account": {}, "transaction": {}}, "indexes": []});
+        let steps = meta_bootstrap_steps("o-test-l1", &empty);
+        assert_eq!(steps.len(), 4);
+        assert_eq!(steps[0], set_field_type("o-test-l1", "TARGET_TYPE_ACCOUNT", "k0", "METADATA_TYPE_STRING"));
+        assert_eq!(steps[1], create_index("o-test-l1", metadata_index_id("TARGET_TYPE_ACCOUNT", "k0")));
+        assert_eq!(steps[2], set_field_type("o-test-l1", "TARGET_TYPE_TRANSACTION", "k1", "METADATA_TYPE_INT64"));
+        assert_eq!(steps[3], create_index("o-test-l1", metadata_index_id("TARGET_TYPE_TRANSACTION", "k1")));
+        // Declared with the seed type: only the create. Indexed (any state): nothing.
+        let partial = json!({"fieldTypes": {"account": {"k0": "METADATA_TYPE_STRING"}, "transaction": {"k1": "METADATA_TYPE_BOOL"}},
+            "indexes": [{"canonical": "metadata:TARGET_TYPE_ACCOUNT:k0", "state": "ambiguous"}]});
+        let steps = meta_bootstrap_steps("o-test-l1", &partial);
+        assert_eq!(steps, vec![set_field_type("o-test-l1", "TARGET_TYPE_TRANSACTION", "k1", "METADATA_TYPE_INT64"), create_index("o-test-l1", metadata_index_id("TARGET_TYPE_TRANSACTION", "k1"))]);
+        let partial2 = json!({"fieldTypes": {"account": {}, "transaction": {"k1": "METADATA_TYPE_INT64"}},
+            "indexes": [{"canonical": "metadata:TARGET_TYPE_ACCOUNT:k0", "state": "active"}]});
+        assert_eq!(meta_bootstrap_steps("o-test-l1", &partial2), vec![create_index("o-test-l1", metadata_index_id("TARGET_TYPE_TRANSACTION", "k1"))]);
+    }
+
+    #[test]
+    fn metadata_index_bootstrap_sends_separate_tracked_writes_then_stops() {
+        let (d, _, fo) = testkit::driver();
+        fo.set_view("ledger", json!({"fieldTypes": {"account": {}, "transaction": {}}, "indexes": []}));
+        let st = d.s.ext::<MetaIndexBootstrap>();
+        for _ in 0..40 {
+            if st.done.load(Ordering::SeqCst) {
+                break;
+            }
+            testkit::run_rule(&d, metadata_index_bootstrap);
+        }
+        assert!(st.done.load(Ordering::SeqCst));
+        let begins = fo.calls("/write/begin");
+        assert_eq!(begins.len(), 4, "declare + create per target, one write each");
+        for b in &begins {
+            let reqs = b["requests"].as_array().unwrap();
+            assert_eq!(reqs.len(), 1, "never a declaration and its create in one bulk");
+            assert!(!reserved(&reqs[0]));
+        }
+        assert!(begins[0]["requests"][0]["setMetadataFieldType"].is_object());
+        assert_eq!(begins[1]["requests"][0]["createIndex"]["ledger"], "o-test-l1");
+        assert!(fo.calls("/view").iter().all(|v| !v.to_string().contains("\"owned\":true")), "a public view: no reserved key is read");
+        // The model has both indexes: re-armed runs send nothing.
+        fo.set_view("ledger", json!({"fieldTypes": {"account": {"k0": "METADATA_TYPE_STRING"}, "transaction": {"k1": "METADATA_TYPE_INT64"}},
+            "indexes": [{"canonical": "metadata:TARGET_TYPE_ACCOUNT:k0", "state": "active"}, {"canonical": "metadata:TARGET_TYPE_TRANSACTION:k1", "state": "active"}]}));
+        for _ in 0..40 {
+            testkit::run_rule(&d, metadata_index_bootstrap);
+        }
+        assert_eq!(fo.calls("/write/begin").len(), 4);
+        assert!(d.s.registry.snapshot().is_empty());
+    }
+
+    #[test]
+    fn metadata_index_bootstrap_accepts_an_existing_index() {
+        let (d, ft, fo) = testkit::driver();
+        fo.set_view("ledger", json!({"fieldTypes": {"account": {"k0": "METADATA_TYPE_STRING"}, "transaction": {"k1": "METADATA_TYPE_INT64"}}, "indexes": []}));
+        ft.set_default("bucket", "Apply", FakeReply::Outcome(Outcome { ok: false, code: "AlreadyExists".into(), reason: "INDEX_ALREADY_EXISTS".into(), ..Default::default() }));
+        let st = d.s.ext::<MetaIndexBootstrap>();
+        for _ in 0..40 {
+            if st.done.load(Ordering::SeqCst) {
+                break;
+            }
+            testkit::run_rule(&d, metadata_index_bootstrap);
+        }
+        assert!(st.done.load(Ordering::SeqCst));
+        assert_eq!(fo.calls("/write/begin").len(), 2);
+    }
+
+    #[test]
+    fn index_op_prefers_metadata_gaps() {
+        let lv = view_with(&["k0"], &["k1"]);
+        let gaps = vec![
+            json!({"canonical": "tx:TX_BUILTIN_INDEX_REFERENCE", "id": tx_builtin_id("TX_BUILTIN_INDEX_REFERENCE")}),
+            json!({"canonical": "tx:TX_BUILTIN_INDEX_TIMESTAMP", "id": tx_builtin_id("TX_BUILTIN_INDEX_TIMESTAMP")}),
+            json!({"canonical": "acct:ACCT_BUILTIN_INDEX_ASSET", "id": asset_index_id()}),
+            json!({"canonical": "metadata:TARGET_TYPE_ACCOUNT:k0", "id": metadata_index_id("TARGET_TYPE_ACCOUNT", "k0")}),
+        ];
+        let (meta, builtin) = (std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0));
+        testkit::with_tc_n(600, |tc| {
+            let r = plan_index_op(tc, "o-test-l1", &lv, &gaps);
+            if let Some(ci) = r.get("createIndex") {
+                match ci["id"].get("metadata") {
+                    Some(m) if m["key"] == "k0" => meta.fetch_add(1, Ordering::SeqCst),
+                    Some(_) => 0,
+                    None => builtin.fetch_add(1, Ordering::SeqCst),
+                };
+            }
+        });
+        let (m, b) = (meta.load(Ordering::SeqCst), builtin.load(Ordering::SeqCst));
+        assert!(m > 2 * b, "metadata gap {m} vs builtin gaps {b}");
+        assert!(b > 0, "builtin gaps still created");
+    }
+
+    #[test]
+    fn plan_retype_targets_active_non_reserved_indexed_keys() {
+        let lv = json!({"fieldTypes": {"account": {"k0": "METADATA_TYPE_STRING", "k2": "METADATA_TYPE_BOOL", "own-bad": "METADATA_TYPE_INT64"}, "transaction": {"k1": "METADATA_TYPE_INT64"}},
+            "indexes": [
+                {"canonical": "metadata:TARGET_TYPE_ACCOUNT:k0", "state": "active"},
+                {"canonical": "metadata:TARGET_TYPE_ACCOUNT:k2", "state": "ambiguous"},
+                {"canonical": "metadata:TARGET_TYPE_ACCOUNT:own-bad", "state": "active"},
+                {"canonical": "metadata:TARGET_TYPE_TRANSACTION:k1", "state": "active"},
+            ]});
+        let mut seen = BTreeSet::new();
+        for seed in 0..8u32 {
+            let (t, k, req) = plan_retype("o-test-l1", &lv, seed, false, "METADATA_TYPE_BOOL").unwrap();
+            let s = &req["setMetadataFieldType"];
+            assert_eq!(s["key"], k.as_str());
+            assert_eq!(s["type"], "METADATA_TYPE_BOOL");
+            match k.as_str() {
+                "k0" => assert_eq!((t, s["targetType"].as_str().unwrap()), (Target::Accounts, "TARGET_TYPE_ACCOUNT")),
+                "k1" => assert_eq!((t, s["targetType"].as_str().unwrap()), (Target::Transactions, "TARGET_TYPE_TRANSACTION")),
+                other => panic!("retype of a key without an active, non-reserved index: {other}"),
+            }
+            seen.insert(k);
+        }
+        assert_eq!(seen.len(), 2);
+        let (_, k, req) = plan_retype("o-test-l1", &lv, 0, true, "METADATA_TYPE_BOOL").unwrap();
+        let want = if k == "k0" { "METADATA_TYPE_STRING" } else { "METADATA_TYPE_INT64" };
+        assert_eq!(req["setMetadataFieldType"]["type"], want, "same: the current type re-declared");
+        assert!(plan_retype("o-test-l1", &json!({"fieldTypes": {"account": {"k0": "METADATA_TYPE_STRING"}}, "indexes": []}), 0, false, "METADATA_TYPE_BOOL").is_none());
+    }
+
+    #[test]
+    fn schema_bulk_retype_probe_lists_on_the_retyped_key() {
+        let (d, ft, fo) = testkit::driver();
+        fo.set_view("ledger", json!({"fieldTypes": {"account": {"k0": "METADATA_TYPE_STRING"}, "transaction": {"k1": "METADATA_TYPE_INT64"}},
+            "indexes": [{"canonical": "metadata:TARGET_TYPE_ACCOUNT:k0", "state": "active"}, {"canonical": "metadata:TARGET_TYPE_TRANSACTION:k1", "state": "active"}]}));
+        ft.set_default("bucket", "ListAccounts", FakeReply::Outcome(Outcome { ok: true, items: Some(vec![]), complete: true, ..Default::default() }));
+        ft.set_default("bucket", "ListTransactions", FakeReply::Outcome(Outcome { ok: true, items: Some(vec![]), complete: true, ..Default::default() }));
+        for _ in 0..40 {
+            testkit::run_rule(&d, schema_bulk);
+        }
+        let retypes: Vec<Value> = fo.calls("/write/begin").into_iter().filter(|b| b["hint"]["retype"].is_string()).collect();
+        assert!(!retypes.is_empty(), "a retype probe ran");
+        let probes: Vec<Value> = fo.calls("/read/end").into_iter().filter(|e| e["hint"]["gen"] == "retype_probe").collect();
+        assert_eq!(probes.len(), retypes.len(), "one list per committed retype");
+        for (w, r) in retypes.iter().zip(&probes) {
+            let key = w["hint"]["retype"].as_str().unwrap();
+            let tt = w["requests"][0]["setMetadataFieldType"]["targetType"].as_str().unwrap();
+            assert_eq!(r["kind"], if tt == "TARGET_TYPE_ACCOUNT" { "ListAccounts" } else { "ListTransactions" });
+            assert_eq!(r["request"]["ledger"], "o-test-l1");
+            assert!(r["request"]["options"]["filter"].to_string().contains(&format!("\"metadata\":\"{key}\"")), "{r}");
+        }
+        assert!(d.s.registry.snapshot().is_empty());
     }
 
     #[test]

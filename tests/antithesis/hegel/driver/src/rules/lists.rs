@@ -65,6 +65,20 @@ fn ref_probe(d: &Driver, tc: &TestCase) -> String {
     format!("{}ref{}", d.s.tracked_prefix(), int_in(tc, 0, 4096))
 }
 
+/// 1/4 of the account and transaction list queries aim at `o-<run>-l1`
+/// (never deleted), where `metadata_index_bootstrap` keeps a metadata index
+/// per indexable target; the rest draw a live ledger.
+const AIM_L1: f64 = 0.25;
+
+fn aimed_ledger(d: &Driver, tc: &TestCase) -> LedgerSel {
+    let pick = draw::ledger_pick(tc);
+    if chance(tc, AIM_L1) {
+        LedgerSel::Name(format!("{}l1", d.s.tracked_prefix()))
+    } else {
+        LedgerSel::Pick(pick)
+    }
+}
+
 /// `list_accounts` (M `runAccountQuery`): filter per `genAccountFilter` then
 /// `rollFilterShape`, reverse 1/2, a pool address cursor 1/2.
 pub fn list_accounts(d: &Driver, tc: TestCase) {
@@ -72,7 +86,7 @@ pub fn list_accounts(d: &Driver, tc: TestCase) {
         if !d.s.oracle_ok() {
             return None;
         }
-        let pick = draw::ledger_pick(tc);
+        let sel = aimed_ledger(d, tc);
         let plan = filters::gen_account_filter(tc);
         let shape = filters::draw_shape(tc, matches!(plan, Plan::Universe));
         let page_size = draw::page_size(tc);
@@ -80,7 +94,7 @@ pub fn list_accounts(d: &Driver, tc: TestCase) {
         let cursor = if chance(tc, 0.5) { filters::page_token(&draw::pool_address(tc)) } else { String::new() };
         let route = draw::route(tc, &d.s);
 
-        let rt = d.read_begin("ListAccounts", &[ViewReq::ledger(LedgerSel::Pick(pick))], json!({}))?;
+        let rt = d.read_begin("ListAccounts", &[ViewReq::ledger(sel)], json!({}))?;
         let ctx = FilterCtx::from_views(&rt.views()[0], None, None);
         let filter = shape.apply(plan.resolve(&ctx));
         let req = json!({"ledger": ctx.ledger, "options": options(page_size, &cursor, reverse, filter)});
@@ -91,6 +105,42 @@ pub fn list_accounts(d: &Driver, tc: TestCase) {
     });
 }
 
+/// Pre-drawn list query whose filter is one Field leaf on a given key: the
+/// read right after a retype of an indexed key (`schema_bulk`), so a page is
+/// served while the key's retype window is open.
+pub struct KeyListPlan {
+    field: filters::FieldPlan,
+    page_size: u64,
+    reverse: bool,
+    route: Route,
+}
+
+impl KeyListPlan {
+    pub fn draw(d: &Driver, tc: &TestCase) -> KeyListPlan {
+        KeyListPlan { field: filters::draw_field(tc), page_size: draw::page_size(tc), reverse: chance(tc, 0.5), route: draw::route(tc, &d.s) }
+    }
+
+    /// One validated ListAccounts / ListTransactions page on `ledger`
+    /// filtered on `key`; abandoned if the key is no longer declared.
+    pub fn run(&self, d: &Driver, ledger: &str, target: filters::Target, key: &str) -> Option<()> {
+        let (kind, method): (&'static str, &str) = match target {
+            filters::Target::Transactions => ("ListTransactions", "ListTransactions"),
+            _ => ("ListAccounts", "ListAccounts"),
+        };
+        let rt = d.read_begin(kind, &[ViewReq::ledger(LedgerSel::Name(ledger.to_string()))], json!({}))?;
+        let ctx = FilterCtx::from_views(&rt.views()[0], None, None);
+        let Some(filter) = self.field.resolve_key(filters::seeds(&ctx, target), key) else {
+            rt.abandon();
+            return None;
+        };
+        let req = json!({"ledger": ctx.ledger, "options": options(self.page_size, "", self.reverse, Some(filter))});
+        let opts = list_opts(self.page_size);
+        let (_, out) = d.call(&self.route, "bucket", method, req.clone(), &opts);
+        rt.end(&req, &out, &self.route, &opts, json!({"gen": "retype_probe"}), json!({}));
+        Some(())
+    }
+}
+
 /// `list_transactions` (M `runTransactionQuery`): filter per
 /// `genTransactionFilter` (or the unsupported-builtin probe 1/24, unshaped),
 /// a malformed cursor 1/16, else an `afterID` in 1..=256 1/2.
@@ -99,7 +149,7 @@ pub fn list_transactions(d: &Driver, tc: TestCase) {
         if !d.s.oracle_ok() {
             return None;
         }
-        let pick = draw::ledger_pick(tc);
+        let sel = aimed_ledger(d, tc);
         let probe = ref_probe(d, tc);
         let plan = filters::gen_transaction_filter(tc);
         let (plan, shape) = match filters::roll_unsupported_builtin(tc) {
@@ -118,7 +168,6 @@ pub fn list_transactions(d: &Driver, tc: TestCase) {
         };
         let route = draw::route(tc, &d.s);
 
-        let sel = LedgerSel::Pick(pick);
         let rt = d.read_begin("ListTransactions", &[ViewReq::ledger(sel.clone()), ViewReq::seek(sel.clone(), "txByRef", &probe, None), ViewReq::stamps(sel)], json!({}))?;
         let v = rt.views();
         let ctx = FilterCtx::from_views(&v[0], Some(&v[1]), Some(&v[2]));

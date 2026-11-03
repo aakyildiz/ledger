@@ -251,6 +251,11 @@ pub struct FilterCtx {
     /// Declared (key, type) pairs per target, sorted by key.
     pub account_fields: Vec<(String, String)>,
     pub tx_fields: Vec<(String, String)>,
+    /// Keys with an active (model) metadata index per target, sorted: a
+    /// field leaf aims at them with high probability, so index-served
+    /// metadata pages (and retype windows) are reachable.
+    pub account_indexed: Vec<String>,
+    pub tx_indexed: Vec<String>,
     /// A committed reference (`seek(txByRef)`), if any.
     pub reference: Option<String>,
     /// Learned transaction timestamps (`stamps.txDates`).
@@ -267,6 +272,25 @@ fn field_list(v: &Value) -> Vec<(String, String)> {
     out
 }
 
+/// The non-reserved keys of the ledger view's active metadata indexes on one
+/// target (canonical `metadata:<TARGET_TYPE_…>:<key>`).
+pub fn active_metadata_index_keys(ledger_view: &Value, target: &str) -> Vec<String> {
+    let prefix = format!("metadata:{target}:");
+    let mut out: Vec<String> = ledger_view["indexes"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter(|e| e["state"] == "active")
+                .filter_map(|e| e["canonical"].as_str()?.strip_prefix(prefix.as_str()).map(str::to_string))
+                .filter(|k| !k.starts_with("own-"))
+                .collect()
+        })
+        .unwrap_or_default();
+    out.sort();
+    out.dedup();
+    out
+}
+
 fn u64_list(v: Option<&Value>) -> Vec<u64> {
     v.and_then(Value::as_array).map(|a| a.iter().filter_map(|x| x.as_str().and_then(|s| s.parse().ok()).or_else(|| x.as_u64())).collect()).unwrap_or_default()
 }
@@ -280,6 +304,8 @@ impl FilterCtx {
             ledger: ledger_view["ledger"].as_str().or_else(|| ledger_view["name"].as_str()).unwrap_or("").to_string(),
             account_fields: field_list(&ft["account"]),
             tx_fields: field_list(&ft["transaction"]),
+            account_indexed: active_metadata_index_keys(ledger_view, "TARGET_TYPE_ACCOUNT"),
+            tx_indexed: active_metadata_index_keys(ledger_view, "TARGET_TYPE_TRANSACTION"),
             reference: seek_ref.filter(|s| s["found"].as_bool() == Some(true)).and_then(|s| s["entry"]["reference"].as_str()).map(str::to_string),
             tx_stamps: u64_list(stamps.and_then(|s| s.get("txDates"))),
             log_dates: u64_list(stamps.and_then(|s| s.get("logDates"))),
@@ -311,6 +337,8 @@ fn draw_bound(tc: &TestCase) -> BoundPlan {
 #[derive(Clone, Debug)]
 pub struct FieldPlan {
     seed: u32,
+    /// Aim at a key with an active metadata index when there is one (3/4).
+    prefer_indexed: bool,
     exists: bool,
     include_null: bool,
     str_hit: bool,
@@ -325,9 +353,10 @@ pub struct FieldPlan {
 /// Metadata string values the generators write (`draw::meta_value` pool).
 const META_STRINGS: [&str; 11] = ["v0", "7", "42", "true", "false", "200", "-1", "-200", "40000", "5000000000", "030"];
 
-fn draw_field(tc: &TestCase) -> FieldPlan {
+pub fn draw_field(tc: &TestCase) -> FieldPlan {
     FieldPlan {
         seed: pick_u32(tc),
+        prefer_indexed: !one_in(tc, 4),
         exists: one_in(tc, 6),
         include_null: one_in(tc, 2),
         str_hit: !one_in(tc, 4),
@@ -345,7 +374,25 @@ fn is_unsigned(t: &str) -> bool {
 }
 
 impl FieldPlan {
-    fn resolve(&self, seeds: &[(String, String)]) -> Option<Value> {
+    /// The leaf on a declared key: 3/4 one with an active metadata index
+    /// (when any is declared), else any declared key.
+    fn resolve(&self, seeds: &[(String, String)], indexed: &[String]) -> Option<Value> {
+        if self.prefer_indexed {
+            let hot: Vec<(String, String)> = seeds.iter().filter(|(k, _)| indexed.contains(k)).cloned().collect();
+            if !hot.is_empty() {
+                return self.resolve_on(&hot);
+            }
+        }
+        self.resolve_on(seeds)
+    }
+
+    /// The leaf on exactly `key` (with its declared type), if declared.
+    pub fn resolve_key(&self, seeds: &[(String, String)], key: &str) -> Option<Value> {
+        let one: Vec<(String, String)> = seeds.iter().filter(|(k, _)| k == key).cloned().collect();
+        self.resolve_on(&one)
+    }
+
+    fn resolve_on(&self, seeds: &[(String, String)]) -> Option<Value> {
         if seeds.is_empty() {
             return None;
         }
@@ -530,7 +577,7 @@ impl Plan {
             Plan::And(c) => and(c.iter().map(|p| p.resolve(ctx).unwrap_or_else(|| json!({}))).collect()),
             Plan::Or(c) => or(c.iter().map(|p| p.resolve(ctx).unwrap_or_else(|| json!({}))).collect()),
             Plan::Not(c) => not(c.resolve(ctx).unwrap_or_else(|| json!({}))),
-            Plan::Field { target, plan, fallback } => match plan.resolve(seeds(ctx, *target)) {
+            Plan::Field { target, plan, fallback } => match plan.resolve(seeds(ctx, *target), indexed(ctx, *target)) {
                 Some(v) => v,
                 None => return fallback.resolve(ctx),
             },
@@ -557,7 +604,14 @@ impl Plan {
     }
 }
 
-fn seeds(ctx: &FilterCtx, target: Target) -> &[(String, String)] {
+fn indexed(ctx: &FilterCtx, target: Target) -> &[String] {
+    match target {
+        Target::Transactions => &ctx.tx_indexed,
+        _ => &ctx.account_indexed,
+    }
+}
+
+pub fn seeds(ctx: &FilterCtx, target: Target) -> &[(String, String)] {
     match target {
         Target::Transactions => &ctx.tx_fields,
         _ => &ctx.account_fields,
@@ -1158,6 +1212,8 @@ mod tests {
             ledger: "o-test-l3".into(),
             account_fields: vec![("k0".into(), "METADATA_TYPE_STRING".into()), ("k2".into(), "METADATA_TYPE_BOOL".into())],
             tx_fields: vec![("k1".into(), "METADATA_TYPE_INT64".into()), ("k3".into(), "METADATA_TYPE_UINT64".into())],
+            account_indexed: vec![],
+            tx_indexed: vec![],
             reference: Some("o-test-ref7".into()),
             tx_stamps: vec![1_700_000_000_000_000, 1_700_000_000_000_100],
             log_dates: vec![1_700_000_000_000_050],
@@ -1311,7 +1367,7 @@ mod tests {
     #[test]
     fn plans_resolve_against_the_views() {
         let c = ctx();
-        let fp = FieldPlan { seed: 0, exists: false, include_null: false, str_hit: false, str_value: 0, bool_value: true, center: 10, lo: BoundPlan { open: false, extremum: None, delta: 3, exclusive: false }, hi: BoundPlan { open: true, extremum: None, delta: 0, exclusive: false }, split: false };
+        let fp = FieldPlan { seed: 0, prefer_indexed: false, exists: false, include_null: false, str_hit: false, str_value: 0, bool_value: true, center: 10, lo: BoundPlan { open: false, extremum: None, delta: 3, exclusive: false }, hi: BoundPlan { open: true, extremum: None, delta: 0, exclusive: false }, split: false };
         let p = Plan::Field { target: Target::Accounts, plan: fp.clone(), fallback: Box::new(Plan::Fixed(reverted(true))) };
         assert_eq!(p.resolve(&c), Some(field_string("k0", "absent-value")));
         let p = Plan::Field { target: Target::Transactions, plan: fp.clone(), fallback: Box::new(Plan::Fixed(reverted(true))) };
@@ -1335,6 +1391,63 @@ mod tests {
         assert_eq!(views.reference.as_deref(), Some("r"));
         assert_eq!(views.tx_stamps, vec![5, 9]);
         assert_eq!(views.log_count, 3);
+    }
+
+    #[test]
+    fn from_views_reads_active_metadata_indexes() {
+        let lv = json!({"ledger": "L", "fieldTypes": {"account": {"k0": "METADATA_TYPE_STRING"}, "transaction": {"k1": "METADATA_TYPE_INT64"}},
+            "indexes": [
+                {"canonical": "metadata:TARGET_TYPE_ACCOUNT:k0", "state": "active"},
+                {"canonical": "metadata:TARGET_TYPE_ACCOUNT:k2", "state": "ambiguous"},
+                {"canonical": "metadata:TARGET_TYPE_ACCOUNT:own-bad", "state": "active"},
+                {"canonical": "metadata:TARGET_TYPE_TRANSACTION:k1", "state": "active"},
+                {"canonical": "tx:TX_BUILTIN_INDEX_REFERENCE", "state": "active"},
+            ]});
+        let c = FilterCtx::from_views(&lv, None, None);
+        assert_eq!(c.account_indexed, vec!["k0".to_string()], "active, non-reserved, this target only");
+        assert_eq!(c.tx_indexed, vec!["k1".to_string()]);
+        assert!(FilterCtx::from_views(&json!({}), None, None).account_indexed.is_empty());
+    }
+
+    /// With an active metadata index on one of several declared keys, most
+    /// field leaves land on it (the coverage probes need an index-served
+    /// page); the other keys stay reachable.
+    #[test]
+    fn field_leaves_aim_at_indexed_keys() {
+        let mut c = ctx();
+        c.account_fields = vec![("k0".into(), "METADATA_TYPE_STRING".into()), ("k1".into(), "METADATA_TYPE_BOOL".into()), ("k2".into(), "METADATA_TYPE_BOOL".into()), ("k3".into(), "METADATA_TYPE_INT64".into())];
+        c.account_indexed = vec!["k2".into()];
+        let counts = Mutex::new((0u32, 0u32));
+        testkit::with_tc_n(600, |tc| {
+            let fp = draw_field(tc);
+            let leaf = Plan::Field { target: Target::Accounts, plan: fp, fallback: Box::new(Plan::Fixed(reverted(true))) }.resolve(&c).unwrap();
+            let mut n = counts.lock().unwrap();
+            n.0 += 1;
+            if leaf.to_string().contains("\"metadata\":\"k2\"") {
+                n.1 += 1;
+            }
+        });
+        let (all, hot) = *counts.lock().unwrap();
+        assert!(hot * 10 > all * 6, "indexed key drawn {hot}/{all}");
+        assert!(hot < all, "other declared keys stay reachable");
+        // An index on an undeclared key is never targeted (it cannot exist).
+        let mut c2 = ctx();
+        c2.account_indexed = vec!["k9".into()];
+        testkit::with_tc_n(50, |tc| {
+            let leaf = Plan::Field { target: Target::Accounts, plan: draw_field(tc), fallback: Box::new(Plan::Fixed(reverted(true))) }.resolve(&c2).unwrap();
+            assert!(!leaf.to_string().contains("k9"));
+        });
+    }
+
+    #[test]
+    fn resolve_key_pins_the_key() {
+        let c = ctx();
+        testkit::with_tc_n(50, |tc| {
+            let fp = draw_field(tc);
+            let leaf = fp.resolve_key(&c.tx_fields, "k3").unwrap();
+            assert!(leaf.to_string().contains("\"k3\""), "{leaf}");
+            assert!(fp.resolve_key(&c.tx_fields, "k0").is_none(), "undeclared on this target");
+        });
     }
 
     /// The deterministic builder cases of `06/filters/builders.json` and a
