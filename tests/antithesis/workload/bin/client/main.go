@@ -1,30 +1,43 @@
 // Command client is the Antithesis client program for the hegel driver
-// (tests/antithesis/hegel). It holds one shared gRPC connection to the ledger
-// cluster, configured as ledgerctl configures its own (the protocol revision
-// header and actions.GRPCRetryPolicy), round-robin over every node, and
-// executes the RPCs the driver sends it.
+// (tests/antithesis/hegel). It holds the gRPC connections to the ledger
+// cluster and executes the RPCs the driver sends it; it makes no choice of its
+// own (DESIGN §7).
 //
-// It deliberately imports nothing from the workload's internal package: that
-// package declares Antithesis assertions this program would never reach.
+// Routes (opRequest.route, routes.go): "lib" (default) is one shared
+// connection configured as ledgerctl configures its own (protocol revision
+// header and actions.GRPCRetryPolicy), round-robin over every node; "plain" is
+// a second shared round-robin connection without a retry policy; "node" pins a
+// direct connection to one node. Every connection accepts 64 MiB messages.
+//
+// It deliberately imports nothing from the workload's internal package (that
+// package declares Antithesis assertions this program would never reach) and
+// nothing from antithesis-sdk-go/lifecycle (deps_test.go).
 //
 // Protocol (HTTP on :8080):
 //
 //	GET  /health -> {"boot": "<id>"}            (does not touch the servers)
-//	POST /op     <- {"opId": n, "service": "bucket"|"cluster", "method": "Apply",
-//	                 "request": <protojson>, "timeoutMs": n, "maxItems": n}
+//	POST /op     <- {"opId": n, "service": "bucket"|"cluster"|"restore",
+//	                 "method": "Apply", "request": <protojson>, "timeoutMs": n,
+//	                 "maxItems": n, "route": "lib"|"plain", "node": "ledger-1:8888",
+//	                 "consistency": "stale", "sign": {"keyId", "seed"}}
 //	             -> {"boot", "opId", "outcome"}
+//	POST /pubkey <- {"seed": "<b64 32 bytes>"} -> {"publicKey": "<b64>"}   (sign.go)
+//	POST /digest (digest.go)
+//	extension handlers registered with registerExt (ext.go)
 //
 // outcome is {"ok": true, "response": <protojson>} for a unary RPC,
-// {"ok": true, "items": [<protojson>...], "complete": bool} for a server
-// stream, or {"ok": false, "code": "Unavailable", "reason": "...",
-// "message": "..."} for an error. Every completion is also sent to
-// OUTCOME_ADDR over UDP as {"boot", "opId", "outcome"}, even if the HTTP
-// request has already given up, so the driver learns late outcomes.
+// {"ok": true, "items": [<protojson>...], "complete": bool, "nextCursor"} for
+// a server stream, or {"ok": false, "code": "Unavailable", "reason": "...",
+// "message": "...", "metadata": {...}, "local": bool} for an error, plus
+// "peer" (the node that answered) and "elapsedMs". Every completion is also
+// sent to OUTCOME_ADDR over UDP as {"boot", "opId", "outcome"}, even if the
+// HTTP request has already given up, so the driver learns late outcomes.
 package main
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -40,8 +53,9 @@ import (
 
 	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
@@ -49,13 +63,8 @@ import (
 	"google.golang.org/protobuf/reflect/protoregistry"
 
 	"github.com/formancehq/ledger/v3/internal/proto/clusterpb"
+	"github.com/formancehq/ledger/v3/internal/proto/restorepb"
 	"github.com/formancehq/ledger/v3/internal/proto/servicepb"
-	"github.com/formancehq/ledger/v3/pkg/grpcprotocol"
-
-	"google.golang.org/grpc/resolver"
-	"google.golang.org/grpc/resolver/manual"
-
-	"github.com/formancehq/ledger/v3/pkg/actions"
 )
 
 var (
@@ -67,6 +76,8 @@ var (
 	services = map[string]protoreflect.FullName{
 		"bucket":  servicepb.File_bucket_proto.Services().Get(0).FullName(),
 		"cluster": clusterpb.File_cluster_proto.Services().Get(0).FullName(),
+		// RestoreService runs on restore nodes only; calls must set node.
+		"restore": restorepb.File_restore_proto.Services().Get(0).FullName(),
 	}
 )
 
@@ -77,12 +88,17 @@ type opRequest struct {
 	Request   json.RawMessage `json:"request"`
 	TimeoutMS int64           `json:"timeoutMs"`
 	MaxItems  int             `json:"maxItems"`
+	// Route selects the connection: "" or "lib" (production retry policy),
+	// "plain" (no retry policy). Ignored when Node is set.
+	Route string `json:"route"`
 	// Node, when set (e.g. "ledger-1:8888"), sends the RPC to that node only,
-	// over a direct connection, instead of the shared round-robin client.
+	// over a direct connection without retries.
 	Node string `json:"node"`
 	// Consistency, when set, is sent as the x-consistency header ("stale"
 	// reads the node's local state).
 	Consistency string `json:"consistency"`
+	// Sign, when set on a bucket Apply, sends request.unsigned signed (sign.go).
+	Sign *signSpec `json:"sign,omitempty"`
 }
 
 type outcome struct {
@@ -97,6 +113,13 @@ type outcome struct {
 	Message    string `json:"message,omitempty"`
 	// Metadata carries the ErrorInfo metadata of a business error.
 	Metadata map[string]string `json:"metadata,omitempty"`
+	// Local marks an error the client produced itself (dial failure,
+	// marshalling, a client-side message-size limit): no server answered it.
+	Local bool `json:"local,omitempty"`
+	// Peer is the node address that answered, when known.
+	Peer string `json:"peer,omitempty"`
+	// ElapsedMS is the time the RPC took, in milliseconds.
+	ElapsedMS int64 `json:"elapsedMs,omitempty"`
 }
 
 type event struct {
@@ -106,52 +129,23 @@ type event struct {
 }
 
 type server struct {
-	conn     *grpc.ClientConn
+	conns    *conns
 	udp      *net.UDPConn
 	udpMu    sync.Mutex
 	inFlight sync.WaitGroup
-
-	nodesMu sync.Mutex
-	nodes   map[string]*grpc.ClientConn
-}
-
-// nodeConn returns a direct connection to one node, without retries, so a
-// per-node read reports that node's own answer.
-func (s *server) nodeConn(addr string) (*grpc.ClientConn, error) {
-	s.nodesMu.Lock()
-	defer s.nodesMu.Unlock()
-	if c, ok := s.nodes[addr]; ok {
-		return c, nil
-	}
-	c, err := grpc.NewClient(addr,
-		grpcprotocol.ClientOption(),
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-	)
-	if err != nil {
-		return nil, err
-	}
-	s.nodes[addr] = c
-
-	return c, nil
 }
 
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 	log.Printf("client boot=%s", boot)
 
-	conn, err := dial(os.Getenv("LEDGER_GRPC_ADDR"))
+	cs, err := newConns(os.Getenv("LEDGER_GRPC_ADDR"))
 	if err != nil {
 		log.Fatalf("dial: %v", err)
 	}
-	s := &server{conn: conn, udp: dialOutcome(os.Getenv("OUTCOME_ADDR")), nodes: map[string]*grpc.ClientConn{}}
+	s := &server{conns: cs, udp: dialOutcome(os.Getenv("OUTCOME_ADDR"))}
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, map[string]string{"boot": boot})
-	})
-	mux.HandleFunc("POST /op", s.handleOp)
-
-	httpServer := &http.Server{Addr: ":8080", Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	httpServer := &http.Server{Addr: ":8080", Handler: s.mux(), ReadHeaderTimeout: 5 * time.Second}
 	go func() {
 		sigs := make(chan os.Signal, 1)
 		signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
@@ -166,38 +160,21 @@ func main() {
 	if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("listen: %v", err)
 	}
-	if err := conn.Close(); err != nil {
-		log.Printf("closing connection: %v", err)
-	}
+	cs.close()
 }
 
-// dial connects to every node in addrs (comma-separated), round-robin, with
-// ledgerctl's retry policy.
-func dial(addrs string) (*grpc.ClientConn, error) {
-	var policy map[string]any
-	if err := json.Unmarshal([]byte(actions.GRPCRetryPolicy), &policy); err != nil {
-		return nil, fmt.Errorf("parsing retry policy: %w", err)
-	}
-	policy["loadBalancingConfig"] = []any{map[string]any{"round_robin": map[string]any{}}}
-	serviceConfig, err := json.Marshal(policy)
-	if err != nil {
-		return nil, err
-	}
-	r := manual.NewBuilderWithScheme("ledger")
-	var state resolver.State
-	for _, a := range strings.Split(addrs, ",") {
-		if a = strings.TrimSpace(a); a != "" {
-			state.Addresses = append(state.Addresses, resolver.Address{Addr: a})
-		}
-	}
-	r.InitialState(state)
+// mux mounts the core endpoints and every registered extension.
+func (s *server) mux() *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, map[string]string{"boot": boot})
+	})
+	mux.HandleFunc("POST /op", s.handleOp)
+	mux.HandleFunc("POST /pubkey", handlePubkey)
+	mux.HandleFunc("POST /digest", s.handleDigest)
+	mountExts(mux, s)
 
-	return grpc.NewClient("ledger:///",
-		grpcprotocol.ClientOption(),
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithDefaultServiceConfig(string(serviceConfig)),
-		grpc.WithResolvers(r),
-	)
+	return mux
 }
 
 // dialOutcome resolves the outcome address, retrying once a second, in the
@@ -219,6 +196,41 @@ func dialOutcome(addr string) *net.UDPConn {
 	}
 }
 
+// prepareOp validates an op request and builds its input message. Errors are
+// the driver's (HTTP 400).
+func prepareOp(req opRequest) (protoreflect.MethodDescriptor, proto.Message, error) {
+	if !validRoute(req.Route) {
+		return nil, nil, fmt.Errorf("unknown route %q", req.Route)
+	}
+	if req.Service == "restore" && req.Node == "" {
+		return nil, nil, errors.New("restore calls must set node")
+	}
+	method, err := lookupMethod(req.Service, req.Method)
+	if err != nil {
+		return nil, nil, err
+	}
+	in, err := newMessage(method.Input())
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(req.Request) > 0 {
+		if err := unmarshal.Unmarshal(req.Request, in); err != nil {
+			return nil, nil, fmt.Errorf("request: %w", err)
+		}
+	}
+	if req.Sign != nil {
+		apply, ok := in.(*servicepb.ApplyRequest)
+		if !ok || req.Service != "bucket" {
+			return nil, nil, errors.New("sign is only valid on bucket Apply")
+		}
+		if err := signApply(apply, *req.Sign); err != nil {
+			return nil, nil, err
+		}
+	}
+
+	return method, in, nil
+}
+
 func (s *server) handleOp(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -230,21 +242,10 @@ func (s *server) handleOp(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	method, err := lookupMethod(req.Service, req.Method)
+	method, in, err := prepareOp(req)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
-	}
-	in, err := newMessage(method.Input())
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	if len(req.Request) > 0 {
-		if err := unmarshal.Unmarshal(req.Request, in); err != nil {
-			http.Error(w, "request: "+err.Error(), http.StatusBadRequest)
-			return
-		}
 	}
 
 	// The RPC runs on its own goroutine with its own deadline, so it completes
@@ -253,28 +254,10 @@ func (s *server) handleOp(w http.ResponseWriter, r *http.Request) {
 	s.inFlight.Add(1)
 	go func() {
 		defer s.inFlight.Done()
-		timeout := time.Duration(req.TimeoutMS) * time.Millisecond
-		if timeout <= 0 {
-			timeout = 10 * time.Second
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		ctx, cancel := context.WithTimeout(context.Background(), opTimeout(req.TimeoutMS))
 		defer cancel()
-		if req.Consistency != "" {
-			ctx = metadata.AppendToOutgoingContext(ctx, "x-consistency", req.Consistency)
-		}
-		conn := s.conn
-		if req.Node != "" {
-			c, err := s.nodeConn(req.Node)
-			if err != nil {
-				out := outcome{Code: "Internal", Message: err.Error()}
-				s.report(req, out)
-				done <- out
-				return
-			}
-			conn = c
-		}
-		out := call(ctx, conn, method, in, req.MaxItems)
-		s.report(req, out)
+		out := s.callRoute(ctx, req.Route, req.Node, req.Consistency, method, in, req.MaxItems)
+		s.report(req.OpID, req.Method, out)
 		done <- out
 	}()
 
@@ -285,34 +268,72 @@ func (s *server) handleOp(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func opTimeout(ms int64) time.Duration {
+	if ms <= 0 {
+		return 10 * time.Second
+	}
+
+	return time.Duration(ms) * time.Millisecond
+}
+
+// callRoute sends one RPC through a route (or a pinned node), with the
+// consistency header, and asserts its classification.
+func (s *server) callRoute(ctx context.Context, route, node, consistency string, method protoreflect.MethodDescriptor, in proto.Message, maxItems int) outcome {
+	fullMethod := fullMethodName(method)
+	start := time.Now()
+	conn, err := s.conns.pick(route, node)
+	if err != nil {
+		out := localOutcome(codes.Internal, "dial: "+err.Error())
+		out.ElapsedMS = time.Since(start).Milliseconds()
+		assertClassified(fullMethod, node, out)
+
+		return out
+	}
+	if consistency != "" {
+		ctx = metadata.AppendToOutgoingContext(ctx, "x-consistency", consistency)
+	}
+	out := call(ctx, conn, method, in, maxItems)
+	out.ElapsedMS = time.Since(start).Milliseconds()
+	assertClassified(fullMethod, node, out)
+
+	return out
+}
+
+func fullMethodName(method protoreflect.MethodDescriptor) string {
+	return fmt.Sprintf("/%s/%s", method.Parent().FullName(), method.Name())
+}
+
+// call sends one RPC and converts its result to an outcome (without
+// elapsedMs, which the caller measures).
 func call(ctx context.Context, conn *grpc.ClientConn, method protoreflect.MethodDescriptor, in proto.Message, maxItems int) outcome {
-	fullMethod := fmt.Sprintf("/%s/%s", method.Parent().FullName(), method.Name())
+	fullMethod := fullMethodName(method)
+	var p peer.Peer
 	if !method.IsStreamingServer() {
 		out, err := newMessage(method.Output())
 		if err != nil {
-			return outcome{Code: "Internal", Message: err.Error()}
+			return localOutcome(codes.Internal, err.Error())
 		}
-		if err := conn.Invoke(ctx, fullMethod, in, out); err != nil {
-			return errOutcome(err)
+		if err := conn.Invoke(ctx, fullMethod, in, out, grpc.Peer(&p)); err != nil {
+			return withPeer(errOutcome(err), &p)
 		}
 		b, err := marshal.Marshal(out)
 		if err != nil {
-			return outcome{Code: "Internal", Message: "marshal response: " + err.Error()}
+			return withPeer(localOutcome(codes.Internal, "marshal response: "+err.Error()), &p)
 		}
 
-		return outcome{OK: true, Response: b}
+		return withPeer(outcome{OK: true, Response: b}, &p)
 	}
 
 	desc := &grpc.StreamDesc{StreamName: string(method.Name()), ServerStreams: true}
-	stream, err := conn.NewStream(ctx, desc, fullMethod)
+	stream, err := conn.NewStream(ctx, desc, fullMethod, grpc.Peer(&p))
 	if err != nil {
-		return errOutcome(err)
+		return withPeer(errOutcome(err), &p)
 	}
-	if err := stream.SendMsg(in); err != nil {
-		return errOutcome(err)
+	if err := stream.SendMsg(in); err != nil && !errors.Is(err, io.EOF) {
+		return withPeer(errOutcome(err), &p)
 	}
 	if err := stream.CloseSend(); err != nil {
-		return errOutcome(err)
+		return withPeer(errOutcome(err), &p)
 	}
 	if maxItems <= 0 {
 		maxItems = 1000
@@ -321,7 +342,7 @@ func call(ctx context.Context, conn *grpc.ClientConn, method protoreflect.Method
 	for {
 		item, err := newMessage(method.Output())
 		if err != nil {
-			return outcome{Code: "Internal", Message: err.Error()}
+			return withPeer(localOutcome(codes.Internal, err.Error()), &p)
 		}
 		err = stream.RecvMsg(item)
 		if err == io.EOF {
@@ -330,36 +351,47 @@ func call(ctx context.Context, conn *grpc.ClientConn, method protoreflect.Method
 				out.NextCursor = next[0]
 			}
 
-			return out
+			return withPeer(out, &p)
 		}
 		if err != nil {
-			return errOutcome(err)
+			return withPeer(errOutcome(err), &p)
 		}
 		b, err := marshal.Marshal(item)
 		if err != nil {
-			return outcome{Code: "Internal", Message: "marshal item: " + err.Error()}
+			return withPeer(localOutcome(codes.Internal, "marshal item: "+err.Error()), &p)
 		}
 		items = append(items, b)
 		if len(items) >= maxItems {
-			return outcome{OK: true, Items: items, Complete: false}
+			return withPeer(outcome{OK: true, Items: items, Complete: false}, &p)
 		}
 	}
 }
 
+// withPeer records the answering node. grpc.Peer is filled once the call
+// reached a transport; an error before that leaves it empty.
+func withPeer(out outcome, p *peer.Peer) outcome {
+	if p.Addr != nil {
+		out.Peer = p.Addr.String()
+	}
+
+	return out
+}
+
 // report logs the completion and sends it to the driver over UDP. Large
 // stream results are summarised on the UDP path; the HTTP response keeps them.
-func (s *server) report(req opRequest, out outcome) {
+func (s *server) report(opID uint64, method string, out outcome) {
 	if out.OK {
-		log.Printf("op=%d method=%s ok items=%d", req.OpID, req.Method, len(out.Items))
+		log.Printf("op=%d method=%s ok items=%d peer=%s ms=%d", opID, method, len(out.Items), out.Peer, out.ElapsedMS)
 	} else {
-		log.Printf("op=%d method=%s error code=%s reason=%s msg=%q", req.OpID, req.Method, out.Code, out.Reason, out.Message)
+		log.Printf("op=%d method=%s error code=%s reason=%s local=%t peer=%s ms=%d msg=%q",
+			opID, method, out.Code, out.Reason, out.Local, out.Peer, out.ElapsedMS, out.Message)
 	}
 	if s.udp == nil {
 		return
 	}
-	b, err := json.Marshal(event{Boot: boot, OpID: req.OpID, Outcome: out})
+	b, err := json.Marshal(event{Boot: boot, OpID: opID, Outcome: out})
 	if err != nil {
-		log.Printf("op=%d marshal event: %v", req.OpID, err)
+		log.Printf("op=%d marshal event: %v", opID, err)
 
 		return
 	}
@@ -368,18 +400,33 @@ func (s *server) report(req opRequest, out outcome) {
 		small.Items = nil
 		small.Response = nil
 		small.Message = "truncated"
-		b, err = json.Marshal(event{Boot: boot, OpID: req.OpID, Outcome: small})
+		b, err = json.Marshal(event{Boot: boot, OpID: opID, Outcome: small})
 		if err != nil {
-			log.Printf("op=%d marshal event: %v", req.OpID, err)
+			log.Printf("op=%d marshal event: %v", opID, err)
 
 			return
 		}
 	}
 	s.udpMu.Lock()
 	// Best effort: a lost event leaves the operation unknown to the driver,
-	// which the model already allows.
+	// which the driver already allows.
 	_, _ = s.udp.Write(b)
 	s.udpMu.Unlock()
+}
+
+// localOutcome is an error the client produced itself.
+func localOutcome(code codes.Code, msg string) outcome {
+	return outcome{Code: code.String(), Message: msg, Local: true}
+}
+
+// Messages grpc-go uses for its own message-size checks
+// (rpc_util.go: recv and send paths). The server's limits are 64 MiB like the
+// client's, so a size error with these messages and no ErrorInfo is the
+// client's own.
+var localSizeMessages = []string{
+	"grpc: received message larger than max",
+	"grpc: received message after decompression larger than max",
+	"grpc: trying to send message larger than max",
 }
 
 func errOutcome(err error) outcome {
@@ -393,6 +440,14 @@ func errOutcome(err error) outcome {
 			out.Metadata = info.GetMetadata()
 		}
 	}
+	if st.Code() == codes.ResourceExhausted && out.Reason == "" {
+		for _, m := range localSizeMessages {
+			if strings.HasPrefix(st.Message(), m) {
+				out.Local = true
+			}
+		}
+	}
+
 	return out
 }
 
