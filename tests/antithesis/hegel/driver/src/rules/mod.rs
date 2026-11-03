@@ -26,6 +26,7 @@ pub mod filters;
 pub mod lists;
 // ==== end 06-list-queries mods ====
 // ==== 07-indexes-typed-metadata mods ====
+pub mod indexes;
 // ==== end 07-indexes-typed-metadata mods ====
 // ==== 08-prepared-queries mods ====
 // ==== end 08-prepared-queries mods ====
@@ -73,6 +74,7 @@ pub fn rules() -> Vec<ConcurrentRule<Driver>> {
     v.extend(lists::rules());
     // ==== end 06-list-queries rules ====
     // ==== 07-indexes-typed-metadata rules ====
+    v.extend(indexes::rules());
     // ==== end 07-indexes-typed-metadata rules ====
     // ==== 08-prepared-queries rules ====
     // ==== end 08-prepared-queries rules ====
@@ -117,6 +119,7 @@ pub fn order_gens() -> Vec<crate::write::OrderGen> {
     // ==== 06-list-queries order_gens ====
     // ==== end 06-list-queries order_gens ====
     // ==== 07-indexes-typed-metadata order_gens ====
+    v.extend(indexes::order_gens());
     // ==== end 07-indexes-typed-metadata order_gens ====
     // ==== 08-prepared-queries order_gens ====
     // ==== end 08-prepared-queries order_gens ====
