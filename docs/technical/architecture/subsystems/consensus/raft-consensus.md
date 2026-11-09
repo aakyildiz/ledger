@@ -175,6 +175,37 @@ A stalled initialization or drain can therefore retain the hook and its
 resources until it completes. Fatal `Run` errors retain their existing
 process-failure behavior.
 
+#### Termination during learner preflight
+
+The join preflight precedes inbound Raft serving, membership startup and
+`Node.Run`. Its outbound registration connections and cancellation subscription
+belong to the preflight itself; Fx does not stop a hook whose start failed.
+SIGTERM or interrupt latches process termination, retains the Fx shutdown
+notification, and cancels only the dedicated registration child context. Keeping
+the private application startup context live permits rollback of previously
+started dependency hooks after intentional registration cancellation.
+
+A positive `total-stop-timeout` arms an absolute signal-time deadline for startup
+unwind and deferred logger finalization. At expiry the private application
+context is canceled and outer waiting fails. As with an expired Fx stop context,
+this is not proof of hook completion or resource closure. Zero leaves this
+waiting unlimited. If startup succeeds, the retained notification invokes normal
+Fx stopping with its existing separate stop budget; the signal deadline is not
+one end-to-end budget for every lifecycle phase. Signal-time logger finalization
+uses the remaining signal deadline and cannot turn expiry into success.
+
+Successful intentional cancellation requires successful rollback and
+finalization; fatal registration statuses, marker-write errors and cleanup
+failures retain failure status even when a signal races them. A later signal does
+not reclassify a completed peer cancellation:
+the registration RPC captures its local cancellation cause in gRPC's completion
+callback, before connection cleanup or caller-side result handling. Cancellation
+does not reverse a remotely committed learner addition. A canceled response can
+leave membership without `CLUSTER_JOINED`; restart still follows the existing
+`AlreadyExists` versus stale-progress rules. See
+[cluster operations](../../../../ops/cluster-operations.md#phase-3-learner-registration-preflight)
+and [server termination](../../../../ops/cli.md#server-termination).
+
 #### Leader readiness generations
 
 Leadership acquisition does not admit writes immediately. The node first
@@ -276,6 +307,23 @@ Drain points ensure the pending commit completes before barriers, checkpoints, s
 - Refresh an existing peer's pooled connection after a committed address update
   while preserving that peer's send loop and queues; a transient optional-TLS
   probe failure retains the committed target for the loop's next retry
+- Retain the committed endpoint and create a peer loop even when the first
+  optional-TLS probe fails. Join preflight deliberately precedes the joining
+  node's listener, so connection refusal during committed learner wiring is
+  recoverable. The pool records the desired address before probing; a network
+  error leaves a pending entry without selecting plaintext. The Raft loop
+  reports unreachable, drains queued sends with their accounting, and retries
+  through its existing one-second delay. Once the listener starts, replication
+  and automatic promotion can resume without a new membership proposal.
+  Removal cancels and joins the loop before deleting the pool entry; transport
+  shutdown rejects new peer loops and joins existing owners before pool closure.
+
+This recovery state is local routing state reconstructed from committed
+membership; it changes no persisted format or service protocol. It reuses one
+loop and the existing bounded priority queues per peer. Probe attempts retain
+the existing timeout and retry pacing; no additional reconciliation worker is
+created. Service-pool consumers retain a failed registration's target too, but
+retry it through their existing registration paths rather than a Raft send loop.
 
 The shared Raft and service connection pools also send gRPC keepalives every
 ten seconds with a five-second response timeout. Raft, service, restore, and
@@ -358,6 +406,26 @@ type NodeConfig struct {
     ProposeQueueCapacity int           // Capacity of the propose queue
 }
 ```
+
+### Processing interval precondition
+
+Every processing ticker construction and reset must receive a positive duration.
+`NodeConfig.Validate` and `NewNode` share an interval guard: both durations must
+be nonnegative, and a positive Raft tick below `10ns` requires a positive
+processing override. Rejecting that combination prevents integer division by
+ten from creating a zero timer; silently raising the Raft tick would also alter
+election and heartbeat timing. Zero Raft tick retains `100ms`, and zero
+processing interval derives one tenth of the effective Raft tick (`10ms` by
+default). These are local scheduling settings, never committed apply inputs.
+
+`orchestrate` resolves the effective processing interval once. It stops that
+ticker while a Ready is in flight and resets it to the same effective value
+when `finishReady` leaves no further Ready work. Explicit positive overrides
+therefore survive every idle rearm. Message and local-storage response fast
+paths still check `HasReady` immediately; polling is not a delay imposed on
+every commit. Tests exercise both shorter and longer overrides through real
+message-only Ready completion under `synctest`, alongside default cadence.
+No WAL, FSM, audit or recovery write ordering changes.
 
 ### Timeout Calculation
 
@@ -664,19 +732,33 @@ sequenceDiagram
     Leader->>Leader: Check: follower.Next < compactIndex?
     Note over Leader: Yes → WAL entries no longer available
     
-    Leader->>Leader: Create snapshot at lastIndex
-    Leader->>Follower: MsgSnap (full snapshot data)
-    Note over Follower: Progress state → StateSnapshot
-    
+    Leader->>Follower: MsgSnap (latest WAL snapshot metadata, no payload)
+    Note over Leader: Progress[follower] → StateSnapshot (replication paused)
+    Leader->>Leader: finishReady: ReportSnapshot(follower, SnapshotFinish)
+    Note over Leader: Progress[follower] → StateProbe
+
     Follower->>Follower: Apply snapshot to WAL
-    Follower->>Follower: Restore FSM state
-    Follower->>Follower: Sync business logs via gRPC
-    
-    Follower->>Leader: MsgSnapStatus (success)
-    Note over Follower: Progress state → StateReplicate
-    
-    Leader->>Follower: Resume normal AppendEntries
+    Follower->>Follower: Enqueue checkpoint synchronization (async, out-of-band gRPC)
+    Follower->>Leader: MsgAppResp (index = snapshot index)
+    Note over Leader: Progress[follower] → StateReplicate
+
+    Leader->>Follower: MsgApp from Match+1, or a fresh MsgSnap if compacted
 ```
+
+Progress is leader-side state; the follower never sends `MsgSnapStatus`.
+etcd/raft keeps a peer in `StateSnapshot` (all appends paused) until the
+leader calls `ReportSnapshot` or receives an acknowledgement that leaves
+`Match+1 >= firstIndex`. The acknowledgement only certifies the Raft snapshot:
+checkpoint restoration may still be running. Two ordinary events defeat the second exit: the
+`MsgSnap` is lost (peer down, stream reset), or the leader's maintenance
+compacts past the sent snapshot before the acknowledgement arrives. Either
+way the peer would receive no entry until the next leader change. The leader
+therefore collects every outbound `MsgSnap` destination in `sendReadyMessages`
+and reports `SnapshotFinish` for each from `finishReady` (the orchestrate
+goroutine owns `rawNode`). Because `MsgSnap` carries no payload, handing it to
+the transport is the send. The peer moves to `StateProbe`, so heartbeat
+responses and acknowledgements resume probing, and a peer still behind the
+compacted boundary gets a fresh snapshot.
 
 #### Progress States
 
@@ -686,7 +768,7 @@ The leader tracks each follower's state:
 |-------|-------------|
 | `StateProbe` | Follower's `Match` is unknown, sending one entry at a time |
 | `StateReplicate` | Normal operation, pipeline enabled |
-| `StateSnapshot` | Snapshot is being sent, waiting for confirmation |
+| `StateSnapshot` | Snapshot sent; appends paused until the leader reports it or an acknowledgement leaves `Match+1 >= firstIndex` |
 
 #### Receiving a snapshot Ready
 

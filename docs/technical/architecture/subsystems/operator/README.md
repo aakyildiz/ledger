@@ -5,11 +5,13 @@ The Ledger v3 Operator owns the Kubernetes lifecycle of a Raft cluster: the
 deletion protection, and operational controllers that must remain outside the
 deterministic Ledger FSM.
 
-Scale-down records the previous replica count on the StatefulSet before Raft
-membership removal and replica reduction. Removed-ordinal PVC cleanup reads
-that durable marker and the claim templates on each reconcile, so a failed
-delete or operator restart cannot strand old claims before a later scale-up.
-The marker is removed only after the deletion requests succeed. See the
+Explicit `whenScaled: Delete` cleanup records the previous replica count and
+an inventory of authorized PVC/PV identities on the StatefulSet before Raft
+membership removal and replica reduction. Each retry uses that inventory,
+revalidates ownership and binding, and sends UID/resourceVersion-preconditioned
+PVC deletes. A replacement with the same name is never adopted as a target.
+Both markers remain until accepted deletion requests complete; `Retain` cancels
+remaining Operator cleanup. See the
 [operator scale-down contract](../../../../../misc/operator/README.md#overview).
 
 Ledger CR target identity is fixed at creation by API-server CEL transition
@@ -21,6 +23,13 @@ stopped before installing the rules; the applied-spec hash does not retain the
 original target. See [Ledger target identity](../../../../../misc/operator/README.md#ledger-target-identity)
 for the upgrade procedure and same-name Cluster replacement boundary.
 
+Mirror-to-normal promotion explicitly reads live, linearizable Ledger mode
+before proposing the transition, overriding pod consistency and checkpoint
+environment settings. Normal mode repairs stale mirror CR status after a lost promotion response or
+status write, including after controller replacement. See
+[mirror promotion recovery](../../../../../misc/operator/README.md#mirror-promotion-recovery)
+for mutation order, retry conditions and the index-reconciliation handoff.
+
 Objects derived from a Cluster name are owned only through a controller
 reference carrying the Cluster UID. The operator never adopts, mutates,
 deletes or execs into a same-name object it does not control, and reports the
@@ -28,6 +37,9 @@ conflict as `ResourceNamesAvailable=False`.
 
 ## Documents
 
+- [Declarative storage reconciliation](storage-reconciliation.md) — configured
+  PVC minima/profiles, actual CSI status, durable claim-template recovery,
+  scale-down retention and guarded layout deletion.
 - [Derived object ownership](derived-object-ownership.md) — ownership checks on
   writes, prunes, status and execs, conflict reporting, and accepted races.
 - [Automatic PVC expansion](volume-auto-expansion.md) — opt-in capacity policy,

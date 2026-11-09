@@ -24,7 +24,15 @@ All backup/restore commands accept the same provider flags; only the `--driver` 
 
 ### Scheduling with the Kubernetes Operator
 
+Operator backups require Kubernetes 1.32 or later and updated BackupRun CRDs
+with `.spec.backupRef` declared in `selectableFields`. Install both matching
+CRD/chart updates before starting the operator; parent lists bypass the cache
+and use API-server field selection.
+
 The operator's `Backup` resource can schedule full and incremental S3 backups:
+Each BackupRun Job uses the Ledger container image from the Cluster's owned
+StatefulSet. This also covers Clusters that inherit their image tag from the
+Operator instead of storing it in `spec.image.tag`.
 
 ```yaml
 apiVersion: ledger.formance.com/v1alpha1
@@ -121,6 +129,21 @@ Acquired malformed summaries and failed Jobs still mark the run Failed. A missin
 result that never becomes available requires operator intervention; no new timeout
 or automatic backup resubmission is introduced. Runs already marked Failed by an
 older operator remain terminal.
+
+To trigger a run directly, apply a `BackupRun` in the Backup's namespace with
+`metadata.name` and `spec.backupRef`; `spec.type` defaults to `Full`. No labels
+or owner references are required. `spec.backupRef` is immutable from creation,
+including Pending and completed runs; create a new run for a different parent.
+When upgrading existing CRDs, stop the operator and recover any previously
+retargeted runs, spec-less runs and affected parent accounting before installing
+the rules requiring `spec` and freezing its parent;
+see [the admission upgrade procedure](../technical/architecture/subsystems/backup/operator-scheduling.md#upgrading-parent-admission).
+The referenced Backup accounts for the run's
+result and completion cursor, applies its history limits, and includes it in
+sibling exclusion even if the association label is missing or incorrect.
+The operator watches unowned manual runs for parent updates without adopting
+them. Existing terminal manual runs also become visible to parent accounting
+and may be pruned by the configured history limits on reconciliation.
 
 The run history limits retain Kubernetes `BackupRun` resources only. They do
 not retain historical backup artifacts or restore points in object storage.
@@ -513,9 +536,11 @@ enforces `--total-stop-timeout`. That budget includes `--grace-period` and all
 Fx stop hooks. Deadline expiry returns a shutdown error and an unsuccessful
 command exit without guaranteeing that every hook completed. Process exit can
 therefore interrupt cleanup and leave staging files or an uncleanly closed
-staging store. Deferred log-export cleanup runs after the Fx lifecycle and is
-outside this timeout; size the process termination grace period to allow that
-additional work. Staging-store close errors are logged under the existing close
+staging store. Deferred log-export cleanup runs after the Fx lifecycle. After a
+termination signal it uses the remaining signal-time deadline, distinct from
+the normal Fx stop budget; expiry or finalization failure exits unsuccessfully.
+See [server termination](cli.md#server-termination) for startup-unwind and zero
+timeout behavior. Staging-store close errors are logged under the existing close
 policy and are not returned by the restore stop hook.
 
 ### Step 2: Validate (Required for gRPC Finalization)
@@ -671,7 +696,7 @@ ledgerctl store bootstrap --driver s3 --s3-bucket my-bucket --s3-region us-east-
 
 1. **Fresh directory guard**: Rejects a `RESTORED` marker, live database or incompatible checkpoint layout. A lone unmarked `checkpoints/0` from interrupted finalization is reclaimed before downloading.
 2. **Download**: Reads the manifest from the configured backend, creates or opens the selected data directory, then inspects `restore-staging/` with rooted `Lstat`. An existing symlink (even to a target inside the data directory) or non-directory is rejected. Any old real staging directory is removed through the data-directory root before a fresh directory is created and opened. Downloads checkpoint files sequentially through a filesystem root opened on staging. Each manifest filename is converted from slash-separated form and must be lexically local before parent creation, object lookup or file creation for that entry. Rooted parent and file creation reject symlink escapes. Each checkpoint file is verified against its manifest size and the sha256 in its object key; a mismatch aborts bootstrap and names the file. Staging is reset even for an export-only manifest.
-3. **Apply exports**: If the manifest contains incremental export segments, applies them to the staging database and rebuilds derived state.
+3. **Apply exports**: If the manifest contains incremental export segments, applies them to the staging database and rebuilds derived state. Before downloading any segment, bootstrap rejects a manifest whose log, audit, or audit-item segments do not continue each other from the checkpoint boundary, so a missing interior segment or an overlap fails even without `--validate`. A missing final segment is not detected by this check; use `--validate` to catch it.
 4. **Preview**: Opens the staging as a read-only Pebble database, reads metadata (last applied index, timestamp, ledger list), and displays a summary table.
 5. **Validate** (optional): If `--validate` is set, runs the full integrity checker (`check.Checker`) -- the same checker used by `store check` and `restore validate`. Execution failures or reported integrity errors abort bootstrap before confirmation, preparation, and finalization. Without this flag, bootstrap skips Checker entirely.
 6. **Confirm**: Unless `--yes` is set, prompts for user confirmation.

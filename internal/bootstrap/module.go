@@ -740,12 +740,17 @@ func Module() fx.Option {
 				lc fx.Lifecycle,
 				cfg Config,
 				logger logging.Logger,
+				termination startupTerminationParams,
 			) {
 				if !shouldRunJoinPreflight(cfg, logger) {
 					return
 				}
 
-				lc.Append(joinPreflightHook(cfg, logger))
+				hook := joinPreflightHook(cfg, logger)
+				if termination.Termination != nil {
+					hook = termination.Termination.hook(hook)
+				}
+				lc.Append(hook)
 			},
 			func(
 				lc fx.Lifecycle,
@@ -966,9 +971,9 @@ func Module() fx.Option {
 						logger,
 						raftNode.IsLeader,
 						func(ctx context.Context, cutoffMicros uint64, lastScannedTimeIndexKey []byte, pebbleKeyHashes [][]byte) {
-							proposal := commands.NewCommand()
+							proposal := commands.NewTechnicalCommand()
 							proposal.CallerSnapshot = commands.SystemCallerSnapshot(commands.ComponentIdempotencyEvict)
-							proposal.TechnicalUpdates = []*raftcmdpb.TechnicalUpdate{{
+							proposal.GetBatch().TechnicalUpdates = []*raftcmdpb.TechnicalUpdate{{
 								Kind: &raftcmdpb.TechnicalUpdate_IdempotencyEviction{
 									IdempotencyEviction: &raftcmdpb.IdempotencyEviction{
 										CutoffMicros:            cutoffMicros,
@@ -992,7 +997,7 @@ func Module() fx.Option {
 							// WriteOperation with nil Coverage so the runner
 							// takes the fast path.
 							operations := []plan.WriteOperation{{
-								Target: &proposal.GetTechnicalUpdates()[0].CoverageBits,
+								Target: &proposal.GetBatch().GetTechnicalUpdates()[0].CoverageBits,
 							}}
 
 							if err := proposeTechnical(ctx, builder, raftNode, proposal, operations); err != nil {
@@ -1301,7 +1306,7 @@ func tryAddLearner(ctx context.Context, cfg Config, tlsCfg TLSConfig, logger log
 			}
 
 			client := clusterbootstrappb.NewClusterBootstrapServiceClient(conn)
-			_, err = client.JoinAsLearner(ctx, req)
+			err = registerLearner(ctx, client, req)
 			_ = conn.Close()
 
 			if err == nil {
@@ -1317,6 +1322,9 @@ func tryAddLearner(ctx context.Context, cfg Config, tlsCfg TLSConfig, logger log
 			}
 
 			st, ok := status.FromError(err)
+			if errors.Is(err, ErrStartupTerminated) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return err
+			}
 			// EN-1436: the leader detected this nodeID in its raft Progress
 			// with a non-zero Match but we (the caller) have no CLUSTER_JOINED
 			// marker on our WAL. The leader's Match for us points at state we
@@ -1411,7 +1419,7 @@ func tryAddLearner(ctx context.Context, cfg Config, tlsCfg TLSConfig, logger log
 
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return joinCancellation(ctx)
 		case <-time.After(backoff):
 		}
 
@@ -1450,12 +1458,12 @@ func proposeAuditKeyIfNeeded(ctx context.Context, n *node.Node, builder *plan.Bu
 	if err != nil {
 		return err
 	}
-	proposal := commands.NewCommand()
+	proposal := commands.NewTechnicalCommand()
 	proposal.CallerSnapshot = commands.SystemCallerSnapshot(commands.ComponentClusterConfig)
-	proposal.TechnicalUpdates = []*raftcmdpb.TechnicalUpdate{{
+	proposal.GetBatch().TechnicalUpdates = []*raftcmdpb.TechnicalUpdate{{
 		Kind: &raftcmdpb.TechnicalUpdate_AuditKey{AuditKey: key},
 	}}
-	if err := proposeTechnical(ctx, builder, n, proposal, []plan.WriteOperation{{Target: &proposal.TechnicalUpdates[0].CoverageBits}}); err != nil {
+	if err := proposeTechnical(ctx, builder, n, proposal, []plan.WriteOperation{{Target: &proposal.GetBatch().TechnicalUpdates[0].CoverageBits}}); err != nil {
 		return fmt.Errorf("proposing audit key: %w", err)
 	}
 	committed, err := query.ReadAuditKey(store)
@@ -1508,9 +1516,9 @@ func proposeClusterConfigIfNeeded(parent context.Context, n plan.Proposer, build
 
 	logger.Infof("Proposing cluster config update on leadership acquisition")
 
-	proposal := commands.NewCommand()
+	proposal := commands.NewTechnicalCommand()
 	proposal.CallerSnapshot = commands.SystemCallerSnapshot(commands.ComponentClusterConfig)
-	proposal.TechnicalUpdates = []*raftcmdpb.TechnicalUpdate{{
+	proposal.GetBatch().TechnicalUpdates = []*raftcmdpb.TechnicalUpdate{{
 		Kind: &raftcmdpb.TechnicalUpdate_ClusterConfig{ClusterConfig: desiredCfg},
 	}}
 
@@ -1523,7 +1531,7 @@ func proposeClusterConfigIfNeeded(parent context.Context, n plan.Proposer, build
 	// applyClusterConfig reads cache-level configuration (Cache.GenerationThreshold,
 	// Cache.Epoch) but no keyed Registry.X.Get; no preload needed.
 	operations := []plan.WriteOperation{{
-		Target: &proposal.GetTechnicalUpdates()[0].CoverageBits,
+		Target: &proposal.GetBatch().GetTechnicalUpdates()[0].CoverageBits,
 	}}
 
 	if err := proposeTechnical(ctx, builder, n, proposal, operations); err != nil {
@@ -1537,9 +1545,9 @@ func proposeClusterConfigIfNeeded(parent context.Context, n plan.Proposer, build
 // revision. It gates on leadership itself and is safe to call repeatedly: the
 // ClusterPolicyReconciler invokes it on a ticker so a transient proposal failure
 // self-heals on the next tick. Unlike the cluster config, the policy flows
-// through AdmitClusterPolicy as an internal audited SetClusterPolicy order so
-// the checker can re-derive it; the write-readiness gate exempts this
-// non-business proposal so it is never blocked by its own cluster-policy gate.
+// through AdmitClusterPolicy as an operational SetClusterPolicyProposal.
+// The write-readiness gate exempts this non-business proposal so it is never
+// blocked by its own cluster-policy gate.
 func reconcileClusterPolicy(ctx context.Context, admission ctrl.Admission, store *dal.Store, cfg Config, isLeader func() bool, logger logging.Logger) {
 	if !isLeader() {
 		return

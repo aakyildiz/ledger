@@ -12,6 +12,9 @@ import (
 
 	logging "github.com/formancehq/go-libs/v5/pkg/observe/log"
 
+	"github.com/formancehq/ledger/v3/internal/domain"
+	"github.com/formancehq/ledger/v3/internal/infra/state"
+	"github.com/formancehq/ledger/v3/internal/proto/commonpb"
 	"github.com/formancehq/ledger/v3/internal/storage/dal"
 )
 
@@ -52,6 +55,46 @@ func validateExportKey(seg ExportSegment, key []byte) error {
 	seq := binary.BigEndian.Uint64(key[len(expected) : len(expected)+8])
 	if seq < seg.StartSeq || seq > seg.EndSeq {
 		return fmt.Errorf("key %x sequence %d outside export range [%d,%d]", key, seq, seg.StartSeq, seg.EndSeq)
+	}
+
+	return nil
+}
+
+// ErrExportCoverageGap is returned by ApplyExportsAndRebuild when the manifest's
+// export segments do not cover a history stream from the checkpoint boundary.
+var ErrExportCoverageGap = errors.New("manifest export segments do not cover history contiguously")
+
+// validateExportCoverage checks the manifest's segment ranges across objects,
+// before any download: ApplyExports validates each object only on its own, so
+// dropping a whole segment reference leaves every remaining object valid. Log,
+// audit, and audit-item sequences are dense, so each segment must start right
+// after the previous one of its type, from the checkpoint boundary. Applied-
+// proposal sequences are sparse, so its segments must only be ordered and
+// disjoint above the audit boundary.
+func validateExportCoverage(manifest *Manifest) error {
+	var logEnd, auditEnd uint64
+	if manifest.Checkpoint != nil {
+		logEnd, auditEnd = manifest.Checkpoint.LastLogSequence, manifest.Checkpoint.LastAuditSequence
+	}
+
+	ends := map[string]uint64{"log": logEnd, "audit": auditEnd, "auditItem": auditEnd, "appliedProposal": auditEnd}
+	for _, seg := range manifest.Exports {
+		end, ok := ends[seg.Type]
+		if !ok {
+			return fmt.Errorf("invalid export segment %s: unsupported export segment type %q", seg.Key, seg.Type)
+		}
+
+		if seg.Type == "appliedProposal" {
+			if seg.StartSeq <= end {
+				return fmt.Errorf("%w: %q segment %s starts at %d, at or below the covered sequence %d",
+					ErrExportCoverageGap, seg.Type, seg.Key, seg.StartSeq, end)
+			}
+		} else if seg.StartSeq == 0 || seg.StartSeq-1 != end {
+			return fmt.Errorf("%w: %q segment %s starts at %d, expected %d",
+				ErrExportCoverageGap, seg.Type, seg.Key, seg.StartSeq, end+1)
+		}
+
+		ends[seg.Type] = seg.EndSeq
 	}
 
 	return nil
@@ -236,7 +279,7 @@ func ApplyExports(
 
 // ApplyExportsAndRebuild applies the manifest's incremental export segments to
 // the staged store and rebuilds derived state from them, leaving the staging
-// directory fully restored. It is a no-op when the manifest carries no exports.
+// directory fully restored. It also restores operational policy when no history was exported.
 //
 // Both the offline bootstrap (cmd/ledgerctl/store) and the gRPC restore path
 // (internal/adapter/grpc) call this so the two cannot drift: skipping it loses
@@ -249,8 +292,30 @@ func ApplyExports(
 // the same directory in the same process. Reusing one handle eliminates that
 // re-open hazard.
 func ApplyExportsAndRebuild(ctx context.Context, logger logging.Logger, storage Storage, store *dal.Store, manifest *Manifest) error {
-	if manifest == nil || len(manifest.Exports) == 0 {
+	if manifest == nil {
 		return nil
+	}
+
+	// Decode/validate operational state before mutating the staging store.
+	var policy *commonpb.ClusterPolicy
+	if snapshot := manifest.ClusterPolicy; snapshot != nil {
+		policy = &commonpb.ClusterPolicy{}
+		if err := policy.UnmarshalVT(snapshot.Data); err != nil {
+			return fmt.Errorf("decoding backup cluster policy: %w", err)
+		}
+		if policy.GetRevision() == 0 || policy.GetQueryCheckpointLimit() == 0 {
+			return errors.New("invalid backup cluster policy")
+		}
+		if err := domain.MetadataLimitsFromPolicy(policy).Validate(); err != nil {
+			return fmt.Errorf("invalid backup cluster policy limits: %w", err)
+		}
+	}
+	if len(manifest.Exports) == 0 && policy == nil {
+		return nil
+	}
+
+	if err := validateExportCoverage(manifest); err != nil {
+		return err
 	}
 
 	if err := ApplyExports(ctx, logger, storage, store, manifest.Exports); err != nil {
@@ -266,8 +331,23 @@ func ApplyExportsAndRebuild(ctx context.Context, logger logging.Logger, storage 
 		fromAuditSeq = manifest.Checkpoint.LastAuditSequence
 	}
 
-	if err := RebuildDelta(ctx, logger, store, fromLogSeq, fromAuditSeq); err != nil {
-		return fmt.Errorf("rebuilding derived state: %w", err)
+	if len(manifest.Exports) > 0 {
+		if err := RebuildDelta(ctx, logger, store, fromLogSeq, fromAuditSeq); err != nil {
+			return fmt.Errorf("rebuilding derived state: %w", err)
+		}
+	}
+
+	// Legacy log folds run first; the explicit operational snapshot is newer
+	// and supersedes them. Activation only follows a successful staging restore.
+	if policy != nil {
+		batch := store.OpenWriteSession()
+		defer func() { _ = batch.Cancel() }()
+		if err := state.SaveClusterPolicy(batch, policy); err != nil {
+			return fmt.Errorf("restoring operational policy: %w", err)
+		}
+		if err := batch.Commit(); err != nil {
+			return fmt.Errorf("committing operational policy: %w", err)
+		}
 	}
 
 	return nil

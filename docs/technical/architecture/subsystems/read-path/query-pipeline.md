@@ -61,6 +61,47 @@ sequenceDiagram
 
 The HTTP REST surface (`internal/adapter/http/`) is a thin wrapper that routes to the same controller methods.
 
+### Named compilation inputs
+
+`query.Compile(filter, options)` and `query.CompileReverse(filter, options)`
+share `query.CompileOptions`. The named fields make the two reader roles and
+their horizon explicit: `MainReader` is the main snapshot used by primary-store
+leaves and enrichment, and `Pin` is its native applied sequence. `IndexReader`
+is the index snapshot used for iteration; `IndexVersionFor` must resolve through
+that same snapshot at the supplied pin. Ledger information, schema, and the
+index registry come from the main snapshot.
+
+The options borrow these resources. Compilation creates fresh recursive state
+but does not acquire or close snapshots or leases; callers still perform
+alignment, horizon trimming, and cleanup. Forward and reverse entry points
+retain their directional iterator construction and share the same input defaults.
+
+### Shared condition resolution
+
+Forward and reverse compilation retain separate recursive dispatch, Boolean
+assembly, iterator constructors and profile labels. Their direction-independent
+leaf preparation has shared owners: `resolveAddressMatch` classifies literal
+and parameter exact/prefix addresses and gates the selected transaction role
+index; `resolveReferenceCondition` gates and resolves reference prefixes;
+`resolveAccountHasAssetPrefix` gates and encodes the asset cell. Account address
+matching requires no transaction index. Address and reference readiness checks
+still precede parameter extraction.
+
+Metadata string/bool point prefixes and both existence arms are resolved once
+using the already selected metadata context and served version. Numeric bound,
+coercion and timestamp-arm helpers remain shared. Transaction-ID equality
+preparation checks main-store existence; log-ID point preparation checks the
+index. Both directions share half-open ID range encoding without overflowing
+an unbounded maximum. The existing forward log singleton-MaxUint64 point
+shortcut and reverse bounded scan remain directional construction choices.
+
+Resolvers own their encoded keys and do not construct or retain result
+iterators. ID point-existence checks open short-lived bounded Pebble iterators
+and close them before returning. Constructors retain pin gates, cleanup,
+profiling and physical traversal. Streaming leaves still
+seek to the cursor and stop at page lookahead; value-ordered ranges and
+transaction address unions retain their existing single materialization.
+
 ### Filter input: one `*commonpb.QueryFilter`
 
 Whatever the transport, a filter reaches the pipeline as a single
@@ -185,6 +226,23 @@ The boolean combinators are **direction-parameterized, not duplicated**: each is
 
 The filter compiler turns a `QueryFilter` proto into a tree of these. `Seek` is an **absolute** reposition to the first entity at or after the target *in the iterator's direction* — `AndIterator.Seek` force-seeks *every* child to the target (EN-1597; a child left ahead would skip valid intersections), and the ahead-child leapfrog survives only inside `converge`'s merge loop. Exhausted leaves stay re-seekable; the `seekFloor`/`seekCeil` cache keeps repeated re-seeks of a proven-empty child O(1). See [iterator-seek-contract.md](iterator-seek-contract.md).
 
+### Current accounts and historical address matches
+
+An exact address filter on TRANSACTIONS reads the selected ANY, SOURCE or
+DESTINATION mapping even when the account has no remaining primary-store
+volume or metadata attributes. These mappings describe historical postings,
+so purging an EPHEMERAL account's volume cells does not remove its funding or
+draining transactions from exact address search. Both hardcoded and
+parameterized exact matches follow this rule in either sort direction. The
+normal index readiness, projection alignment and main-store horizon gates
+still apply.
+
+Exact address filters on ACCOUNTS continue checking current primary-store
+attributes. Prefix address filters on either target enumerate current accounts
+before consulting mappings; they do not expand over historical-only addresses.
+The exact transaction path still uses the materialized address union described
+below, with the existing construction cost and pagination behavior.
+
 ### Direction is compiled, not applied afterwards
 
 The compiler has two entry points over one recursion shape: `query.Compile` builds the ascending tree, `query.CompileReverse` (`internal/query/compile_reverse.go`) builds the descending one, out of the shared combinators and the direction-specific leaves. `listDescFiltered` therefore has the same shape as `listAscending` — compile, trim to the main-store horizon, hand to `PaginateReverse` — and a descending page seeks to its cursor and stops after the lookahead.
@@ -193,7 +251,16 @@ Before EN-1966 a filtered descending page drained **every** match into a slice, 
 
 Iterator *construction* is what is duplicated between the two entry points — and that is more than the leaves. `compileRev` carries its own recursion shape: the depth guard, the per-target `rejectInvalidCondition` check, the filter-type dispatch switch, and the AND/OR/NOT/universe composition together with its profile-tree wiring. A change to ascending composition semantics does **not** propagate on its own; it has to be mirrored by hand in `compile_reverse.go`.
 
-What *is* shared is what a filter means: predicate resolution, schema validation, index-readiness gating and bound computation are single functions called from both directions (`resolveFieldMetadataCtx`, `resolveIntBounds`/`resolveUintBounds`, `requireIndexReady`, `mergeFieldRanges`, `resolveTxTimestampArm`/`resolveLogDateArm`, `intRangeBounds`/`uintRangeBounds`/`timestampRangeBounds`). So the two directions cannot disagree about which entities a filter selects, nor about accepting or refusing it — only about which way they walk the result. `TestCompileErrorParity` pins the refusal half: for the target guard, the depth guard, the per-target validity table, schema and coercion checks, index readiness and the "condition has no value" arms, both entry points must fail with the *identical* error, and `TestCompileErrorParity_AcceptanceIsAlsoShared` pins the converse — every filter the ascending compiler accepts must compile descending too.
+Shared helpers own the condition resolution described above, together with
+schema validation, index readiness, numeric bounds, timestamp arms and range
+encoding. Separate dispatch and composition still require parity coverage:
+sharing leaf helpers alone cannot prove matching acceptance or membership.
+`TestCompileErrorParity` pins the same refusal and error message for target,
+depth, shape, schema, coercion and readiness failures, while
+`TestCompileErrorParity_AcceptanceIsAlsoShared` pins successful compilation in
+both directions. The focused leaf-resolution tests additionally assert
+independent expected identities, so a mistake in a shared resolver cannot pass
+merely because both directions agree.
 
 **Two leaf classes stay materializing**, both because their order genuinely forbids streaming:
 

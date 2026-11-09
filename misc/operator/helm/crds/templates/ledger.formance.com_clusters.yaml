@@ -2092,7 +2092,35 @@ spec:
                       port:
                         description: Port for the trace exporter.
                         type: string
+                      sampler:
+                        description: |-
+                          Sampler selects a standard OpenTelemetry head-sampling policy. Omitted
+                          values preserve the SDK default or raw extraEnv sampler configuration.
+                          Typed sampling cannot be combined with raw sampler variables in extraEnv.
+                        enum:
+                        - always_on
+                        - always_off
+                        - traceidratio
+                        - parentbased_always_on
+                        - parentbased_always_off
+                        - parentbased_traceidratio
+                        type: string
+                      samplerArg:
+                        description: |-
+                          SamplerArg is the explicit finite ratio in [0,1] required by traceidratio
+                          and parentbased_traceidratio. Other policies must omit this argument.
+                        type: string
+                        x-kubernetes-validations:
+                        - message: samplerArg must be a finite ratio in [0,1]
+                          rule: double(self) >= 0.0 && double(self) <= 1.0
                     type: object
+                    x-kubernetes-validations:
+                    - message: samplerArg requires a ratio sampler
+                      rule: '!has(self.samplerArg) || (has(self.sampler) && self.sampler
+                        in [''traceidratio'', ''parentbased_traceidratio''])'
+                    - message: ratio sampler requires samplerArg
+                      rule: '!has(self.sampler) || !(self.sampler in [''traceidratio'',
+                        ''parentbased_traceidratio'']) || has(self.samplerArg)'
                 type: object
               networkPolicy:
                 description: NetworkPolicy configuration for egress restrictions.
@@ -2546,9 +2574,10 @@ spec:
                         - type: integer
                         - type: string
                         description: |-
-                          Size is the initial and minimum requested capacity of the volume. Automatic
-                          expansion updates the live PVCs only and never rewrites this field or the
-                          StatefulSet VolumeClaimTemplates.
+                          Size is the initial and minimum requested capacity of the volume. Increases
+                          reconcile existing PVCs and claim templates; decreases never shrink them.
+                          Automatic expansion updates live PVCs only and never rewrites this field
+                          or the StatefulSet VolumeClaimTemplates.
                         pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
                         x-kubernetes-int-or-string: true
                       storageClass:
@@ -2558,7 +2587,9 @@ spec:
                         type: string
                       volumeAttributesClassName:
                         description: |-
-                          VolumeAttributesClassName is the name of the VolumeAttributesClass to use for the PVC.
+                          VolumeAttributesClassName selects the CSI performance profile for new and
+                          existing PVCs. Changes are applied in place; clearing a non-empty class is
+                          unsupported. Completion is reported separately from accepting the request.
                           Requires the VolumeAttributesClass feature gate to be enabled (beta in K8s 1.31+).
                           Mutually exclusive with hostPath.
                         type: string
@@ -2685,9 +2716,10 @@ spec:
                         - type: integer
                         - type: string
                         description: |-
-                          Size is the initial and minimum requested capacity of the volume. Automatic
-                          expansion updates the live PVCs only and never rewrites this field or the
-                          StatefulSet VolumeClaimTemplates.
+                          Size is the initial and minimum requested capacity of the volume. Increases
+                          reconcile existing PVCs and claim templates; decreases never shrink them.
+                          Automatic expansion updates live PVCs only and never rewrites this field
+                          or the StatefulSet VolumeClaimTemplates.
                         pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
                         x-kubernetes-int-or-string: true
                       storageClass:
@@ -2697,7 +2729,9 @@ spec:
                         type: string
                       volumeAttributesClassName:
                         description: |-
-                          VolumeAttributesClassName is the name of the VolumeAttributesClass to use for the PVC.
+                          VolumeAttributesClassName selects the CSI performance profile for new and
+                          existing PVCs. Changes are applied in place; clearing a non-empty class is
+                          unsupported. Completion is reported separately from accepting the request.
                           Requires the VolumeAttributesClass feature gate to be enabled (beta in K8s 1.31+).
                           Mutually exclusive with hostPath.
                         type: string
@@ -4107,6 +4141,34 @@ spec:
           status:
             description: ClusterStatus defines the observed state of Cluster.
             properties:
+              claimTemplateRecovery:
+                description: |-
+                  ClaimTemplateRecovery identifies the durable journal for a claim-template
+                  replacement. The operator restores that workload before newer spec edits.
+                properties:
+                  completed:
+                    type: boolean
+                  configMapName:
+                    description: ConfigMapName includes a prefix of the complete authorized
+                      digest.
+                    type: string
+                  configMapUID:
+                    description: ConfigMapUID is bound only after the immutable journal
+                      is authenticated.
+                    type: string
+                  payloadSHA256:
+                    description: PayloadSHA256 covers the complete JSON payload and
+                      its Cluster identity.
+                    type: string
+                  sourceUID:
+                    description: SourceUID identifies the original StatefulSet saved
+                      in the payload.
+                    type: string
+                required:
+                - configMapName
+                - payloadSHA256
+                - sourceUID
+                type: object
               conditions:
                 description: Conditions represent the latest available observations.
                 items:
@@ -4242,6 +4304,48 @@ spec:
                 required:
                 - mode
                 - secretName
+                type: object
+              upgrade:
+                description: |-
+                  Upgrade records an interrupted mandatory stop-and-recreate upgrade.
+                  It is persisted before the old StatefulSet is deleted.
+                properties:
+                  claimUIDs:
+                    additionalProperties:
+                      type: string
+                    description: ClaimUIDs pins each pre-existing volume to its original
+                      claim.
+                    type: object
+                  drainEpoch:
+                    description: DrainEpoch identifies the Raft admission cutoff across
+                      operator restarts.
+                    type: string
+                  expectedReplicas:
+                    format: int32
+                    type: integer
+                  phase:
+                    type: string
+                  source:
+                    type: string
+                  statefulSetUID:
+                    type: string
+                  target:
+                    type: string
+                  targetSpecHash:
+                    type: string
+                  volumeUIDs:
+                    additionalProperties:
+                      type: string
+                    description: VolumeUIDs pins every bound PV reused by the original
+                      claims.
+                    type: object
+                required:
+                - expectedReplicas
+                - phase
+                - source
+                - statefulSetUID
+                - target
+                - targetSpecHash
                 type: object
             type: object
         type: object

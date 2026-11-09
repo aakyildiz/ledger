@@ -32,10 +32,18 @@ import (
 type ClusterReconciler struct {
 	client.Client
 
+	APIReader client.Reader
+
 	Scheme    *runtime.Scheme
 	Config    *rest.Config
 	Clientset kubernetes.Interface
 	Recorder  record.EventRecorder
+	// stopVersions overrides the shipped boundary list in focused tests.
+	stopVersions []string
+	// OperatorVersion is the release version embedded in the running binary.
+	OperatorVersion string
+
+	claimTemplateRetries claimTemplateRetries
 }
 
 // +kubebuilder:rbac:groups=ledger.formance.com,resources=clusters,verbs=get;list;watch;create;update;patch;delete
@@ -63,11 +71,17 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (re
 	// Fetch the Cluster CR
 	ledger := &ledgerv1alpha1.Cluster{}
 	if err := r.Get(ctx, req.NamespacedName, ledger); err != nil {
+		if apierrors.IsNotFound(err) {
+			r.claimTemplateRetries.forget(req.NamespacedName)
+		}
+
 		return ctrl.Result{}, ignoreNotFound(err)
 	}
 
 	// Handle deletion — owned resources are garbage-collected via owner references.
 	if !ledger.DeletionTimestamp.IsZero() {
+		r.claimTemplateRetries.forget(req.NamespacedName)
+
 		return ctrl.Result{}, nil
 	}
 	// Commit the identity before any resource can start a Ledger process. An
@@ -110,11 +124,41 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (re
 		result, retErr = r.reportResourceNameConflict(ctx, ledger, result, retErr)
 	}()
 
+	// Restore an interrupted claim-template replacement before applying any new
+	// desired changes, including an invalid spec or a changed RC target.
+	if handled, result, err := r.resumeClaimTemplateRecovery(ctx, ledger); handled || err != nil {
+		return result, err
+	}
+
 	// An in-flight drain owns the workload until its release completes. This
 	// also lets annotation removal reopen admission even if a later spec edit
 	// is invalid or a rollout would otherwise start.
 	if ledger.Status.Drain != nil {
 		return r.reconcileAnnotatedDrain(ctx, ledger, r.PreflightDrainBarrier, r.EnsureDrainBarrier, r.EnsureDrainReleased)
+	}
+
+	versionReason, versionErr := validateLedgerVersion(ledger, r.OperatorVersion)
+	versionStatus := metav1.ConditionTrue
+	versionMessage := "Declared Ledger image tag does not exceed the Ledger Operator release"
+	if versionReason == "DevelopmentVersions" {
+		versionStatus = metav1.ConditionUnknown
+		versionMessage = fmt.Sprintf("development versions %q and %q cannot be compared", ledger.Spec.Image.Tag, r.OperatorVersion)
+	}
+	if versionErr != nil {
+		versionStatus = metav1.ConditionFalse
+		versionMessage = versionErr.Error()
+	}
+	meta.SetStatusCondition(&ledger.Status.Conditions, metav1.Condition{
+		Type:               "VersionCompatible",
+		Status:             versionStatus,
+		Reason:             versionReason,
+		Message:            versionMessage,
+		ObservedGeneration: ledger.Generation,
+	})
+	if versionErr != nil {
+		ledger.Status.Phase = "Error"
+
+		return ctrl.Result{}, nil
 	}
 
 	// Validate spec — report errors via status condition instead of retrying.
@@ -139,9 +183,14 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (re
 		return ctrl.Result{}, fmt.Errorf("fetching StatefulSet for RC upgrade validation: %w", err)
 	}
 	var rcUpgradeError error
-	if existingStatefulSet == nil {
+	switch {
+	case ledger.Status.Upgrade != nil:
+		if ledger.Spec.Image.Tag != ledger.Status.Upgrade.Target {
+			rcUpgradeError = fmt.Errorf("stopped upgrade is in progress; restore spec.image.tag to %s", ledger.Status.Upgrade.Target)
+		}
+	case existingStatefulSet == nil:
 		rcUpgradeError = r.validateRCUpgradeWithoutStatefulSet(ctx, ledger)
-	} else {
+	default:
 		rcUpgradeError = validateRCUpgrade(ledger.Spec.Image.Tag, existingStatefulSet)
 	}
 	if rcUpgradeError != nil {
@@ -152,6 +201,12 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (re
 			Message:            rcUpgradeError.Error(),
 			ObservedGeneration: ledger.Generation,
 		})
+		if ledger.Status.Upgrade != nil {
+			meta.SetStatusCondition(&ledger.Status.Conditions, metav1.Condition{
+				Type: "Upgrade", Status: metav1.ConditionFalse, Reason: "Blocked",
+				Message: rcUpgradeError.Error(), ObservedGeneration: ledger.Generation,
+			})
+		}
 		ledger.Status.Phase = "Error"
 
 		return ctrl.Result{}, nil
@@ -164,7 +219,6 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (re
 		Reason:             "Valid",
 		ObservedGeneration: ledger.Generation,
 	})
-
 	// Prune optional Services whose spec marks them disabled BEFORE running
 	// the drift guard: an edit that both disables a Service and tweaks
 	// additionalLabels would otherwise abort on drift detected on the
@@ -248,6 +302,45 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (re
 		}
 	}
 
+	// Keep dependencies needed by old and replacement pods available while the
+	// stop gate holds all workload mutations. A missing headless Service prevents
+	// ledgerctl from reaching the old voters; a missing TLS Secret prevents
+	// replacement pods from starting.
+	if err := r.reconcileHeadlessService(ctx, ledger); err != nil {
+		return ctrl.Result{}, fmt.Errorf("reconciling HeadlessService: %w", err)
+	}
+	if err := r.reconcileClusterSecretForTLSState(ctx, ledger, false); err != nil {
+		return ctrl.Result{}, fmt.Errorf("reconciling ClusterSecret: %w", err)
+	}
+	if ledger.Status.Upgrade != nil {
+		if err := r.reconcileServiceAccount(ctx, ledger); err != nil {
+			return ctrl.Result{}, fmt.Errorf("reconciling ServiceAccount during stopped upgrade: %w", err)
+		}
+		if _, _, err := r.reconcileAuthKeysWithDeletion(ctx, ledger, false); err != nil {
+			return ctrl.Result{}, fmt.Errorf("reconciling AuthKeys during stopped upgrade: %w", err)
+		}
+	}
+	// A persisted scale-down cleanup marker lives on the source StatefulSet.
+	// Finish that cleanup before the stopped-upgrade gate may delete it.
+	if err := r.cleanupPendingScaleDownPVCs(ctx, ledger, existingStatefulSet); err != nil {
+		return ctrl.Result{}, fmt.Errorf("completing pending scale-down PVC cleanup before stopped upgrade: %w", err)
+	}
+
+	// The stop gate runs before any generic template mutation, including the
+	// scale-down and immutable claim-template recreation paths.
+	proceed, upgradeResult, err := r.reconcileRequiredUpgrade(ctx, ledger, existingStatefulSet)
+	if err != nil {
+		meta.SetStatusCondition(&ledger.Status.Conditions, metav1.Condition{Type: "Upgrade", Status: metav1.ConditionFalse, Reason: "Blocked", Message: err.Error(), ObservedGeneration: ledger.Generation})
+		ledger.Status.Phase = "Error"
+
+		return ctrl.Result{}, fmt.Errorf("reconciling required stopped upgrade: %w", err)
+	}
+	if !proceed {
+		ledger.Status.Phase = "Pending"
+
+		return upgradeResult, nil
+	}
+
 	// Compute spec hash for rolling updates
 	specHash := computeSpecHash(&ledger.Spec)
 
@@ -257,7 +350,6 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (re
 		fn   func(context.Context, *ledgerv1alpha1.Cluster) error
 	}{
 		{"ServiceAccount", r.reconcileServiceAccount},
-		{"HeadlessService", r.reconcileHeadlessService},
 		{"Service", r.reconcileService},
 		{"GrpcService", r.reconcileGrpcService},
 		{"Ingress", r.reconcileIngress},
@@ -280,22 +372,6 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (re
 		logger.Error(err, "failed to reconcile auth keys")
 
 		return ctrl.Result{}, fmt.Errorf("reconciling AuthKeys: %w", err)
-	}
-
-	// Reconcile the cluster-secret (TLS static bearer token) BEFORE the
-	// AuthKeysPending gate, but only its SAFE (create/update) side: mayDelete=false.
-	// Creating/keeping the Secret while any StatefulSet references it never mutates
-	// the pod template or triggers a rollout, so it is safe (and necessary) even
-	// while the auth-keys fail-safe holds the StatefulSet pass — otherwise a Secret
-	// that went missing during a long Credentials-non-distribution window would
-	// crash restarted pods referencing CLUSTER_SECRET via SecretKeyRef. Deletion
-	// (TLS-off) is deferred to AFTER reconcileStatefulSet on the non-pending path,
-	// so we never delete a Secret still referenced by a StatefulSet we cannot update
-	// (EN-1487; only the pod-template mutation may be frozen, not this).
-	if err := r.reconcileClusterSecretForTLSState(ctx, ledger, false); err != nil {
-		logger.Error(err, "failed to reconcile cluster secret")
-
-		return ctrl.Result{}, fmt.Errorf("reconciling ClusterSecret: %w", err)
 	}
 
 	// Fail-safe (EN-1487): the auth-key set cannot be safely reconciled yet.
@@ -351,6 +427,13 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (re
 
 		return ctrl.Result{}, fmt.Errorf("reconciling StatefulSet: %w", err)
 	}
+	if ledger.Status.ClaimTemplateRecovery != nil {
+		// The saved workload owns recovery. Do not start a drain or remove
+		// dependencies while its StatefulSet may be absent.
+		return stsResult, nil
+	}
+	// The normal workload pass can now apply the refreshed key projection.
+	meta.RemoveStatusCondition(&ledger.Status.Conditions, "AuthKeysRolloutDeferred")
 
 	// Now that reconcileStatefulSet has run (not pending), the pod template has
 	// dropped the CLUSTER_SECRET SecretKeyRef if TLS is disabled — so it is finally
@@ -447,6 +530,10 @@ func (r *ClusterReconciler) updateStatus(ctx context.Context, ledger *ledgerv1al
 	// Preserve the phase set during reconciliation (e.g. "Degraded" from
 	// validation failure) before we try to recompute from StatefulSet state.
 	reconciledPhase := ledger.Status.Phase
+	replicas := int32(3)
+	if latest.Spec.Replicas != nil {
+		replicas = *latest.Spec.Replicas
+	}
 
 	// Get the StatefulSet to read ready replicas
 	sts := &appsv1.StatefulSet{}
@@ -475,11 +562,6 @@ func (r *ClusterReconciler) updateStatus(ctx context.Context, ledger *ledgerv1al
 	} else {
 		latest.Status.ReadyReplicas = sts.Status.ReadyReplicas
 
-		replicas := int32(3)
-		if latest.Spec.Replicas != nil {
-			replicas = *latest.Spec.Replicas
-		}
-
 		switch {
 		// An "Error" phase is set when reconciliation hit a hard stop
 		// (invalid spec, selector drift). Keep it visible — recomputing
@@ -487,6 +569,8 @@ func (r *ClusterReconciler) updateStatus(ctx context.Context, ledger *ledgerv1al
 		// users and automation that key off .status.phase.
 		case reconciledPhase == "Error":
 			latest.Status.Phase = "Error"
+		case latest.Status.Upgrade != nil:
+			latest.Status.Phase = "Pending"
 		case sts.Status.ReadyReplicas == replicas:
 			latest.Status.Phase = "Running"
 		case sts.Status.ReadyReplicas > 0:
@@ -499,6 +583,7 @@ func (r *ClusterReconciler) updateStatus(ctx context.Context, ledger *ledgerv1al
 	latest.Status.ObservedGeneration = latest.Generation
 	latest.Status.Endpoints = ledger.Status.Endpoints
 	latest.Status.TLSMigrationPhase = ledger.Status.TLSMigrationPhase
+	latest.Status.Upgrade = ledger.Status.Upgrade
 
 	// Set condition
 	condition := metav1.Condition{
@@ -513,7 +598,11 @@ func (r *ClusterReconciler) updateStatus(ctx context.Context, ledger *ledgerv1al
 	} else {
 		condition.Status = metav1.ConditionFalse
 		condition.Reason = "ReplicasNotReady"
-		condition.Message = fmt.Sprintf("%d/%d replicas ready", latest.Status.ReadyReplicas, *latest.Spec.Replicas)
+		condition.Message = fmt.Sprintf("%d/%d replicas ready", latest.Status.ReadyReplicas, replicas)
+		if versionCondition := meta.FindStatusCondition(latest.Status.Conditions, "VersionCompatible"); versionCondition != nil && versionCondition.Status == metav1.ConditionFalse {
+			condition.Reason = versionCondition.Reason
+			condition.Message = versionCondition.Message
+		}
 	}
 	meta.SetStatusCondition(&latest.Status.Conditions, condition)
 
@@ -655,6 +744,10 @@ func validateSpec(ledger *ledgerv1alpha1.Cluster) error {
 // this only rejects values that would either be silently ignored or that the
 // server would refuse.
 func validateClusterConfig(spec *ledgerv1alpha1.ClusterSpec) error {
+	if err := validateTraceSampling(spec); err != nil {
+		return err
+	}
+
 	// Auth requires TLS. The ledger server rejects --auth-enabled unless
 	// --tls-mode=required, and buildEnvVars defers auth env until TLS converges
 	// to `required`. Without this guard a CR with auth.enabled=true but

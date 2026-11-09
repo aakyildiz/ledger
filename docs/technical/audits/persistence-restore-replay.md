@@ -80,7 +80,7 @@ table is a discovery map, not a frozen exhaustive schema.
 | Live primary mutations | `internal/domain/processing/`, `internal/infra/state/`, `internal/infra/attributes/`: enumerate every audited apply mutation, including deletion/range-deletion and proposal-local effects. Record persisted class and exact keys. |
 | Durable storage | `internal/storage/dal/`, `wal/`, `spool/`, `pebblecfg/`: establish write-session commit, checkpoint, cursor and recovery semantics. A cache or snapshot read is not proof that the primary write is durable. |
 | Backup publication | `internal/application/backup/`, `internal/infra/backup/manager.go`, `manifest.go`, `segment.go`, and `cmd/ledgerctl/store/incremental_backup.go`: trace sequence capture, segment contents, object upload, manifest swap and orphan pruning. The current published manifest must always remain fully restorable. |
-| Raw delta application | `internal/infra/backup/restore.go`: verify manifest/type/range/key-shape/stream validation, batch commits, partial-prefix behavior and retry. Permanent history residency must equal the source logically. |
+| Raw delta application | `internal/infra/backup/restore.go`: verify manifest/type/range/key-shape/stream validation, batch commits, partial-prefix behavior and retry. Per-object stream checks cannot detect a whole omitted segment reference; `validateExportCoverage` must reject cross-object gaps, overlaps and reordering of dense streams from the checkpoint boundary before download, while applied-proposal segments stay sparse. Permanent history residency must equal the source logically. |
 | Derived-state rebuild | `internal/infra/backup/rebuild.go`, `internal/domain/replay/`: compare every replay branch and fold with its live writer. Essential facts may live in `LedgerLog`, chain-bound serialized `AuditItem`, or `AppliedProposal`; absence must not silently become a default. |
 | Restore preparation and bootstrap | `internal/infra/attributes/prepare.go`, `internal/bootstrap/`, restore gRPC and `ledgerctl` commands: distinguish retained genesis boundary and business provenance from cleared source identity, peers, transient jobs, cache/bloom state, and restored query-checkpoint provenance. |
 | Controlled drain state | `internal/infra/state/`, `internal/storage/dal/store.go`, and `internal/infra/backup/`: trace the Raft-applied marker/release, Pebble batch and applied index, qualifying status fsync, local reopen, in-cluster snapshot sync and cross-cluster restore preparation. Active drain is local operational state; it survives restart with the same volume but is discarded with `ZoneClusterTransient` on cross-cluster restore. |
@@ -190,6 +190,20 @@ full CLI confirmation/finalization coverage. Rooted deletion and namespace safet
 belong to `filesystem-confinement-contracts`; no persisted format migration or
 repair of a finalized corrupt restore is introduced by this reset.
 
+Follower-sync staging follows the same rule per session, not only per donor.
+`grpcSnapshotFetcher.FetchSnapshot` empties staging and resets progress before
+every session retry, and `fallbackSnapshotFetcher` does the same before every
+donor change. A donor restart between two sessions changes the checkpoint file
+set, and a leftover `MANIFEST`, WAL or `marker.manifest.000001.*` from the
+failed session can make Pebble open a stale manifest over the new WAL. The
+result is a restored applied index that covers entries whose effects are
+missing. `TestGRPCSnapshotFetcher_SessionRetryDiscardsEarlierSessionFiles` is
+the evidence oracle: inspect the final staging listing, not only the bytes of
+the manifest files. `verifyStagingMatchesManifest` then enforces the same
+property before success, and `TestGRPCSnapshotFetcher_RejectsStagingEntryOutsideManifest`
+proves a stray entry fails the fetch as a local fault rather than a donor
+fallback.
+
 Reject or downgrade a candidate when current evidence shows that the state is
 explicitly discarded and safely reseeded, the delta cannot change a preserved
 value, the alleged export state is unreachable, validation fails before
@@ -230,3 +244,32 @@ CreatedLedgerLog carries initial metadata so post-checkpoint creation reconstruc
 Does a restore with nonempty checkpoint files and a nonempty post-checkpoint creation delta reproduce typed initial metadata for normal and mirror ledgers, including explicit protobuf null and a schema type mismatch?
 
 See [the creation contract](../architecture/subsystems/api/atomic-ledger-creation.md) for the authorized semantics and regression evidence. Treat HTTP response/forwarding, actual FSM readback, keyed replay, nonempty checkpoint-plus-delta restore, and primary-projection tampering as separate evidence oracles; a helper-only test does not prove every boundary.
+
+## Proposal payload cutover
+
+The proposal codec is part of this contract. Production writers serialize the
+execution and policy oneof directly after a full-stop upgrade. All source nodes
+must stop before any target starts, and old binaries must never reopen a WAL
+containing new payloads, including technical entries written during startup.
+Historical replay must retain exact audit bytes and hashes. Native policy
+controls are operational and emit neither audit nor business logs; they are never
+lowered to orders. Compare final state across formats, verify each chain and its
+expected audit count, and preserve the historical prefix byte-for-byte. Preserve
+coverage, HLC semantics and checkpoint boundaries. Test policy-only incremental
+manifest publication and mixed historical/native delta restore. Current policy
+and operational quotas are explicitly outside business checker scope.
+See [proposal payloads](../architecture/subsystems/consensus/proposal-payloads.md).
+
+## Historical address search after a purge delta
+
+Checkpoint a funded EPHEMERAL account, then commit its final drain and require
+nonempty log/audit exports. Restore through the production checkpoint-plus-delta
+composition, run CheckStore, and verify that the checkpoint-era volume is absent
+while both funding and draining history remain searchable after rebuilding the
+peer read store. Compare independent ANY/SOURCE/DESTINATION IDs in both directions
+on source and restored stores. The real-admission fixture in
+`internal/infra/backup/historical_address_restore_test.go` is an evidence lead.
+Fresh read-store reconstruction uses retained transaction and AppliedProposal
+history; it does not repair pre-existing frozen query-checkpoint read copies.
+Read-consistency-projections owns index population/readiness, and
+query-semantic-equivalence owns exact-versus-prefix selection at a fixed horizon.

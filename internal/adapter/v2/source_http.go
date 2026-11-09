@@ -8,7 +8,11 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
+	"strings"
+
+	"github.com/formancehq/ledger/v3/internal/pkg/httptransport"
 )
 
 // HTTPSource is a Source that fetches logs from a v2 ledger HTTP API.
@@ -16,19 +20,33 @@ type HTTPSource struct {
 	baseURL    string
 	ledgerName string
 	httpClient *http.Client
+	// closeIdle is false when the default client shares an uncloneable
+	// http.DefaultTransport, whose idle connections Close must leave alone.
+	closeIdle bool
 }
 
 // NewHTTPSource creates a new HTTP-based v2 log source.
-// If httpClient is nil, a default http.Client is used.
+// If httpClient is nil, a client with its own transport is used when possible,
+// so Close does not drop connections of other clients sharing
+// http.DefaultTransport.
 func NewHTTPSource(baseURL, ledgerName string, httpClient *http.Client) *HTTPSource {
+	return newHTTPSource(baseURL, ledgerName, httpClient, http.DefaultTransport)
+}
+
+// newHTTPSource derives the nil-client default from defaultTransport.
+func newHTTPSource(baseURL, ledgerName string, httpClient *http.Client, defaultTransport http.RoundTripper) *HTTPSource {
+	closeIdle := true
 	if httpClient == nil {
-		httpClient = &http.Client{}
+		var transport http.RoundTripper
+		transport, closeIdle = httptransport.Clone(defaultTransport)
+		httpClient = &http.Client{Transport: transport}
 	}
 
 	return &HTTPSource{
 		baseURL:    baseURL,
 		ledgerName: ledgerName,
 		httpClient: httpClient,
+		closeIdle:  closeIdle,
 	}
 }
 
@@ -50,9 +68,34 @@ func (s *HTTPSource) doGet(ctx context.Context, path string, query url.Values) (
 		return nil, fmt.Errorf("creating request: %w", err)
 	}
 
-	resp, err := s.httpClient.Do(req)
+	// Observe credentials before net/http masks passwords in its final URL
+	// error. Copy the client so concurrent source calls keep separate state.
+	users := []*url.Userinfo{u.User}
+	client := *s.httpClient
+	transport := client.Transport
+	if transport == nil {
+		transport = http.DefaultTransport
+	}
+	redirects := &mirrorRedirectTransport{RoundTripper: transport}
+	client.Transport = redirects
+	client.CheckRedirect = func(next *http.Request, via []*http.Request) error {
+		users = append(users, next.URL.User)
+		if s.httpClient.CheckRedirect != nil {
+			err := s.httpClient.CheckRedirect(next, via)
+			users = append(users, next.URL.User)
+
+			return err
+		}
+		// Preserve net/http's default redirect limit when no policy was supplied.
+		if len(via) >= 10 {
+			return errors.New("stopped after 10 redirects")
+		}
+
+		return nil
+	}
+	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("fetching %s: %w", path, err)
+		return nil, fmt.Errorf("fetching %s: %w", path, s.transportDiagnostic(err, redirects.invalidURL, users...))
 	}
 
 	if resp.StatusCode != http.StatusOK {
@@ -63,6 +106,63 @@ func (s *HTTPSource) doGet(ctx context.Context, path string, query url.Values) (
 	}
 
 	return resp, nil
+}
+
+// transportDiagnostic detaches the diagnostic from the unsafe client error.
+// net/http masks passwords in its URL wrapper, but not passwordless userinfo;
+// transport causes may also repeat credentials. Never retain that error chain.
+func (s *HTTPSource) transportDiagnostic(err error, invalidRedirect bool, users ...*url.Userinfo) error {
+	values := []string{}
+	for _, user := range users {
+		if user == nil {
+			continue
+		}
+		values = append(values, user.String())
+		credentials := []string{user.Username()}
+		if password, ok := user.Password(); ok {
+			credentials = append(credentials, password)
+		}
+		for _, credential := range credentials {
+			if credential == "" {
+				continue
+			}
+			values = append(values, url.User(credential).String(), url.QueryEscape(credential), url.PathEscape(credential), credential)
+		}
+	}
+	// A credential can itself equal the usual replacement marker. In that case
+	// remove it rather than reintroducing it through the replacement text.
+	replacement := "[redacted]"
+	for _, value := range values {
+		if value != "" && strings.Contains(replacement, value) {
+			replacement = ""
+
+			break
+		}
+	}
+	// Prefer complete userinfo and longer overlapping forms. A single pass
+	// prevents subsequent replacements from modifying already redacted text.
+	sort.SliceStable(values, func(i, j int) bool { return len(values[i]) > len(values[j]) })
+	pairs := make([]string, 0, 2*len(values))
+	for _, value := range values {
+		if value != "" {
+			pairs = append(pairs, value, replacement)
+		}
+	}
+	// net/http includes an unparseable Location verbatim and never calls
+	// CheckRedirect, so its credentials cannot be collected there.
+	message := "invalid mirror redirect URL"
+	if !invalidRedirect {
+		message = err.Error()
+	}
+	message = strings.NewReplacer(pairs...).Replace(message)
+	// Preserve cancellation identity without retaining dependency error objects.
+	for _, cancellation := range []error{context.Canceled, context.DeadlineExceeded} {
+		if errors.Is(err, cancellation) {
+			return fmt.Errorf("%s: %w", message, cancellation)
+		}
+	}
+
+	return errors.New(message)
 }
 
 // FetchLogs fetches logs from the v2 API.
@@ -120,7 +220,41 @@ func (s *HTTPSource) GetLatestLogID(ctx context.Context) (uint64, error) {
 
 // Close closes idle connections in the underlying HTTP transport.
 func (s *HTTPSource) Close() error {
-	s.httpClient.CloseIdleConnections()
+	if s.closeIdle {
+		s.httpClient.CloseIdleConnections()
+	}
 
 	return nil
+}
+
+// mirrorRedirectTransport observes malformed redirect targets before net/http
+// renders them into errors. It leaves responses and redirect handling unchanged.
+// Each doGet owns its observer, including all requests in that redirect chain.
+type mirrorRedirectTransport struct {
+	http.RoundTripper
+
+	invalidURL bool
+}
+
+func (t *mirrorRedirectTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := t.RoundTripper.RoundTrip(req)
+	if err == nil && resp != nil {
+		switch resp.StatusCode {
+		case http.StatusMovedPermanently, http.StatusFound, http.StatusSeeOther, http.StatusTemporaryRedirect, http.StatusPermanentRedirect:
+			if location := resp.Header.Get("Location"); location != "" {
+				if _, parseErr := req.URL.Parse(location); parseErr != nil {
+					t.invalidURL = true
+				}
+			}
+		}
+	}
+
+	return resp, err
+}
+
+// CancelRequest preserves cancellation for legacy caller-supplied transports.
+func (t *mirrorRedirectTransport) CancelRequest(req *http.Request) {
+	if canceler, ok := t.RoundTripper.(interface{ CancelRequest(*http.Request) }); ok {
+		canceler.CancelRequest(req)
+	}
 }

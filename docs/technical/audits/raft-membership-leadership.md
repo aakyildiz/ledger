@@ -167,6 +167,19 @@ exceeds its stated operator-owned risk or fails to converge on retry/snapshot.
 
 ### Transport, forwarding, and ReadIndex
 
+Initial registration and replacement are distinct recovery triggers. Hold a
+fresh learner's Raft listener closed through production join preflight with
+optional TLS. Record the term, committed addition index, durable learner
+membership and valid persisted instance identity. A failed first probe must
+retain the committed endpoint and a live retry owner without downgrading a
+network error to plaintext. After listener startup, require autonomous
+replication, catch-up and automatic promotion without voter restart, another
+registration or another membership refresh. Verify pending retries terminate
+on removal and shutdown and cannot create a peer after shutdown. The lifecycle
+regression is `internal/bootstrap/join_transport_recovery_test.go`; independent
+pool and actual-stream delivery tests preserve the first-registration trigger
+separately from existing endpoint-replacement and monitor-fencing coverage.
+
 An interrupted cluster command on a stopped Raft run must surface as retryable
 gRPC `Unavailable`, including a wrapped `raft.ErrStopped`. Verify the shared
 unary/streaming conversion without classifying unrelated failures as transient;
@@ -246,6 +259,29 @@ restart out of sync, elect among themselves, resynchronize from a peer, and
 run a sink created inside the checkpoint. `TestSyncDonor`,
 `TestAddLearnerWaitsForLeaderReady`, `TestCheckAndPromoteLearnersWaitsForLeaderReady`,
 and `TestManagerLeadership` pin the donor rotation and the gates.
+
+Permanent donor loss is an independent recovery trigger. In
+`tests/e2e/cluster/checkpoint_donor_loss_test.go`, hold the recovering voter's
+real `PrepareSnapshot`, keep another checkpointable voter alive, and stop the
+original donor without restarting it. Prevent the healthy voter from initiating
+an election so the syncing voter must win, verify its store-dependent reads
+remain gated, then release preparation and require recovery plus a new
+acknowledged write. Compare literal balances on both surviving stores, including
+business data committed while synchronization was held. This proves survival of
+that committed suffix, but does not distinguish whether the later donor
+checkpoint contains it or spool replay supplies it; retain the existing
+out-of-sync restart regression separately.
+
+`internal/application/ctrl/snapshot_fetcher_donor_loss_test.go` isolates donor
+loss during preparation and after partial file bytes reach the real staging
+file. The RPC boundary is mocked, while the session, file verification and
+filesystem machinery execute normally. Require exact RPC attempts and distinct
+session identities, cleanup of the failed temporary file even when closing the
+dead donor's session fails, and removal of completed files from the abandoned
+session before the surviving donor starts. The winning session must produce
+literal final bytes and progress counters without accumulating abandoned data.
+These tests establish recovery after an explicit transport failure; they do not
+establish a recovery latency bound or detect an indefinitely stalled stream.
 
 After real snapshot catch-up, `tests/e2e/cluster/raft_test.go` restarts the
 recovered voter again and verifies retained business state through a
@@ -351,3 +387,31 @@ in-memory snapshot/cache and durable WAL prefix on any failure. The focused
 regression is `process_ready_snapshot_test.go` under `internal/infra/node/`.
 Snapshot-only processing retains its existing append count; a combined Ready
 reappends only the suffix once, with no retained-log scan.
+
+## Sent snapshot liveness evidence
+
+etcd/raft pauses every append to a peer whose Progress is in `StateSnapshot`.
+It leaves that state only when the leader calls `ReportSnapshot` for the peer
+or when an acknowledgement leaves `Match+1 >= firstIndex` on the leader.
+Prove that every outbound `MsgSnap` is reported from the orchestrate goroutine
+(`snapshotRecipients` in `sendReadyMessages`, then `finishReady`), and that a
+lost snapshot or a late acknowledgement after leader compaction leads to
+renewed probing or a fresh snapshot rather than a stalled peer. The focused
+regression is `leader_snapshot_report_test.go` under `internal/infra/node/`;
+the cluster-level triggers are the out-of-sync election and lost-follower
+specs under `tests/e2e/cluster/`.
+
+## Proposal payload cutover
+
+The proposal codec is part of this contract. Production writers serialize the
+execution and policy oneof directly after a full-stop upgrade. All source nodes
+must stop before any target starts, and old binaries must never reopen a WAL
+containing new payloads, including technical entries written during startup.
+Historical replay must retain exact audit bytes and hashes. Native policy
+controls are operational and emit neither audit nor business logs; they are never
+lowered to orders. Compare final state across formats, verify each chain and its
+expected audit count, and preserve the historical prefix byte-for-byte. Preserve
+coverage, HLC semantics and checkpoint boundaries. Test policy-only incremental
+manifest publication and mixed historical/native delta restore. Current policy
+and operational quotas are explicitly outside business checker scope.
+See [proposal payloads](../architecture/subsystems/consensus/proposal-payloads.md).

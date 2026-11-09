@@ -6,6 +6,13 @@ window. Unkeyed attempts and expired keys remain outside the single-effect
 guarantee. Error presentation at API boundaries is owned by
 `api-boundary-contracts`; a transport code alone never establishes non-commit.
 
+The service error boundary sends `grpc-retry-pushback-ms: -1` with a validated
+`Unavailable` / `MAINTENANCE_MODE` rejection. That stops native gRPC retries;
+it does not change the commit ambiguity of an earlier interrupted attempt.
+Explicit application retry loops retain their policy. Preserve the actual
+Antithesis factory's maintenance recovery regression below to prove that the
+hint does not end retry-forever keyed recovery.
+
 `UncommittedFailure` is a retryable technical interruption, not a frozen
 failure. A keyed first attempt on this branch writes no audit entry or
 idempotency result. An existing frozen outcome may still be replayed before
@@ -53,3 +60,49 @@ Initial metadata shares the CreateLedger operation identity and proposal atomici
 After a keyed creation carrying metadata, does replay preserve the original metadata and audit sequence? Does an invalid metadata map leave neither a ledger nor metadata rows or a consumed ledger ID?
 
 See [the creation contract](../architecture/subsystems/api/atomic-ledger-creation.md) for the authorized semantics and regression evidence. Treat HTTP response/forwarding, actual FSM readback, keyed replay, nonempty checkpoint-plus-delta restore, and primary-projection tampering as separate evidence oracles; a helper-only test does not prove every boundary.
+
+## Technical-update submission boundary
+
+Production submission through `plan.Builder.Run` rejects more than one technical
+update and permits a technical update alongside orders only for MirrorSync.
+Verify rejection before serialization/Raft submission, loader cleanup on both
+preload paths, and unchanged standalone operational updates. Historical committed
+compositions keep their interpreter; this admission guard must never become a
+replay-time semantic change. Pair MirrorSync with real ingestion and a concurrent
+ledger promotion: rejected ingestion must preserve the prior source head and
+applied position through recovery; successful ingestion advances both.
+See [the composition contract](../architecture/subsystems/fsm/technical-update-atomicity.md).
+
+## Metadata policy tightening and retained recovery
+
+Public admission preserves authentication, shape and safe preload construction,
+then submits ordinary business proposals. Existing FSM handlers evaluate mutable
+metadata policy after idempotency lookup. A matching retained success or failure
+replays without new audit or business effects. A fresh definitive refusal and a
+live content conflict are audited; missing, expired or evicted keys are new
+attempts under the policy at apply. A retained refusal must survive later policy
+loosening. Earlier preparation and readiness failures retain their precedence;
+there is no general admission-error replay bypass.
+
+Prove the original success/failure replay triggers, each metadata dimension,
+fresh keyed and unkeyed failure audit items, no durable business effects,
+conflict preservation of the original outcome, expiry/eviction, cancellation,
+log-read failures, and maintenance/drain/audit-capacity refusal. A failure can
+follow speculative handler writes, but the discarded WriteSet must leave no
+business projection or log. Runtime gates remain shared with
+`runtime-health-admission-contracts`; deduplicate by root cause.
+
+Queue policy tightening and an original prepared under the older policy. Apply
+only the policy, submit the retry, then hold both applies separately. Neither
+proposal acceptance nor the original's apply completes the retry; after ordered
+durable apply it returns the original frozen outcome without another audit.
+Also consider a retry submitted before the original: it is then the first
+attempt and must evaluate policy at that apply index.
+
+The ordinary proposal replicates request bytes and preloads declared keys. Fresh
+policy failures persist attempted orders in audit, while replay adds no audit
+rows. Cost scales with request bytes/keys and script dependencies, without a new
+historical scan or consensus-spanning lifecycle lock. Preserve cost-shape tests
+and local benchmark evidence; do not claim network/saturation measurements.
+No persisted projection, format, FSM interpreter or restore reconstruction changes.
+See [the admission contract](../architecture/subsystems/admission/idempotency.md#replay-after-metadata-limits-tighten).

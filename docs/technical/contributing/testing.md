@@ -41,6 +41,10 @@ example that reaches nearby code.
   bypassing the guarded production call and confirming that the focused test
   fails. Never keep the mutation in the worktree.
 
+Shell fixtures that wrap commands must resolve the underlying executable through
+`exec.LookPath` before adding wrappers to `PATH`. Pass that path to the wrapper
+explicitly. NixOS does not provide `/bin` or `/usr/bin` aliases for these tools.
+
 #### Nested AI-tooling fixtures
 
 Tests that launch AI workflow scripts or operate on synthetic Git repositories
@@ -143,6 +147,20 @@ func TestStoreIntegration(t *testing.T) {
     // ...
 }
 ```
+
+### Operator API-server regressions
+
+`nix develop .#operator-tests --command just operator-test-admission` runs
+Ledger and BackupRun target admission and BackupRun recovery/association regressions with
+the race detector against Kubernetes 1.32.x envtest. The selection includes
+both labeled lost-response recovery and minimally admitted, unlabeled manual
+runs through Job-result capture, parent events and accounting. These tests
+publish Job and Pod status themselves; they do not run a kubelet or prove
+garbage collection. Keep the recipe's selection aligned with these regression
+names so CI executes the API-server evidence as well as operator unit tests.
+`TestBackupRunParentSelectorIntegration` checks the CRD field selector and real
+manager-cache index with unlabeled runs, misleading labels, other parents,
+namespace isolation and empty results.
 
 ### Schemathesis API Conformance Tests
 
@@ -472,6 +490,9 @@ restart. It catches:
 - **Illegal business outcomes** — a failure the model can't reproduce under any
   serialization, or a linearizable read returning state outside the candidate
   set.
+- **Incomplete direct audit reads** — `GetAuditEntry` must return one
+  `AuditItem` per order for a modeled, committed success. `ListAuditEntries`
+  omits item bodies, so the model checks its entries without this count rule.
 
 It exercises the chart of accounts, STRICT/AUDIT enforcement switches through
 both setter forms, transactions and reverts (with post-commit volumes), color
@@ -865,12 +886,32 @@ or cloud credentials. The retry regression creates a real full checkpoint and
 nonempty incremental delta, interrupts after completed or partially committed
 rebuild, then checks exact volumes/balances and Checker health after retry.
 
-CI's `Tests` job runs `just test-internal-coverage` after light unit coverage.
-It selects `./internal/...` and `./cmd/ledgerctl/store` with every optional feature
-tag from `all_tags` and the race detector. This executes Kafka, NATS, ClickHouse and Databricks event
-tests, S3 and Azure backup tests, and the S3 bootstrap lifecycle regression.
+CI runs `Tests-Unit` (light unit coverage), `Tests-Internal` (all `./internal/...`
+packages with every optional feature tag), and `Tests-Store`
+(`./cmd/ledgerctl/store` with the same tags) in parallel. The optional-feature
+jobs use the race detector. Together they execute Kafka, NATS, ClickHouse and
+Databricks event tests, S3 and Azure backup tests, and the S3 bootstrap
+lifecycle regression.
 Full-tag E2E runs select different packages and do not execute these assertions.
-The separate `integration` tag is not enabled by this recipe.
+The separate `integration` tag is not enabled by these recipes.
+
+On 2026-10-29, the former sequential `Tests` job in
+[run 40921999115](https://github.com/formancehq/ledger/actions/runs/40921999115/job/123617430871)
+took 15m39s: setup 29s, unit coverage 4m44s, optional-feature internal coverage
+8m19s, PostgreSQL mirror 48s, and Antithesis assertions 1m14s. Within the
+internal step, `cmd/ledgerctl/store` alone reported 6m14s of test time (6m03s
+in [run 40922047881](https://github.com/formancehq/ledger/actions/runs/40922047881)).
+Five other successful jobs on that date took 11m15s–16m01s; unit coverage
+ranged from 2m56s to 5m35s and optional-feature internal coverage from 5m20s
+to 8m46s. These are observed times, not a before/after benchmark.
+
+With the five suites running concurrently, the expected completion of the
+`Tests` aggregate is roughly 8–11 minutes from runner start, dominated by the
+store suite. This assumes enough Namespace runners to start the jobs together,
+similar Go/Nix cache warmth, and unchanged test work. Each job repeats checkout
+and setup (about 30s in the reference run), and a cold cache or runner queue can
+erase part of the gain. Measure the actual after time in CI before treating this
+estimate as a regression threshold.
 
 Kafka, ClickHouse and S3 tests require Docker for their Testcontainers; NATS
 runs in-process, and the current internal Azure and Databricks tests require
@@ -878,13 +919,66 @@ no cloud credentials. Reproduce the CI step with:
 
 ```bash
 nix develop .#ci --command just test-internal-coverage
+nix develop .#ci --command just test-store-coverage
 ```
 
-The job uploads `build/coverage/internal.out` alongside `unit.out`. CI coverage
-merging requires the internal profile, and `just coverage-all` also includes
-this suite. A failure blocks the existing `Tests` release and image gates.
+The jobs upload `unit.out`, `internal.out`, and `store.out` separately. The
+`Tests-Postgres-Mirror` and `Tests-Antithesis-Assertions` jobs similarly upload
+`postgres-mirror.out` and `antithesis.out`. CI coverage merging requires all
+five profiles, and `just coverage-all` includes all five recipes. Each job is
+an explicit input to the existing `Tests` status check and release gate; a
+failure cannot be hidden by another job's profile.
 
 ### E2E Tests
+
+#### Pinned binary rolling upgrade (Chainsaw)
+
+After the harness is integrated into `release/v3.0`, run
+`just test-rolling-upgrade v3.0.0-rc.1 origin/release/v3.0` from a clean
+checkout of the integrated revision. For another binary transition, pass its
+distinct source and target Git refs. The target must descend from the source
+and include the harness commit.
+`tests/upgrade/run.sh` fetches `origin/<branch>` refs, records both exact
+commit SHAs, builds Linux images from those revisions, and runs the Chainsaw
+scenario in a dedicated kind cluster. Build and provenance-recording failures
+abort before cluster creation. Its three Pods use separate persistent
+WAL and data claims; Chainsaw replaces followers and then the old leader while
+maintenance remains active. The test checks source and target transactions,
+reads on every voter, rejected ledger creation and transaction posting on every
+ready live voter during mixed windows and replacement, durable Raft cursors,
+leadership transfer, and each voter’s audit/derived-store checker. Transient
+RPC failures are retried for a bounded period; an accepted write fails at once.
+
+The `.#upgrade` Nix shell provides Chainsaw, kind, kubectl, gh, and Docker client;
+a local Docker daemon is still required. `UPGRADE_PHASE_SECONDS` sets the
+minimum mixed-window soak (default 15 seconds). Use `KEEP_WORKDIR=1` to retain
+revision and image hashes and failed Pod logs. The runner is separate from the
+Antithesis model suite because that driver intentionally toggles maintenance.
+
+#### Adjacent v3.0 RC to branch HEAD (operator)
+
+Dispatch `.github/workflows/release-operator-upgrade.yml` with a
+`release/v3.0` branch and the default `rc2-to-rc3` transition, or run
+`RELEASE_BRANCH=release/v3.0 just test-release-operator-upgrade` locally after
+the harness on `main` has been integrated into that release branch. The
+launcher pins the published rc.2 source and exact release branch HEAD, pulls
+the source Ledger and operator images, and builds both target images from that
+one target commit. It tags the local images `v3.0.0-rc.3` without publishing
+them; recorded Docker and Pod image IDs prove which builds ran. Chainsaw
+checks an operator upgrade before the Ledger rollout, rejection of a
+non-adjacent RC request, old/new Ledger Pod coexistence with at least two
+Ready Pods, retained PVC identities, data and Raft progress before and after,
+and every voter's store check. The Ready Pod count does not establish Raft
+quorum during the mixed-version window. The test does not write during mixed
+Ledger versions or test maintenance-mode rejection.
+The workflow saves the evidence under `build/upgrade-operator/` and uploads it
+even on failure. A Docker daemon and access to the published GHCR image are
+required. The separate `rc3-to-rc4` transition is prepared for a future
+mandatory stopped boundary; run it only after rc.3 is published and the
+format-change PR adds rc.4 to the operator's stop list. It checks drain,
+absence of all old Pods before target Pod creation, retained PVCs, target-voter
+replay and post-upgrade audit. See [Server Binary Upgrades](../../ops/upgrades.md#operator-managed-rc2-to-rc3-rolling-validation)
+for the detailed coverage and limits.
 
 ```bash
 # With Ginkgo
@@ -910,7 +1004,7 @@ plain `-tags e2e` run neither builds nor runs them:
 
 The bootstrap regression `TestRestoreDownloadStopsWithFxApplication` also needs
 the `s3` tag to compile the production S3 backend, but uses an in-process HTTP
-server and requires no MinIO or Docker when run alone. CI's `Tests` job includes
+server and requires no MinIO or Docker when run alone. CI's `Tests-Internal` job includes
 it in the optional-feature internal suite. Run just this regression with:
 
 ```bash
@@ -950,7 +1044,7 @@ export DOCKER_HOST=unix://$HOME/.orbstack/run/docker.sock
 
 ### Operator Integration Tests
 
-The default Nix shell provides `setup-envtest`, and its shell hook exports `KUBEBUILDER_ASSETS`. The first shell start downloads the etcd and kube-apiserver binaries. The lean `ci` shell does not include envtest. The `Tests-Operator` CI job uses the dedicated `operator-tests` shell for the focused Ledger target admission regressions, selecting Kubernetes 1.32.x assets:
+The default Nix shell provides `setup-envtest`, and its shell hook exports `KUBEBUILDER_ASSETS`. The first shell start downloads the etcd and kube-apiserver binaries. The lean `ci` shell does not include envtest. The `Tests-Operator` CI job uses the dedicated `operator-tests` shell for Ledger and BackupRun target admission plus BackupRun recovery and manual association regressions, selecting Kubernetes 1.32.x assets. See the [canonical selection description](#operator-api-server-regressions) above:
 
 ```bash
 nix develop .#operator-tests --command just operator-test-admission
@@ -982,6 +1076,7 @@ go tool cover -html=coverage.out
 ```
 
 The `just` coverage recipes (`test-coverage`, `test-internal-coverage`,
+`test-store-coverage`,
 `test-postgres-mirror-coverage`,
 `test-antithesis-assertions`, `test-e2e-coverage`, `test-scenarios-coverage`,
 `fuzz-check-coverage`) run through `scripts/go-test-coverage` rather than
@@ -1216,3 +1311,12 @@ To learn more:
 1. [Development](./development.md) - How to write testable code
 2. [Architecture](../architecture/overview.md) - Understand the system to test
 3. [Data Flows](../architecture/data-flows.md) - Understand the flows to test
+
+### Operator API admission
+
+CI runs `just operator-test-admission` in `nix develop .#operator-tests`.
+The recipe selects integration-tagged `TestLedgerAdmission` and
+`TestTraceSampling` cases in the Operator module using envtest. This preserves
+Ledger target immutability coverage and exercises trace sampler schema
+validation plus typed/raw conflict correction through the real StatefulSet
+environment. Untagged `go test ./...` in that module covers unit tests only.

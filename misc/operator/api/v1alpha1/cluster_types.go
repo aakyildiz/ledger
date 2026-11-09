@@ -765,6 +765,8 @@ type MonitoringConfig struct {
 }
 
 // TracesConfig holds trace configuration.
+// +kubebuilder:validation:XValidation:rule="!has(self.samplerArg) || (has(self.sampler) && self.sampler in ['traceidratio', 'parentbased_traceidratio'])",message="samplerArg requires a ratio sampler"
+// +kubebuilder:validation:XValidation:rule="!has(self.sampler) || !(self.sampler in ['traceidratio', 'parentbased_traceidratio']) || has(self.samplerArg)",message="ratio sampler requires samplerArg"
 type TracesConfig struct {
 	// Enabled enables tracing.
 	// +optional
@@ -793,6 +795,19 @@ type TracesConfig struct {
 	// Batch enables batch mode.
 	// +optional
 	Batch string `json:"batch,omitempty"`
+
+	// Sampler selects a standard OpenTelemetry head-sampling policy. Omitted
+	// values preserve the SDK default or raw extraEnv sampler configuration.
+	// Typed sampling cannot be combined with raw sampler variables in extraEnv.
+	// +kubebuilder:validation:Enum=always_on;always_off;traceidratio;parentbased_always_on;parentbased_always_off;parentbased_traceidratio
+	// +optional
+	Sampler string `json:"sampler,omitempty"`
+
+	// SamplerArg is the explicit finite ratio in [0,1] required by traceidratio
+	// and parentbased_traceidratio. Other policies must omit this argument.
+	// +kubebuilder:validation:XValidation:rule="double(self) >= 0.0 && double(self) <= 1.0",message="samplerArg must be a finite ratio in [0,1]"
+	// +optional
+	SamplerArg string `json:"samplerArg,omitempty"`
 }
 
 // MetricsConfig holds metrics configuration.
@@ -1134,9 +1149,10 @@ type VolumeSpec struct {
 	// +optional
 	AccessMode string `json:"accessMode,omitempty"`
 
-	// Size is the initial and minimum requested capacity of the volume. Automatic
-	// expansion updates the live PVCs only and never rewrites this field or the
-	// StatefulSet VolumeClaimTemplates.
+	// Size is the initial and minimum requested capacity of the volume. Increases
+	// reconcile existing PVCs and claim templates; decreases never shrink them.
+	// Automatic expansion updates live PVCs only and never rewrites this field
+	// or the StatefulSet VolumeClaimTemplates.
 	// +optional
 	Size resource.Quantity `json:"size,omitempty"`
 
@@ -1145,7 +1161,9 @@ type VolumeSpec struct {
 	// +optional
 	AutoExpansion *VolumeAutoExpansionSpec `json:"autoExpansion,omitempty"`
 
-	// VolumeAttributesClassName is the name of the VolumeAttributesClass to use for the PVC.
+	// VolumeAttributesClassName selects the CSI performance profile for new and
+	// existing PVCs. Changes are applied in place; clearing a non-empty class is
+	// unsupported. Completion is reported separately from accepting the request.
 	// Requires the VolumeAttributesClass feature gate to be enabled (beta in K8s 1.31+).
 	// Mutually exclusive with hostPath.
 	// +optional
@@ -1349,11 +1367,19 @@ type TLSRolloutStatus struct {
 
 // ClusterStatus defines the observed state of Cluster.
 type ClusterStatus struct {
+	// ClaimTemplateRecovery identifies the durable journal for a claim-template
+	// replacement. The operator restores that workload before newer spec edits.
+	// +optional
+	ClaimTemplateRecovery *ClaimTemplateRecoveryStatus `json:"claimTemplateRecovery,omitempty"`
 	// Drain records the operator-owned epoch and transition across restarts.
 	// It is cleared after all members durably apply the release.
 	// +optional
 	Drain *DrainStatus `json:"drain,omitempty"`
 
+	// Upgrade records an interrupted mandatory stop-and-recreate upgrade.
+	// It is persisted before the old StatefulSet is deleted.
+	// +optional
+	Upgrade *ClusterUpgradeStatus `json:"upgrade,omitempty"`
 	// TLSRollout preserves certificate references and mode across operator restarts
 	// and StatefulSet recreation. Cleared after the disabled rollout converges.
 	// +optional
@@ -1388,10 +1414,43 @@ type ClusterStatus struct {
 	TLSMigrationPhase string `json:"tlsMigrationPhase,omitempty"`
 }
 
+// ClaimTemplateRecoveryStatus authorizes exact journal bytes before creation.
+// An empty ConfigMapUID is Preparing; a bound UID is Active. Completed retains
+// the binding until cleanup succeeds, including after a lost delete response.
+type ClaimTemplateRecoveryStatus struct {
+	// ConfigMapName includes a prefix of the complete authorized digest.
+	ConfigMapName string `json:"configMapName"`
+	// SourceUID identifies the original StatefulSet saved in the payload.
+	SourceUID string `json:"sourceUID"`
+	// PayloadSHA256 covers the complete JSON payload and its Cluster identity.
+	PayloadSHA256 string `json:"payloadSHA256"`
+	// ConfigMapUID is bound only after the immutable journal is authenticated.
+	// +optional
+	ConfigMapUID string `json:"configMapUID,omitempty"`
+	// +optional
+	Completed bool `json:"completed,omitempty"`
+}
+
 // DrainStatus tracks an annotation-triggered drain lifecycle.
 type DrainStatus struct {
 	Epoch string `json:"epoch"`
 	Phase string `json:"phase"`
+}
+
+// ClusterUpgradeStatus fences recreation until the old workload is fully gone.
+type ClusterUpgradeStatus struct {
+	Source           string `json:"source"`
+	Target           string `json:"target"`
+	StatefulSetUID   string `json:"statefulSetUID"`
+	TargetSpecHash   string `json:"targetSpecHash"`
+	ExpectedReplicas int32  `json:"expectedReplicas"`
+	// DrainEpoch identifies the Raft admission cutoff across operator restarts.
+	DrainEpoch string `json:"drainEpoch,omitempty"`
+	// ClaimUIDs pins each pre-existing volume to its original claim.
+	ClaimUIDs map[string]string `json:"claimUIDs,omitempty"`
+	// VolumeUIDs pins every bound PV reused by the original claims.
+	VolumeUIDs map[string]string `json:"volumeUIDs,omitempty"`
+	Phase      string            `json:"phase"`
 }
 
 // EndpointsStatus contains the resolved endpoints for a Cluster.

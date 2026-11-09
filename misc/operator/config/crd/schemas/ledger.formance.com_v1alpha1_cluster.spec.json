@@ -2118,9 +2118,41 @@
             "port": {
               "description": "Port for the trace exporter.",
               "type": "string"
+            },
+            "sampler": {
+              "description": "Sampler selects a standard OpenTelemetry head-sampling policy. Omitted\nvalues preserve the SDK default or raw extraEnv sampler configuration.\nTyped sampling cannot be combined with raw sampler variables in extraEnv.",
+              "enum": [
+                "always_on",
+                "always_off",
+                "traceidratio",
+                "parentbased_always_on",
+                "parentbased_always_off",
+                "parentbased_traceidratio"
+              ],
+              "type": "string"
+            },
+            "samplerArg": {
+              "description": "SamplerArg is the explicit finite ratio in [0,1] required by traceidratio\nand parentbased_traceidratio. Other policies must omit this argument.",
+              "type": "string",
+              "x-kubernetes-validations": [
+                {
+                  "message": "samplerArg must be a finite ratio in [0,1]",
+                  "rule": "double(self) \u003e= 0.0 \u0026\u0026 double(self) \u003c= 1.0"
+                }
+              ]
             }
           },
-          "type": "object"
+          "type": "object",
+          "x-kubernetes-validations": [
+            {
+              "message": "samplerArg requires a ratio sampler",
+              "rule": "!has(self.samplerArg) || (has(self.sampler) \u0026\u0026 self.sampler in ['traceidratio', 'parentbased_traceidratio'])"
+            },
+            {
+              "message": "ratio sampler requires samplerArg",
+              "rule": "!has(self.sampler) || !(self.sampler in ['traceidratio', 'parentbased_traceidratio']) || has(self.samplerArg)"
+            }
+          ]
         }
       },
       "type": "object"
@@ -2606,7 +2638,7 @@
                   "type": "string"
                 }
               ],
-              "description": "Size is the initial and minimum requested capacity of the volume. Automatic\nexpansion updates the live PVCs only and never rewrites this field or the\nStatefulSet VolumeClaimTemplates.",
+              "description": "Size is the initial and minimum requested capacity of the volume. Increases\nreconcile existing PVCs and claim templates; decreases never shrink them.\nAutomatic expansion updates live PVCs only and never rewrites this field\nor the StatefulSet VolumeClaimTemplates.",
               "pattern": "^(\\+|-)?(([0-9]+(\\.[0-9]*)?)|(\\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\\+|-)?(([0-9]+(\\.[0-9]*)?)|(\\.[0-9]+))))?$",
               "x-kubernetes-int-or-string": true
             },
@@ -2615,7 +2647,7 @@
               "type": "string"
             },
             "volumeAttributesClassName": {
-              "description": "VolumeAttributesClassName is the name of the VolumeAttributesClass to use for the PVC.\nRequires the VolumeAttributesClass feature gate to be enabled (beta in K8s 1.31+).\nMutually exclusive with hostPath.",
+              "description": "VolumeAttributesClassName selects the CSI performance profile for new and\nexisting PVCs. Changes are applied in place; clearing a non-empty class is\nunsupported. Completion is reported separately from accepting the request.\nRequires the VolumeAttributesClass feature gate to be enabled (beta in K8s 1.31+).\nMutually exclusive with hostPath.",
               "type": "string"
             }
           },
@@ -2754,7 +2786,7 @@
                   "type": "string"
                 }
               ],
-              "description": "Size is the initial and minimum requested capacity of the volume. Automatic\nexpansion updates the live PVCs only and never rewrites this field or the\nStatefulSet VolumeClaimTemplates.",
+              "description": "Size is the initial and minimum requested capacity of the volume. Increases\nreconcile existing PVCs and claim templates; decreases never shrink them.\nAutomatic expansion updates live PVCs only and never rewrites this field\nor the StatefulSet VolumeClaimTemplates.",
               "pattern": "^(\\+|-)?(([0-9]+(\\.[0-9]*)?)|(\\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\\+|-)?(([0-9]+(\\.[0-9]*)?)|(\\.[0-9]+))))?$",
               "x-kubernetes-int-or-string": true
             },
@@ -2763,7 +2795,7 @@
               "type": "string"
             },
             "volumeAttributesClassName": {
-              "description": "VolumeAttributesClassName is the name of the VolumeAttributesClass to use for the PVC.\nRequires the VolumeAttributesClass feature gate to be enabled (beta in K8s 1.31+).\nMutually exclusive with hostPath.",
+              "description": "VolumeAttributesClassName selects the CSI performance profile for new and\nexisting PVCs. Changes are applied in place; clearing a non-empty class is\nunsupported. Completion is reported separately from accepting the request.\nRequires the VolumeAttributesClass feature gate to be enabled (beta in K8s 1.31+).\nMutually exclusive with hostPath.",
               "type": "string"
             }
           },
